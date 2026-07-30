@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Runtime data (preserve directory placeholders)
+data/*
+!data/.gitkeep
+!data/keyframes/
+data/keyframes/*
+!data/keyframes/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Media, model weights, and Resolve artifacts
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.mp3
+*.flac
+*.pt
+*.pth
+*.bin
+*.gguf
+*.drp
+*.dra
+*.drt
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local secrets/config
+.env
+.env.*
+!.env.example

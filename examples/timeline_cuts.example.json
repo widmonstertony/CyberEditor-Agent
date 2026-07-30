@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "project_fps": 25.0,
+  "director_model": "qwen2.5:32b",
+  "chunk_duration_sec": 720.0,
+  "clips": [
+    {
+      "clip_id": 1,
+      "file_name": "D:\\Media\\proxy\\documentary_1080p.mp4",
+      "cut_in_sec": 12.5,
+      "cut_out_sec": 18.2,
+      "reason_for_cut": "完整表达主题观点",
+      "confidence": 0.9
+    }
+  ]
+}

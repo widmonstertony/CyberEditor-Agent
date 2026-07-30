@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "source_video": "D:\\Media\\documentary_source.mov",
+  "proxy_file_name": "D:\\Media\\proxy\\documentary_1080p.mp4",
+  "duration_sec": 900.0,
+  "language": "zh",
+  "whisper_model": "small",
+  "video": {
+    "fps": 25.0,
+    "frame_count": 22500,
+    "width": 1920,
+    "height": 1080,
+    "duration_sec": 900.0
+  },
+  "transcript": [
+    {
+      "id": 0,
+      "start_sec": 12.5,
+      "end_sec": 18.2,
+      "text": "这是纪录片开场的第一句完整台词。"
+    }
+  ],
+  "keyframes": [
+    {
+      "timestamp_sec": 10.0,
+      "file_name": "keyframe_0001_000010.000.jpg",
+      "scene_score": 0.41
+    }
+  ]
+}
