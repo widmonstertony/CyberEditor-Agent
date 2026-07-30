@@ -14,6 +14,7 @@ and VRAM-release guarantees.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,83 @@ FLOW_LABELS = {
     "仅执行 Resolve / Resolve only": "resolve",
 }
 FLOW_NAMES = {value: key for key, value in FLOW_LABELS.items()}
+
+
+def enable_windows_high_dpi() -> str:
+    """
+    Enable the sharpest DPI mode available before creating a Tk window.
+    在创建 Tk 窗口前启用系统支持的最高级 DPI 模式。
+
+    Returns / 返回:
+        The selected awareness mode, mainly for diagnostics and tests.
+        已选择的感知模式，主要用于诊断与测试。
+    """
+    if os.name != "nt":
+        return "platform-default"
+
+    # Windows 10 Creators Update+: crisp rendering across mixed-DPI monitors.
+    try:
+        user32 = ctypes.windll.user32
+        setter = user32.SetProcessDpiAwarenessContext
+        setter.argtypes = [ctypes.c_void_p]
+        setter.restype = ctypes.c_bool
+        per_monitor_v2 = ctypes.c_void_p(-4)
+        if setter(per_monitor_v2):
+            return "per-monitor-v2"
+    except (AttributeError, OSError):
+        pass
+
+    # Windows 8.1 fallback.
+    try:
+        shcore = ctypes.windll.shcore
+        result = shcore.SetProcessDpiAwareness(2)
+        if result in (0, -2147024891):  # S_OK or already configured.
+            return "per-monitor"
+    except (AttributeError, OSError):
+        pass
+
+    # Vista/Windows 7 fallback.
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return "system"
+    except (AttributeError, OSError):
+        pass
+    return "unavailable"
+
+
+def get_primary_work_area(
+    screen_width: int, screen_height: int
+) -> Tuple[int, int, int, int]:
+    """
+    Return the primary monitor area not occupied by the taskbar.
+    返回主显示器中未被任务栏占用的工作区域。
+
+    The screen dimensions are used as a cross-platform fallback.
+    非 Windows 平台或系统查询失败时使用传入的屏幕尺寸。
+    """
+    if os.name == "nt":
+        class Rect(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        rectangle = Rect()
+        try:
+            if ctypes.windll.user32.SystemParametersInfoW(
+                0x0030, 0, ctypes.byref(rectangle), 0
+            ):
+                return (
+                    int(rectangle.left),
+                    int(rectangle.top),
+                    int(rectangle.right - rectangle.left),
+                    int(rectangle.bottom - rectangle.top),
+                )
+        except (AttributeError, OSError):
+            pass
+    return 0, 0, int(screen_width), int(screen_height)
 
 
 def _absolute_path(value: str, project_root: Path) -> Path:
@@ -258,13 +336,28 @@ class CyberEditorApp:
     def _configure_window(self) -> None:
         """Configure the main window. / 配置主窗口。"""
         self.root.title(APP_TITLE)
-        self.root.geometry("1240x800")
-        self.root.minsize(1040, 700)
         self.root.configure(bg=BG)
         try:
-            self.root.tk.call("tk", "scaling", 1.15)
+            dpi = float(self.root.winfo_fpixels("1i"))
         except tk.TclError:
-            pass
+            dpi = 96.0
+        dpi_scale = max(1.0, dpi / 96.0)
+        # Tk uses pixels for geometry and points for fonts. Match both to the
+        # physical monitor DPI so Windows never bitmap-stretches the window.
+        self.root.tk.call("tk", "scaling", dpi / 72.0)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        area_left, area_top, area_width, area_height = get_primary_work_area(
+            screen_width, screen_height
+        )
+        width = min(int(1240 * dpi_scale), int(area_width * 0.92))
+        height = min(int(800 * dpi_scale), int(area_height * 0.88))
+        minimum_width = min(int(1040 * dpi_scale), width)
+        minimum_height = min(int(700 * dpi_scale), height)
+        left = area_left + max(0, (area_width - width) // 2)
+        top = area_top + max(0, (area_height - height) // 2)
+        self.root.geometry(f"{width}x{height}+{left}+{top}")
+        self.root.minsize(minimum_width, minimum_height)
 
     def _configure_styles(self) -> None:
         """Create the dark visual system. / 创建深色视觉样式系统。"""
@@ -632,7 +725,7 @@ class CyberEditorApp:
         checks.grid(row=5, column=0, sticky="ew", pady=(13, 0))
         self.skip_resolve_check = ttk.Checkbutton(
             checks,
-            text="只生成 JSON（跳过 Resolve）/ JSON only",
+            text="只生成 JSON（未装 Studio 时保持勾选）/ JSON only",
             variable=self.skip_resolve_var,
         )
         self.skip_resolve_check.pack(side=tk.LEFT)
@@ -641,6 +734,11 @@ class CyberEditorApp:
             text="严格 FPS / Strict FPS",
             variable=self.strict_fps_var,
         ).pack(side=tk.LEFT, padx=(18, 0))
+        ttk.Label(
+            parent,
+            text="提示：外部 Python 自动组装时间线需要 DaVinci Resolve Studio。",
+            style="Muted.TLabel",
+        ).grid(row=6, column=0, sticky="w", pady=(7, 0))
 
         footer = ttk.Frame(parent, style="Card.TFrame")
         footer.grid(row=11, column=0, sticky="ew", pady=(18, 0))
@@ -1129,7 +1227,10 @@ class CyberEditorApp:
             ),
         ]
         resolve_ready = any(path.is_file() for path in resolve_candidates)
-        results["Resolve"] = (resolve_ready, "已安装" if resolve_ready else "未安装")
+        results["Resolve"] = (
+            resolve_ready,
+            "已检测，请确认 Studio" if resolve_ready else "未安装",
+        )
         self.messages.put(("environment", (results, models)))
 
     def _apply_environment_result(self, payload: object) -> None:
@@ -1273,6 +1374,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             为未来的界面命令行选项预留。
     """
     del argv
+    enable_windows_high_dpi()
     project_root = Path(__file__).resolve().parents[1]
     root = tk.Tk()
     CyberEditorApp(root, project_root)

@@ -5,7 +5,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from src.gui import WorkflowOptions, build_runtime_environment
+from src.gui import (
+    WorkflowOptions,
+    build_runtime_environment,
+    enable_windows_high_dpi,
+    get_primary_work_area,
+)
 
 
 class WorkflowOptionsTests(unittest.TestCase):
@@ -63,6 +68,26 @@ class WorkflowOptionsTests(unittest.TestCase):
         self.assertIn("PATH", environment)
         self.assertIn(os.environ.get("PATH", ""), environment["PATH"])
         self.assertEqual(environment["PYTHONUNBUFFERED"], "1")
+
+    def test_high_dpi_helper_returns_a_mode(self) -> None:
+        mode = enable_windows_high_dpi()
+        self.assertIn(
+            mode,
+            {
+                "per-monitor-v2",
+                "per-monitor",
+                "system",
+                "unavailable",
+                "platform-default",
+            },
+        )
+
+    def test_work_area_is_positive(self) -> None:
+        left, top, width, height = get_primary_work_area(1920, 1080)
+        self.assertGreaterEqual(left, 0)
+        self.assertGreaterEqual(top, 0)
+        self.assertGreater(width, 0)
+        self.assertGreater(height, 0)
 
 
 if __name__ == "__main__":
