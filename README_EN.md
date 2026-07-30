@@ -36,9 +36,19 @@ The default `Auto` hardware profile detects CPU threads, system RAM, GPU, and
 VRAM using standard-library and operating-system interfaces. It uses
 `nvidia-smi` when available for accurate NVIDIA memory and probes PyTorch CUDA
 support in a disposable child process. The result selects a Whisper model,
-device mode, 10–15 minute chunk size, Ollama context, and the best
-already-installed Ollama model within a safe memory budget. Auto mode never
-downloads a model or changes media properties based on hardware performance.
+device mode, 10–15 minute chunk size, Ollama context, and the best-quality
+already-installed Ollama model within a safe memory budget. Model selection
+accounts for Chinese, long context, instruction following, and quantization
+instead of using file size alone. Auto mode never downloads a multi-gigabyte
+model without consent or changes media properties based on hardware
+performance. A 16 GB VRAM + 64 GB RAM machine defaults to the slower quality
+profile: Whisper `large-v3`, 10-minute chunks, and a 16K context.
+
+At UI startup, an installed but stopped local Ollama service is launched
+automatically without loading a model or consuming model VRAM. Resolve is found
+across C:, D:, and other custom install drives, but is launched only when the
+strict serial workflow reaches stage 3. The executor then waits for the
+scripting API, so Resolve cannot compete with Whisper or Ollama for VRAM.
 
 `Project FPS` defaults to **Auto from source media**, not a fixed 25. After a
 source is selected, a short-lived `ffprobe` process reads `avg_frame_rate` or
@@ -132,6 +142,7 @@ CyberEditor-Agent/
 │  ├─ __init__.py
 │  ├─ gui.py                     # Dependency-free fallback and shared probes
 │  ├─ modern_gui.py              # Windows 11, 4K, Chinese/English UI
+│  ├─ runtime_services.py        # Cross-drive discovery and service auto-start
 │  ├─ ui_i18n.py                 # GUI-independent bilingual strings
 │  ├─ extractor.py               # Whisper + OpenCV extraction
 │  ├─ director.py                # Chunked Ollama director
@@ -148,6 +159,7 @@ CyberEditor-Agent/
    ├─ test_extractor.py
    ├─ test_gui.py
    ├─ test_orchestrator.py
+   ├─ test_runtime_services.py
    └─ test_resolve_executor.py
 ```
 
@@ -167,14 +179,19 @@ CyberEditor-Agent/
 
 | Hardware | Whisper | Ollama | Notes |
 |---|---|---|---|
-| Integrated GPU / CPU only | `tiny` / `base` | 7B–14B Q4 | Slow, but the workflow remains usable |
-| 8–12 GB VRAM | `small` | 14B/32B Q4 with mixed offload | Lower `--num-ctx` to save memory |
-| 16 GB VRAM | `small` / `turbo` | 32B Q4 or mixed CPU/GPU 70B | The primary target for strict serialization |
-| 24 GB+ VRAM | `turbo` / `large-v3` | Quantized 32B/70B | Serial execution is still recommended |
+| Integrated GPU / CPU only | `tiny` / `base` | Qwen 3.5 4B/9B Q4 | Slow, but the workflow remains usable |
+| 8–12 GB VRAM | `small` / `turbo` | `qwen3.5:9b-q4_K_M` | 6.6 GB, strong Chinese and long context |
+| 16 GB VRAM | `large-v3` | `qwen3.5:9b-q8_0` | About 11 GB; recommended full-GPU quality option |
+| 16 GB VRAM + 64 GB RAM | `large-v3` | `qwen3.5:35b-a3b` | About 24 GB; slower mixed CPU/GPU quality option |
+| 24 GB+ VRAM | `large-v3` | Qwen 3.5 27B/35B | Serial execution is still recommended |
 
-A 70B model cannot fit entirely in 16 GB of VRAM. “Compatible” means that
-Ollama/llama.cpp offloads some layers to system RAM and the CPU. Real-world
-speed depends on quantization, memory bandwidth, and context length.
+The currently installed `qwen2.5:3b` is suitable for smoke tests, not
+high-quality documentary editing. On a 16 GB Quadro with 64 GB RAM, prefer
+`qwen3.5:35b-a3b` when quality matters more than speed, or
+`qwen3.5:9b-q8_0` for steadier full-GPU inference. Mixed-offload speed depends
+on quantization, memory bandwidth, and context length. Qwen 3.5 supports
+vision, tools, reasoning, and 201 languages:
+[Qwen 3.5 on Ollama](https://ollama.com/library/qwen3.5).
 
 Whisper's published approximate VRAM requirements range from about 1 GB for
 tiny/base to about 6 GB for turbo. See the
@@ -238,11 +255,22 @@ details.
 
 ### 3. Prepare Ollama
 
-The following is only an example; use any compatible model already installed:
+Quality-first for 16 GB VRAM + 64 GB RAM (about a 24 GB download and slower
+mixed CPU/GPU inference):
 
 ```powershell
-ollama pull qwen2.5:32b
+ollama pull qwen3.5:35b-a3b
 ```
+
+For a faster high-quality model that fits fully in 16 GB VRAM (about 11 GB):
+
+```powershell
+ollama pull qwen3.5:9b-q8_0
+```
+
+Models are downloaded once. The UI subsequently starts Ollama automatically
+and selects the best installed model, but never downloads a large model without
+confirmation.
 
 Limit Ollama to one resident model and one parallel request, then restart
 Ollama:
@@ -260,16 +288,19 @@ the executor converts them to frames using the active Resolve project FPS.
 
 ## One-command workflow
 
-Start Ollama first. Before the Resolve stage begins, start Resolve Studio and
-open the target project:
+There is no need to start Ollama or Resolve manually. The program starts the
+local Ollama service but does not load the model until the director stage.
+After that model is unloaded, the executor launches Resolve and waits for its
+API. Resolve Studio's External Scripting preference must still be set to
+`Local` once beforehand.
 
 ```powershell
 python main.py `
   --video "D:\Documentary\source.mov" `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen2.5:32b" `
+  --ollama-model "qwen3.5:35b-a3b" `
   --project-fps 25 `
-  --chunk-minutes 12
+  --chunk-minutes 10
 ```
 
 Default outputs:

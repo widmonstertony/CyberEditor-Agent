@@ -41,9 +41,12 @@ from .gui import (
     detect_system_theme,
     detect_torch_runtime,
     enable_windows_high_dpi,
+    ensure_ollama_service,
+    find_resolve_executable,
     get_primary_work_area,
     parse_frame_rate,
     recommend_automatic_settings,
+    RuntimeServiceError,
 )
 from .ui_i18n import (
     detect_system_language,
@@ -1225,8 +1228,8 @@ class ModernCyberEditorApp:
                     "chunk_minutes": 12.0, "num_ctx": 8192,
                 },
                 "performance": {
-                    "whisper_model": "turbo", "whisper_device": "auto",
-                    "chunk_minutes": 15.0, "num_ctx": 16384,
+                    "whisper_model": "large-v3", "whisper_device": "auto",
+                    "chunk_minutes": 10.0, "num_ctx": 16384,
                 },
             }
             settings = presets.get(profile, presets["balanced"])
@@ -1398,34 +1401,38 @@ class ModernCyberEditorApp:
         )
         models: List[Dict[str, object]] = []
         try:
-            request = urllib_request.Request(
-                ollama_url.rstrip("/") + "/api/tags",
-                headers={"Accept": "application/json"},
+            models, ollama_started = ensure_ollama_service(
+                ollama_url, timeout=30.0
             )
-            with urllib_request.urlopen(request, timeout=3) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            for item in payload.get("models", []):
-                if isinstance(item, dict) and str(item.get("name", "")).strip():
-                    models.append({
-                        "name": str(item["name"]).strip(),
-                        "size": int(item.get("size") or 0),
-                    })
             results["Ollama"] = (
                 True,
-                self.t("models_count", count=len(models))
-                if models else self.t("online"),
+                (
+                    self.t("models_count_started", count=len(models))
+                    if ollama_started and models
+                    else self.t("online_started")
+                    if ollama_started
+                    else self.t("models_count", count=len(models))
+                    if models
+                    else self.t("online")
+                ),
             )
-        except (OSError, ValueError, urllib_error.URLError):
+        except (
+            OSError,
+            ValueError,
+            urllib_error.URLError,
+            RuntimeServiceError,
+        ):
             results["Ollama"] = (False, self.t("not_connected"))
 
-        resolve_paths = [
-            Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"),
-            Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve Studio\Resolve.exe"),
-        ]
-        resolve_ready = any(path.is_file() for path in resolve_paths)
+        resolve_path = find_resolve_executable()
+        resolve_ready = resolve_path is not None
         results["Resolve"] = (
             resolve_ready,
-            self.t("installed") if resolve_ready else self.t("not_found"),
+            (
+                self.t("installed_auto_start")
+                if resolve_ready
+                else self.t("not_found")
+            ),
         )
         hardware = detect_hardware()
         torch_runtime = detect_torch_runtime()

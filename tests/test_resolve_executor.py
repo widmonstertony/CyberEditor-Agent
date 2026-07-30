@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from src.resolve_executor import DaVinciExecutor, Decimal
 
@@ -178,6 +179,73 @@ class ResolveExecutorTests(unittest.TestCase):
                 project.media_pool.appended[0]["endFrame"], 49
             )
             self.assertTrue(resolve.manager.saved)
+
+    def test_custom_install_configures_fusionscript_library(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "DaVinci Resolve" / "Resolve.exe"
+            library = executable.parent / "fusionscript.dll"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            library.touch()
+            with mock.patch.dict(
+                "os.environ", {"RESOLVE_SCRIPT_LIB": ""}, clear=False
+            ):
+                from src.resolve_executor import os
+
+                os.environ.pop("RESOLVE_SCRIPT_LIB", None)
+                DaVinciExecutor._configure_resolve_library(executable)
+                self.assertEqual(
+                    os.environ.get("RESOLVE_SCRIPT_LIB"), str(library)
+                )
+
+    def test_connect_auto_starts_and_waits_for_resolve(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = root / "timeline_cuts.json"
+            plan.write_text("{}", encoding="utf-8")
+            executable = root / "Resolve.exe"
+            executable.touch()
+            expected = FakeResolve(FakeProject())
+
+            module = mock.Mock()
+            module.scriptapp.side_effect = [None, expected]
+            launched = mock.Mock()
+            launched.poll.return_value = None
+            executor = DaVinciExecutor(
+                json_path=plan,
+                startup_timeout=5,
+                logger=logging.getLogger("test.resolve.start"),
+            )
+            with (
+                mock.patch(
+                    "src.resolve_executor.platform.system",
+                    return_value="Windows",
+                ),
+                mock.patch(
+                    "src.resolve_executor.find_resolve_executable",
+                    return_value=executable,
+                ),
+                mock.patch.object(
+                    executor, "_configure_resolve_library"
+                ),
+                mock.patch.object(
+                    executor,
+                    "_load_resolve_module",
+                    return_value=(module, [], []),
+                ),
+                mock.patch.object(
+                    executor, "_is_resolve_running", return_value=False
+                ),
+                mock.patch.object(
+                    executor, "_launch_resolve", return_value=launched
+                ) as launch,
+                mock.patch("src.resolve_executor.time.sleep"),
+            ):
+                result = executor.connect()
+
+            self.assertIs(result, expected)
+            launch.assert_called_once_with(executable)
 
 
 if __name__ == "__main__":

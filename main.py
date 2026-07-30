@@ -26,6 +26,8 @@ from typing import Dict, List, Optional, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from src.runtime_services import RuntimeServiceError, ensure_ollama_service
+
 
 LOGGER_NAME = "cybereditor"
 
@@ -188,6 +190,18 @@ class WorkflowOrchestrator:
                 self._release_barrier("Whisper/OpenCV")
 
             if not args.skip_director:
+                try:
+                    _, ollama_started = ensure_ollama_service(
+                        args.ollama_url,
+                        timeout=min(30.0, float(args.ollama_timeout)),
+                    )
+                except RuntimeServiceError as exc:
+                    raise WorkflowError(str(exc)) from exc
+                if ollama_started:
+                    self.logger.info(
+                        "已自动启动 Ollama 服务（尚未加载模型）"
+                        " / Ollama service auto-started; no model is loaded yet"
+                    )
                 command = [
                     self.python_executable,
                     "-m",
