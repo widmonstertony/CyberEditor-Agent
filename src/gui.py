@@ -34,6 +34,13 @@ from urllib import request as urllib_request
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from .runtime_services import (
+    RuntimeServiceError,
+    ensure_ollama_service,
+    find_ollama_executables,
+    find_resolve_executable,
+)
+
 try:
     import winreg
 except ImportError:  # pragma: no cover - only relevant outside Windows.
@@ -111,7 +118,7 @@ PROFILE_LABELS = {
     "自动检测 / Auto": "auto",
     "节能 / Conservative": "conservative",
     "均衡 / Balanced": "balanced",
-    "高性能 / Performance": "performance",
+    "高质量（较慢） / Quality (slower)": "performance",
     "自定义 / Custom": "custom",
 }
 PROFILE_NAMES = {value: key for key, value in PROFILE_LABELS.items()}
@@ -437,7 +444,14 @@ def recommend_automatic_settings(
     cpu_threads = int(hardware.get("cpu_threads") or 1)
     torch_cuda = bool(hardware.get("torch_cuda"))
 
-    if torch_cuda and vram_gb >= 8:
+    if torch_cuda and vram_gb >= 12:
+        # Accuracy is preferred over throughput.  The stages are serial, so a
+        # 16 GiB GPU can safely devote itself to Whisper large-v3 and release
+        # it before Ollama starts.
+        # 优先保证识别准确率。各阶段严格串行，因此 16 GiB 显卡可独占运行
+        # Whisper large-v3，并在启动 Ollama 前完整释放。
+        whisper_model = "large-v3"
+    elif torch_cuda and vram_gb >= 8:
         whisper_model = "turbo"
     elif (torch_cuda and vram_gb >= 4) or (
         ram_gb >= 24 and cpu_threads >= 8
@@ -447,7 +461,10 @@ def recommend_automatic_settings(
         whisper_model = "base"
 
     if ram_gb >= 64:
-        chunk_minutes = 15.0
+        # Shorter chunks preserve local narrative detail.  More model calls are
+        # slower but produce better edit decisions for hour-long footage.
+        # 更短的分块能保留局部叙事细节；调用次数更多但长视频剪辑决策更细致。
+        chunk_minutes = 10.0
         num_ctx = 16384
         profile = "performance"
     elif ram_gb >= 24 or vram_gb >= 6:
@@ -461,8 +478,8 @@ def recommend_automatic_settings(
 
     # Preserve at least ~10 GiB for Windows, Resolve, and orchestration.
     model_budget_gb = max(2.0, min(ram_gb * 0.55, max(2.0, ram_gb - 10.0)))
-    candidates: List[Tuple[str, float]] = []
-    all_models: List[Tuple[str, float]] = []
+    candidates: List[Tuple[str, float, float]] = []
+    all_models: List[Tuple[str, float, float]] = []
     for model in ollama_models:
         name = str(model.get("name", "")).strip()
         try:
@@ -471,12 +488,38 @@ def recommend_automatic_settings(
             size_gb = 0.0
         if not name:
             continue
-        all_models.append((name, size_gb))
+        normalized = name.casefold()
+        quality_score = size_gb
+        # Editing quality depends on instruction following, Chinese support,
+        # long-context reasoning, and quantization—not simply file size.
+        # 剪辑质量取决于指令遵循、中文、长上下文与量化，而非只看文件大小。
+        family_scores = (
+            ("qwen3.5:35b-a3b", 1000.0),
+            ("qwen3.5:27b", 980.0),
+            ("qwen3.5:9b", 940.0),
+            ("qwen3:30b", 850.0),
+            ("gpt-oss:20b", 820.0),
+            ("qwen3:14b", 790.0),
+            ("qwen2.5:32b", 740.0),
+            ("qwen2.5:14b", 680.0),
+            ("gemma3:12b", 640.0),
+        )
+        for marker, score in family_scores:
+            if marker in normalized:
+                quality_score = score
+                break
+        if "q8_0" in normalized or "q8-0" in normalized:
+            quality_score += 35.0
+        elif "q6_k" in normalized:
+            quality_score += 25.0
+        elif "q4_k_m" in normalized:
+            quality_score += 15.0
+        all_models.append((name, size_gb, quality_score))
         if size_gb <= model_budget_gb:
-            candidates.append((name, size_gb))
+            candidates.append((name, size_gb, quality_score))
     selected_pool = candidates or all_models
     selected_model = (
-        max(selected_pool, key=lambda item: item[1])[0]
+        max(selected_pool, key=lambda item: (item[2], item[1]))[0]
         if selected_pool
         else ""
     )
@@ -518,6 +561,10 @@ def build_runtime_environment() -> Dict[str, str]:
         local_app_data / "Programs" / "Ollama",
         Path(r"C:\Program Files\GitHub CLI"),
     ]
+    ollama_cli, ollama_app = find_ollama_executables()
+    for executable in (ollama_cli, ollama_app):
+        if executable is not None:
+            candidates.append(executable.parent)
     existing = environment.get("PATH", "").split(os.pathsep)
     normalized = {item.casefold() for item in existing if item}
     prefixes = [
@@ -1512,9 +1559,9 @@ class CyberEditorApp:
                     "num_ctx": 8192,
                 },
                 "performance": {
-                    "whisper_model": "turbo",
+                    "whisper_model": "large-v3",
                     "whisper_device": "auto",
-                    "chunk_minutes": 15.0,
+                    "chunk_minutes": 10.0,
                     "num_ctx": 16384,
                 },
             }
@@ -1889,41 +1936,33 @@ class CyberEditorApp:
 
         models: List[Dict[str, object]] = []
         try:
-            request = urllib_request.Request(
-                ollama_url.rstrip("/") + "/api/tags",
-                headers={"Accept": "application/json"},
+            models, ollama_started = ensure_ollama_service(
+                ollama_url, timeout=30.0
             )
-            with urllib_request.urlopen(request, timeout=3) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            for item in payload.get("models", []):
-                if not isinstance(item, dict):
-                    continue
-                name = str(item.get("name", "")).strip()
-                if not name:
-                    continue
-                models.append(
-                    {
-                        "name": name,
-                        "size": int(item.get("size") or 0),
-                    }
-                )
             results["Ollama"] = (
                 True,
-                f"{len(models)} 个模型" if models else "服务在线",
+                (
+                    f"{len(models)} 个模型 · 已自动启动"
+                    if ollama_started and models
+                    else "服务在线 · 已自动启动"
+                    if ollama_started
+                    else f"{len(models)} 个模型"
+                    if models
+                    else "服务在线"
+                ),
             )
-        except (OSError, ValueError, urllib_error.URLError):
+        except (
+            OSError,
+            ValueError,
+            urllib_error.URLError,
+            RuntimeServiceError,
+        ):
             results["Ollama"] = (False, "未连接")
 
-        resolve_candidates = [
-            Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"),
-            Path(
-                r"C:\Program Files\Blackmagic Design\DaVinci Resolve Studio\Resolve.exe"
-            ),
-        ]
-        resolve_ready = any(path.is_file() for path in resolve_candidates)
+        resolve_ready = find_resolve_executable() is not None
         results["Resolve"] = (
             resolve_ready,
-            "已检测，请确认 Studio" if resolve_ready else "未安装",
+            "已安装 · 执行时自动启动" if resolve_ready else "未安装",
         )
         hardware = detect_hardware()
         hardware.update(detect_torch_runtime())

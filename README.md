@@ -18,8 +18,14 @@ PowerShell 中运行：
 “性能配置”默认使用 `自动检测 / Auto`：界面以标准库读取 CPU、系统内存和 GPU，
 通过 `nvidia-smi`（可用时）读取准确显存，并在一次性子进程中确认当前 PyTorch 是否
 真的支持 CUDA。它会自动选择 Whisper 模型、设备模式、10–15 分钟分块时长、
-Ollama 上下文，以及在内存预算内最合适的**已安装** Ollama 模型。自动档不会下载
-模型，也不会让硬件性能档修改素材属性。
+Ollama 上下文，以及在内存预算内质量最合适的**已安装** Ollama 模型；模型排序会
+考虑中文、长上下文、指令遵循和量化，不再只比较文件大小。自动档不会擅自下载十几
+GB 的模型，也不会让硬件性能档修改素材属性。16GB VRAM + 64GB RAM 会默认进入
+“高质量（较慢）”：Whisper `large-v3`、10 分钟分块、16K 上下文。
+
+UI 启动时会检测本机 Ollama；若已安装但服务未运行，会自动启动后台 API，但不会
+加载模型或占用模型显存。Resolve 支持 C/D/其他盘的自定义安装位置，只在严格串行
+流程进入第 3 阶段后自动启动并等待脚本 API，因此不会提前与 Whisper/Ollama 抢显存。
 
 “工程 FPS”默认是**自动读取源素材**，不是固定 25。选择原片后，界面使用短生命周期
 `ffprobe` 进程读取 `avg_frame_rate` / `r_frame_rate`，并支持 23.976、29.97、59.94
@@ -107,6 +113,7 @@ CyberEditor-Agent/
 │  ├─ __init__.py
 │  ├─ gui.py                     # 无额外 UI 依赖的后备控制器与公共检测逻辑
 │  ├─ modern_gui.py              # Windows 11 / 4K / 中英文现代界面
+│  ├─ runtime_services.py        # 跨盘软件发现与 Ollama/Resolve 自动启动
 │  ├─ ui_i18n.py                 # 不依赖 GUI 包的中英文文案
 │  ├─ extractor.py               # Whisper + OpenCV 数据提取
 │  ├─ director.py                # Ollama 分块导演
@@ -123,6 +130,7 @@ CyberEditor-Agent/
    ├─ test_extractor.py
    ├─ test_gui.py
    ├─ test_orchestrator.py
+   ├─ test_runtime_services.py
    └─ test_resolve_executor.py
 ```
 
@@ -142,13 +150,17 @@ CyberEditor-Agent/
 
 | 设备 | Whisper | Ollama 建议 | 说明 |
 |---|---|---|---|
-| 核显/纯 CPU | `tiny` / `base` | 7B–14B Q4 | 慢，但整个流程仍可运行 |
-| 8–12GB VRAM | `small` | 14B/32B Q4 混合卸载 | 降低 `--num-ctx` 可节省内存 |
-| 16GB VRAM | `small` / `turbo` | 32B Q4，或 70B CPU/GPU 混合 | 严格串行是核心目标 |
-| 24GB+ VRAM | `turbo` / `large-v3` | 32B/70B 量化 | 仍建议保留串行策略 |
+| 核显/纯 CPU | `tiny` / `base` | Qwen 3.5 4B/9B Q4 | 慢，但整个流程仍可运行 |
+| 8–12GB VRAM | `small` / `turbo` | `qwen3.5:9b-q4_K_M` | 6.6GB，中文与长上下文表现好 |
+| 16GB VRAM | `large-v3` | `qwen3.5:9b-q8_0` | 约 11GB，可完整放入显存，推荐日常高质量档 |
+| 16GB VRAM + 64GB RAM | `large-v3` | `qwen3.5:35b-a3b` | 约 24GB，CPU/GPU 混合，质量优先且更慢 |
+| 24GB+ VRAM | `large-v3` | Qwen 3.5 27B/35B | 仍建议保留串行策略 |
 
-70B 模型不可能完整装入 16GB VRAM；“兼容”指 Ollama/llama.cpp 将部分层卸载到
-CPU/RAM。实际速度取决于量化、内存带宽和上下文长度。
+对本项目而言，当前的 `qwen2.5:3b` 适合功能测试，不是高质量纪录片剪辑模型。
+你的 16GB Quadro + 64GB RAM 可优先选择 `qwen3.5:35b-a3b`；若希望更稳定地
+全 GPU 运行，则选择 `qwen3.5:9b-q8_0`。混合卸载的实际速度取决于量化、内存带宽
+和上下文长度。Qwen 3.5 官方模型同时支持视觉、工具、推理与 201 种语言：
+[Qwen 3.5 on Ollama](https://ollama.com/library/qwen3.5)。
 
 Whisper 官方列出的近似显存占用从 tiny/base 的约 1GB 到 turbo 的约 6GB：
 [OpenAI Whisper README](https://github.com/openai/whisper#available-models-and-languages)。
@@ -206,11 +218,20 @@ Whisper 需要系统 FFmpeg；其官方安装和 Python 调用方式见
 
 ### 3. 准备 Ollama
 
-以下只是默认示例，可替换为本机已有模型：
+质量优先（16GB VRAM + 64GB RAM，下载约 24GB，运行较慢）：
 
 ```powershell
-ollama pull qwen2.5:32b
+ollama pull qwen3.5:35b-a3b
 ```
+
+更快且可完整放入 16GB 显存的高质量选择（约 11GB）：
+
+```powershell
+ollama pull qwen3.5:9b-q8_0
+```
+
+模型只需下载一次。之后 UI 会自动启动 Ollama 服务并优先选择已安装的高质量模型，
+但不会在未经确认时自动下载大模型。
 
 建议在启动 Ollama 前限制并行与同时驻留模型数，然后重启 Ollama：
 
@@ -226,15 +247,17 @@ setx OLLAMA_NUM_PARALLEL 1
 
 ## 一键运行
 
-先启动 Ollama；运行到 Resolve 阶段前还需启动 Resolve 并打开目标工程。
+无需手动启动 Ollama 或 Resolve：程序会启动本机 Ollama 服务但延迟到导演阶段才
+加载模型；Ollama 模型卸载后，执行器才自动启动 Resolve 并等待脚本 API。Resolve
+Studio 的 External Scripting 仍需预先设置一次为 `Local`。
 
 ```powershell
 python main.py `
   --video "D:\Documentary\source.mov" `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen2.5:32b" `
+  --ollama-model "qwen3.5:35b-a3b" `
   --project-fps 25 `
-  --chunk-minutes 12
+  --chunk-minutes 10
 ```
 
 默认输出：

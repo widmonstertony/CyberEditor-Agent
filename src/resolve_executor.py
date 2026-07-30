@@ -22,7 +22,13 @@ import re
 import struct
 import subprocess
 import sys
+import time
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+
+try:
+    from .runtime_services import find_resolve_executable
+except ImportError:  # pragma: no cover - direct ``python src/...`` fallback.
+    from runtime_services import find_resolve_executable
 
 
 LOGGER_NAME = "cybereditor.resolve"
@@ -71,6 +77,12 @@ class DaVinciExecutor:
         strict_fps:
             Fail instead of warning when JSON and Resolve FPS differ.
             JSON 与 Resolve FPS 不一致时失败，而非警告。
+        auto_start_resolve:
+            Start Resolve automatically when it is installed but not running.
+            Resolve 已安装但未运行时自动启动。
+        startup_timeout:
+            Maximum seconds to wait for the Resolve scripting API.
+            等待 Resolve 脚本 API 就绪的最长秒数。
     """
 
     def __init__(
@@ -80,6 +92,8 @@ class DaVinciExecutor:
         timeline_name: str = "CyberEditor Timeline",
         project_name: str = "CyberEditor Project",
         strict_fps: bool = False,
+        auto_start_resolve: bool = True,
+        startup_timeout: float = 120.0,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         """Initialize paths and policy without connecting to Resolve. / 初始化路径和策略，但不连接 Resolve。"""
@@ -92,10 +106,17 @@ class DaVinciExecutor:
         self.timeline_name = timeline_name.strip()
         self.project_name = project_name.strip()
         self.strict_fps = strict_fps
+        self.auto_start_resolve = bool(auto_start_resolve)
+        self.startup_timeout = float(startup_timeout)
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         if not self.timeline_name or not self.project_name:
             raise ResolveExecutorError(
                 "工程/时间线名称不能为空 / Project/timeline name cannot be empty."
+            )
+        if self.startup_timeout <= 0:
+            raise ResolveExecutorError(
+                "Resolve 启动超时必须大于 0 秒"
+                " / Resolve startup timeout must be greater than zero."
             )
 
         self.resolve: Any = None
@@ -227,14 +248,8 @@ class DaVinciExecutor:
             raise ResolveExecutorError(
                 "DaVinci Resolve 需要 64 位 Python / Resolve requires 64-bit Python."
             )
-        process_state = self._is_resolve_running()
-        if process_state is False:
-            raise ResolveExecutorError(
-                "未检测到 Resolve.exe。请启动 DaVinci Resolve 后重试。"
-                " / Resolve.exe is not running. Start Resolve and retry."
-            )
-
-        self._configure_resolve_library()
+        executable = find_resolve_executable()
+        self._configure_resolve_library(executable)
         module, checked, errors = self._load_resolve_module()
         if module is None:
             checked_text = "\n  - ".join(str(path) for path in checked)
@@ -246,18 +261,53 @@ class DaVinciExecutor:
                 f"Checked:\n  - {checked_text or '(none)'}\n"
                 f"Errors: {' | '.join(errors[-3:])}"
             )
-        try:
-            resolve = module.scriptapp("Resolve")
-        except Exception as exc:
-            raise ResolveExecutorError(
-                "连接 Resolve 失败。请在 Preferences > System > General 中将 "
-                "External scripting 设置为 Local，并重启 Resolve。\n"
-                f"Resolve connection failed; enable Local external scripting: {exc}"
-            ) from exc
+
+        process_state = self._is_resolve_running()
+        resolve = self._try_scriptapp(module)
+        launched_process: Optional[subprocess.Popen] = None
+        if resolve is None and process_state is not True:
+            if not self.auto_start_resolve:
+                raise ResolveExecutorError(
+                    "未检测到 Resolve.exe，且已关闭自动启动。"
+                    " / Resolve is not running and auto-start is disabled."
+                )
+            if executable is None:
+                raise ResolveExecutorError(
+                    "未找到 Resolve.exe。已检查注册表及所有磁盘的 Program Files。"
+                    " / Resolve.exe was not found in the registry or Program Files "
+                    "on mounted drives."
+                )
+            launched_process = self._launch_resolve(executable)
+            self.logger.info(
+                "已自动启动 Resolve，正在等待脚本 API（最长 %.0f 秒）"
+                " / Resolve auto-started; waiting up to %.0f seconds for its API",
+                self.startup_timeout,
+                self.startup_timeout,
+            )
+
+        if resolve is None:
+            deadline = time.monotonic() + self.startup_timeout
+            while resolve is None and time.monotonic() < deadline:
+                if (
+                    launched_process is not None
+                    and launched_process.poll() is not None
+                ):
+                    raise ResolveExecutorError(
+                        "Resolve 启动后提前退出。请手动打开 Resolve 检查启动报错。"
+                        " / Resolve exited during startup; open it manually to "
+                        "inspect the startup error."
+                    )
+                time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
+                resolve = self._try_scriptapp(module)
         if resolve is None:
             raise ResolveExecutorError(
-                "GetResolve() 返回空实例。确认 Resolve 正在运行、外部脚本设为 Local。"
-                " / GetResolve() returned no instance; check Resolve and Local scripting."
+                "Resolve 已运行，但脚本 API 在等待后仍不可用。请在 Preferences > "
+                "System > General 中将 External scripting 设为 Local 后重启。"
+                "当前安装的 API 文档要求 DaVinci Resolve Studio；免费版可能无法"
+                "接受外部脚本连接。\n"
+                "Resolve is running but its API did not become ready. Enable Local "
+                "external scripting and restart Resolve. The bundled API documentation "
+                "targets DaVinci Resolve Studio."
             )
         try:
             name = resolve.GetProductName()
@@ -740,12 +790,25 @@ class DaVinciExecutor:
         return paths
 
     @staticmethod
-    def _configure_resolve_library() -> None:
-        """Populate RESOLVE_SCRIPT_LIB from standard installs when absent. / 未配置时从标准安装位置填充 RESOLVE_SCRIPT_LIB。"""
+    def _configure_resolve_library(
+        executable: Optional[Path] = None,
+    ) -> None:
+        """
+        Populate ``RESOLVE_SCRIPT_LIB`` from default or custom installs.
+        从默认或自定义安装位置填充 ``RESOLVE_SCRIPT_LIB``。
+        """
         if os.environ.get("RESOLVE_SCRIPT_LIB"):
             return
         root = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
-        candidates = (
+        candidates: List[Path] = []
+        if executable is not None:
+            candidates.extend(
+                (
+                    executable.parent / "fusionscript.dll",
+                    executable.parent / "Fusion" / "fusionscript.dll",
+                )
+            )
+        candidates.extend((
             root
             / "Blackmagic Design"
             / "DaVinci Resolve"
@@ -755,11 +818,42 @@ class DaVinciExecutor:
             / "DaVinci Resolve"
             / "Fusion"
             / "fusionscript.dll",
-        )
+        ))
         for candidate in candidates:
             if candidate.is_file():
                 os.environ["RESOLVE_SCRIPT_LIB"] = str(candidate)
                 return
+
+    @staticmethod
+    def _try_scriptapp(module: Any) -> Any:
+        """
+        Try one non-throwing ``scriptapp('Resolve')`` connection.
+        尝试一次不向外抛异常的 ``scriptapp('Resolve')`` 连接。
+        """
+        try:
+            return module.scriptapp("Resolve")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _launch_resolve(executable: Path) -> subprocess.Popen:
+        """
+        Start Resolve visibly so the user can see splash/license errors.
+        以可见方式启动 Resolve，便于用户查看启动或许可证错误。
+        """
+        try:
+            return subprocess.Popen(
+                [str(executable)],
+                cwd=str(executable.parent),
+                close_fds=True,
+                creationflags=getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+                ),
+            )
+        except OSError as exc:
+            raise ResolveExecutorError(
+                f"自动启动 Resolve 失败 / Failed to auto-start Resolve: {exc}"
+            ) from exc
 
     @staticmethod
     def _is_resolve_running() -> Optional[bool]:
@@ -984,6 +1078,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-name", default="CyberEditor Project")
     parser.add_argument("--strict-fps", action="store_true")
     parser.add_argument(
+        "--no-auto-start-resolve",
+        action="store_true",
+        help="Do not launch Resolve automatically when it is not running.",
+    )
+    parser.add_argument(
+        "--resolve-startup-timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for Resolve's scripting API after launch.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -1002,6 +1107,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             timeline_name=args.timeline_name,
             project_name=args.project_name,
             strict_fps=args.strict_fps,
+            auto_start_resolve=not args.no_auto_start_resolve,
+            startup_timeout=args.resolve_startup_timeout,
             logger=logger,
         )
         executor.run()
