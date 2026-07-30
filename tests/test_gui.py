@@ -8,8 +8,10 @@ import unittest
 from src.gui import (
     WorkflowOptions,
     build_runtime_environment,
+    detect_system_theme,
     enable_windows_high_dpi,
     get_primary_work_area,
+    recommend_automatic_settings,
 )
 
 
@@ -88,6 +90,57 @@ class WorkflowOptionsTests(unittest.TestCase):
         self.assertGreaterEqual(top, 0)
         self.assertGreater(width, 0)
         self.assertGreater(height, 0)
+
+    def test_auto_profile_is_conservative_on_low_memory(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {
+                "ram_gb": 16,
+                "vram_gb": 0,
+                "cpu_threads": 8,
+            },
+            [
+                {"name": "small:latest", "size": 2 * 1024**3},
+                {"name": "large:latest", "size": 20 * 1024**3},
+            ],
+        )
+        self.assertEqual(recommendation["profile"], "conservative")
+        self.assertEqual(recommendation["whisper_model"], "base")
+        self.assertEqual(recommendation["num_ctx"], 4096)
+        self.assertEqual(recommendation["ollama_model"], "small:latest")
+
+    def test_auto_profile_uses_capable_installed_model(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {
+                "ram_gb": 64,
+                "vram_gb": 16,
+                "cpu_threads": 24,
+                "torch_cuda": True,
+            },
+            [
+                {"name": "qwen:3b", "size": 2 * 1024**3},
+                {"name": "qwen:32b", "size": 20 * 1024**3},
+            ],
+        )
+        self.assertEqual(recommendation["profile"], "performance")
+        self.assertEqual(recommendation["whisper_model"], "turbo")
+        self.assertEqual(recommendation["num_ctx"], 16384)
+        self.assertEqual(recommendation["ollama_model"], "qwen:32b")
+
+    def test_auto_profile_does_not_assume_pytorch_cuda(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {
+                "ram_gb": 64,
+                "vram_gb": 16,
+                "cpu_threads": 16,
+                "torch_cuda": False,
+            },
+            [{"name": "qwen:3b", "size": 2 * 1024**3}],
+        )
+        self.assertEqual(recommendation["whisper_model"], "small")
+        self.assertEqual(recommendation["whisper_device"], "auto")
+
+    def test_system_theme_has_supported_value(self) -> None:
+        self.assertIn(detect_system_theme(), {"light", "dark"})
 
 
 if __name__ == "__main__":

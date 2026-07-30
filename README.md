@@ -15,6 +15,16 @@ PowerShell 中运行：
 阶段进度、停止任务和打开输出目录等功能。UI 只使用 Python 标准库 Tkinter，并通过
 子进程调用原有 `main.py`，不会改变严格串行与显存释放策略。
 
+“性能配置”默认使用 `自动检测 / Auto`：界面以标准库读取 CPU、系统内存和 GPU，
+通过 `nvidia-smi`（可用时）读取准确显存，并在一次性子进程中确认当前 PyTorch 是否
+真的支持 CUDA。它会自动选择 Whisper 模型、设备模式、10–15 分钟分块时长、
+Ollama 上下文，以及在内存预算内最合适的**已安装** Ollama 模型。自动档不会下载
+模型，也不会修改必须与素材/工程一致的 FPS。
+
+右上角主题菜单支持 `跟随系统 / System`、`深色 / Dark` 和 `浅色 / Light`。跟随
+系统模式读取 Windows 的应用主题设置，并在系统主题改变时实时切换。三种模式都保留
+Per-Monitor DPI Awareness V2，适配 4K 与混合 DPI 显示器。
+
 ## Resolve 版本与 Sony A7M4 PP8 素材
 
 本项目的最终执行阶段需要 **DaVinci Resolve Studio**（付费版，官方名称不是

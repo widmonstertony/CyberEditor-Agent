@@ -33,6 +33,20 @@ the strict serial execution and VRAM-release guarantees remain intact. The UI
 enables Windows Per-Monitor DPI Awareness V2 and scales itself dynamically for
 4K and mixed-DPI displays.
 
+The default `Auto` hardware profile detects CPU threads, system RAM, GPU, and
+VRAM using standard-library and operating-system interfaces. It uses
+`nvidia-smi` when available for accurate NVIDIA memory and probes PyTorch CUDA
+support in a disposable child process. The result selects a Whisper model,
+device mode, 10–15 minute chunk size, Ollama context, and the best
+already-installed Ollama model within a safe memory budget. Auto mode never
+downloads a model and never guesses FPS, which must match the source and Resolve
+project.
+
+The top-right theme menu provides `System`, `Dark`, and `Light` modes. System
+mode reads the Windows application theme and follows changes while the UI is
+open. All three modes retain Per-Monitor DPI Awareness V2 for sharp rendering
+on 4K and mixed-DPI displays.
+
 ## Resolve edition and Sony A7 IV PP8 media
 
 The final automation stage requires **DaVinci Resolve Studio**. The paid edition
