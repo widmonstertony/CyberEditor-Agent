@@ -12,8 +12,8 @@ PowerShell 中运行：
 ```
 
 桌面界面提供素材选择、Whisper/Ollama 参数、断点续跑模式、Resolve 开关、实时日志、
-阶段进度、停止任务和打开输出目录等功能。UI 只使用 Python 标准库 Tkinter，并通过
-子进程调用原有 `main.py`，不会改变严格串行与显存释放策略。
+阶段进度、停止任务和打开输出目录等功能。现代界面使用轻量级 CustomTkinter，并通过
+子进程调用原有 `main.py`；常驻 UI 不导入 PyTorch，不会改变严格串行与显存释放策略。
 
 “性能配置”默认使用 `自动检测 / Auto`：界面以标准库读取 CPU、系统内存和 GPU，
 通过 `nvidia-smi`（可用时）读取准确显存，并在一次性子进程中确认当前 PyTorch 是否
@@ -21,9 +21,10 @@ PowerShell 中运行：
 Ollama 上下文，以及在内存预算内最合适的**已安装** Ollama 模型。自动档不会下载
 模型，也不会修改必须与素材/工程一致的 FPS。
 
-右上角主题菜单支持 `跟随系统 / System`、`深色 / Dark` 和 `浅色 / Light`。跟随
-系统模式读取 Windows 的应用主题设置，并在系统主题改变时实时切换。三种模式都保留
-Per-Monitor DPI Awareness V2，适配 4K 与混合 DPI 显示器。
+右上角主题菜单支持跟随系统、深色和浅色；语言菜单支持跟随 Windows、中文和 English，
+两者都可即时切换并保存。界面启用 Per-Monitor DPI Awareness V2、Windows 11 Mica
+标题背景与圆角，同时保留原生标题栏，因此贴靠布局、任务栏预览和 Alt+Tab 仍然可用。
+4K 几何尺寸会按 Windows 工作区和 CustomTkinter 的实际缩放比例计算，避免重复缩放。
 
 ## Resolve 版本与 Sony A7M4 PP8 素材
 
@@ -89,6 +90,8 @@ CyberEditor-Agent/
 ├─ gui.py                        # Windows 桌面 UI 入口
 ├─ launch_ui.bat                 # 双击启动 UI
 ├─ main.py                       # 严格串行工作流调度器
+├─ scripts/
+│  └─ install_windows.ps1        # 自动选择 CPU/CUDA 的 Windows 安装器
 ├─ requirements.txt
 ├─ README.md
 ├─ README_EN.md
@@ -97,7 +100,8 @@ CyberEditor-Agent/
 ├─ SECURITY.md
 ├─ src/
 │  ├─ __init__.py
-│  ├─ gui.py                    # 高 DPI 桌面工作流控制器
+│  ├─ gui.py                     # 无额外 UI 依赖的后备控制器与公共检测逻辑
+│  ├─ modern_gui.py              # Windows 11 / 4K / 中英文现代界面
 │  ├─ extractor.py               # Whisper + OpenCV 数据提取
 │  ├─ director.py                # Ollama 分块导演
 │  └─ resolve_executor.py        # DaVinci Resolve 自动组装
@@ -163,21 +167,32 @@ ollama --version
 设为 `Local`，然后重启 Resolve。免费版可以运行本项目的提取与 AI 导演阶段，但不能
 让独立 UI/Python 进程自动执行最终时间线组装。
 
-### 2. 克隆并创建虚拟环境
+### 2. 克隆并自动安装（推荐）
 
 ```powershell
 git clone https://github.com/widmonstertony/CyberEditor-Agent.git
 cd CyberEditor-Agent
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\install_windows.ps1
 ```
 
-NVIDIA 用户建议先按 [PyTorch 官方安装器](https://pytorch.org/get-started/locally/)
-安装与驱动匹配的 CUDA 版本，再安装项目依赖：
+安装器会创建 `.venv`、安装依赖、检测 `nvidia-smi` 与驱动版本，并在兼容的 NVIDIA
+电脑上用 PyTorch 官方索引替换通用 CPU wheel，最后实际运行 CUDA 张量计算。没有
+NVIDIA GPU 时会安全保留 CPU 版。也可以强制指定：
 
 ```powershell
-pip install -r requirements.txt
+.\scripts\install_windows.ps1 -ComputePlatform cpu
+.\scripts\install_windows.ps1 -ComputePlatform cu126
+.\scripts\install_windows.ps1 -ComputePlatform cu130
+```
+
+如果希望手动安装，请先创建虚拟环境，再按
+[PyTorch 官方安装器](https://pytorch.org/get-started/locally/)选择 Windows、Pip
+和与驱动兼容的 CUDA 版本，然后运行 `pip install -r requirements.txt`。完成后可用
+以下命令验证；只有返回 `True` 才代表当前虚拟环境真正启用了 CUDA：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 ```
 
 Whisper 需要系统 FFmpeg；其官方安装和 Python 调用方式见

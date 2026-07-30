@@ -13,6 +13,7 @@ from src.gui import (
     get_primary_work_area,
     recommend_automatic_settings,
 )
+from src.modern_gui import resolve_language, translate
 
 
 class WorkflowOptionsTests(unittest.TestCase):
@@ -141,6 +142,14 @@ class WorkflowOptionsTests(unittest.TestCase):
 
     def test_system_theme_has_supported_value(self) -> None:
         self.assertIn(detect_system_theme(), {"light", "dark"})
+
+    def test_interface_translations_cover_chinese_and_english(self) -> None:
+        self.assertEqual(translate("zh", "start"), "开始串行工作流")
+        self.assertEqual(translate("en", "start"), "Start serial workflow")
+
+    def test_explicit_interface_language_does_not_depend_on_system(self) -> None:
+        self.assertEqual(resolve_language("zh"), "zh")
+        self.assertEqual(resolve_language("en"), "en")
 
 
 if __name__ == "__main__":

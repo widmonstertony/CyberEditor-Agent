@@ -541,6 +541,7 @@ class WorkflowOptions:
     flow: str = "full"
     hardware_profile: str = "auto"
     theme: str = "system"
+    ui_language: str = "system"
     whisper_model: str = "small"
     whisper_device: str = "auto"
     language: str = ""

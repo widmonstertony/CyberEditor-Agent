@@ -27,11 +27,10 @@ The bilingual desktop UI includes source/proxy selection, Whisper and Ollama
 settings, resumable workflow modes, Resolve controls, live logs, stage
 progress, safe cancellation, environment checks, and output shortcuts.
 
-The UI uses only the standard-library Tkinter toolkit and launches the existing
-`main.py` orchestrator as a child process. It never imports ML dependencies, so
-the strict serial execution and VRAM-release guarantees remain intact. The UI
-enables Windows Per-Monitor DPI Awareness V2 and scales itself dynamically for
-4K and mixed-DPI displays.
+The modern UI uses lightweight CustomTkinter and launches the existing
+`main.py` orchestrator as a child process. The resident UI never imports
+PyTorch, so the strict serial execution and VRAM-release guarantees remain
+intact.
 
 The default `Auto` hardware profile detects CPU threads, system RAM, GPU, and
 VRAM using standard-library and operating-system interfaces. It uses
@@ -42,10 +41,12 @@ already-installed Ollama model within a safe memory budget. Auto mode never
 downloads a model and never guesses FPS, which must match the source and Resolve
 project.
 
-The top-right theme menu provides `System`, `Dark`, and `Light` modes. System
-mode reads the Windows application theme and follows changes while the UI is
-open. All three modes retain Per-Monitor DPI Awareness V2 for sharp rendering
-on 4K and mixed-DPI displays.
+The top-right menus switch theme (`System`, `Dark`, `Light`) and interface
+language (`System`, `中文`, `English`) immediately and remember both choices.
+The window uses Per-Monitor DPI Awareness V2, a Windows 11 Mica-backed title
+surface, rounded corners, and a work-area-aware 4K layout. It keeps the native
+title bar, so Snap Layouts, taskbar previews, Alt+Tab, and accessibility remain
+available.
 
 ## Resolve edition and Sony A7 IV PP8 media
 
@@ -113,6 +114,8 @@ CyberEditor-Agent/
 ├─ gui.py                        # Windows desktop UI entry point
 ├─ launch_ui.bat                 # Double-click UI launcher
 ├─ main.py                       # Strict serial workflow orchestrator
+├─ scripts/
+│  └─ install_windows.ps1        # Windows CPU/CUDA auto-installer
 ├─ requirements.txt
 ├─ README.md                     # Simplified Chinese documentation
 ├─ README_EN.md                  # English documentation
@@ -121,7 +124,8 @@ CyberEditor-Agent/
 ├─ SECURITY.md
 ├─ src/
 │  ├─ __init__.py
-│  ├─ gui.py                     # High-DPI desktop workflow controller
+│  ├─ gui.py                     # Dependency-free fallback and shared probes
+│  ├─ modern_gui.py              # Windows 11, 4K, Chinese/English UI
 │  ├─ extractor.py               # Whisper + OpenCV extraction
 │  ├─ director.py                # Chunked Ollama director
 │  └─ resolve_executor.py        # DaVinci Resolve assembly
@@ -190,23 +194,35 @@ Install **DaVinci Resolve Studio**, open Preferences, set External Scripting to
 and AI director stages, but an independent UI/Python process cannot use it to
 assemble the final timeline automatically.
 
-### 2. Clone and create a virtual environment
+### 2. Clone and install automatically (recommended)
 
 ```powershell
 git clone https://github.com/widmonstertony/CyberEditor-Agent.git
 cd CyberEditor-Agent
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\install_windows.ps1
 ```
 
-NVIDIA users should first use the
-[official PyTorch installer](https://pytorch.org/get-started/locally/) to
-install the CUDA build matching their driver, then install the project
-dependencies:
+The installer creates `.venv`, installs dependencies, checks `nvidia-smi` and
+the NVIDIA driver, replaces the generic CPU wheel from the official PyTorch
+CUDA index when compatible, and finishes with a real CUDA tensor calculation.
+Systems without an NVIDIA GPU safely keep the CPU build. You can also override
+the automatic choice:
 
 ```powershell
-pip install -r requirements.txt
+.\scripts\install_windows.ps1 -ComputePlatform cpu
+.\scripts\install_windows.ps1 -ComputePlatform cu126
+.\scripts\install_windows.ps1 -ComputePlatform cu130
+```
+
+For manual installation, create the virtual environment, use the
+[official PyTorch installer](https://pytorch.org/get-started/locally/) to
+select Windows, Pip, and a CUDA build supported by the installed driver, then
+run `pip install -r requirements.txt`. Verify the actual environment with the
+command below. Only `True` means CUDA is genuinely active:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 ```
 
 Whisper also requires the system FFmpeg executable. See
