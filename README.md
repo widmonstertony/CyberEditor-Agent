@@ -1,5 +1,58 @@
 # CyberEditor-Agent
 
+[简体中文](README.md) | [English](README_EN.md)
+
+## Windows 桌面 UI / Desktop UI
+
+安装依赖后，双击仓库根目录的 `launch_ui.bat` 即可启动图形界面，也可以在
+PowerShell 中运行：
+
+```powershell
+.\.venv\Scripts\python.exe gui.py
+```
+
+桌面界面提供素材选择、Whisper/Ollama 参数、断点续跑模式、Resolve 开关、实时日志、
+阶段进度、停止任务和打开输出目录等功能。现代界面使用轻量级 CustomTkinter，并通过
+子进程调用原有 `main.py`；常驻 UI 不导入 PyTorch，不会改变严格串行与显存释放策略。
+
+“性能配置”默认使用 `自动检测 / Auto`：界面以标准库读取 CPU、系统内存和 GPU，
+通过 `nvidia-smi`（可用时）读取准确显存，并在一次性子进程中确认当前 PyTorch 是否
+真的支持 CUDA。它会自动选择 Whisper 模型、设备模式、10–15 分钟分块时长、
+Ollama 上下文，以及在内存预算内最合适的**已安装** Ollama 模型。自动档不会下载
+模型，也不会让硬件性能档修改素材属性。
+
+“工程 FPS”默认是**自动读取源素材**，不是固定 25。选择原片后，界面使用短生命周期
+`ffprobe` 进程读取 `avg_frame_rate` / `r_frame_rate`，并支持 23.976、29.97、59.94
+等分数帧率；没有可读取素材时，会依次尝试 `timeline_cuts.json` 和 `raw_data.json`。
+只有检测失败才会在启动前提示用户，仍可从现代下拉菜单手动选择常用工程帧率。
+
+右上角主题菜单支持跟随系统、深色和浅色；语言菜单支持跟随 Windows、中文和 English，
+两者都可即时切换并保存。界面启用 Per-Monitor DPI Awareness V2、Windows 11 Mica
+标题背景与圆角，同时保留原生标题栏，因此贴靠布局、任务栏预览和 Alt+Tab 仍然可用。
+4K 几何尺寸会按 Windows 工作区和 CustomTkinter 的实际缩放比例计算，避免重复缩放。
+
+## Resolve 版本与 Sony A7M4 PP8 素材
+
+本项目的最终执行阶段需要 **DaVinci Resolve Studio**（付费版，官方名称不是
+“Resolve Pro”）。原因不是简单的 4K 分辨率，而是：
+
+- 本项目从独立 Python/UI 进程连接 Resolve，所需的 External Scripting/API 访问是
+  Studio 功能。免费版只能在 Resolve 内部的 Console 或 Scripts 菜单运行脚本。
+- Resolve 免费版官方定位为处理最高 UHD 3840×2160、60 fps 的大多数 8-bit 格式；
+  Studio 支持专业 10-bit 格式、最高 120 fps、超过 4K 的分辨率，并提供 H.264/H.265
+  硬件编解码加速。
+
+如果“M4”指 Sony α7 IV（A7M4），PP8 默认是 **S-Log3 + S-Gamut3.Cine 图片配置**，
+不是 RAW 视频格式。相机可能按所选记录格式生成 XAVC S、XAVC HS 或 XAVC S-I，
+并可能为 8-bit 或 10-bit 4:2:2。对于常见的 PP8 4K 10-bit 4:2:2 素材以及本项目的
+外部自动组装流程，建议直接安装 Resolve Studio。
+
+参考：
+[Blackmagic Design 版本对比](https://www.blackmagicdesign.com/products/davinciresolve)、
+[Resolve Studio 脚本与自动化](https://www.blackmagicdesign.com/products/davinciresolve/studio)、
+[Sony α7 IV PP8 说明](https://helpguide.sony.net/ilc/2110/v1/en/contents/TP1000649066.html)、
+[Sony α7 IV 记录格式](https://helpguide.sony.net/ilc/2110/v1/en/contents/TP1000640834.html)。
+
 完全本地、隐私优先、面向 Windows 的 AI 长视频自动剪辑 MVP。
 
 CyberEditor-Agent 使用 Whisper 提取带时间戳台词，以 OpenCV 生成轻量场景打点，
@@ -39,14 +92,22 @@ Ollama 官方 API 支持以 JSON Schema 约束输出，并以 `keep_alive: 0` �
 
 ```text
 CyberEditor-Agent/
+├─ gui.py                        # Windows 桌面 UI 入口
+├─ launch_ui.bat                 # 双击启动 UI
 ├─ main.py                       # 严格串行工作流调度器
+├─ scripts/
+│  └─ install_windows.ps1        # 自动选择 CPU/CUDA 的 Windows 安装器
 ├─ requirements.txt
 ├─ README.md
+├─ README_EN.md
 ├─ LICENSE
 ├─ CONTRIBUTING.md
 ├─ SECURITY.md
 ├─ src/
 │  ├─ __init__.py
+│  ├─ gui.py                     # 无额外 UI 依赖的后备控制器与公共检测逻辑
+│  ├─ modern_gui.py              # Windows 11 / 4K / 中英文现代界面
+│  ├─ ui_i18n.py                 # 不依赖 GUI 包的中英文文案
 │  ├─ extractor.py               # Whisper + OpenCV 数据提取
 │  ├─ director.py                # Ollama 分块导演
 │  └─ resolve_executor.py        # DaVinci Resolve 自动组装
@@ -60,6 +121,7 @@ CyberEditor-Agent/
 └─ tests/
    ├─ test_director.py
    ├─ test_extractor.py
+   ├─ test_gui.py
    ├─ test_orchestrator.py
    └─ test_resolve_executor.py
 ```
@@ -74,7 +136,7 @@ CyberEditor-Agent/
 - 至少 20GB 可用磁盘空间，另加代理素材和模型空间
 - FFmpeg
 - Ollama
-- DaVinci Resolve，且已允许本机 Python 脚本访问
+- DaVinci Resolve Studio，且 External Scripting 已设为 `Local`
 
 ### 模型建议
 
@@ -107,24 +169,36 @@ ffmpeg -version
 ollama --version
 ```
 
-安装 DaVinci Resolve 后，在 Resolve 的偏好设置中允许本机 External Scripting
-访问（Local），然后重启 Resolve。
+安装 **DaVinci Resolve Studio** 后，在 Resolve 的偏好设置中将 External Scripting
+设为 `Local`，然后重启 Resolve。免费版可以运行本项目的提取与 AI 导演阶段，但不能
+让独立 UI/Python 进程自动执行最终时间线组装。
 
-### 2. 克隆并创建虚拟环境
+### 2. 克隆并自动安装（推荐）
 
 ```powershell
 git clone https://github.com/widmonstertony/CyberEditor-Agent.git
 cd CyberEditor-Agent
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\install_windows.ps1
 ```
 
-NVIDIA 用户建议先按 [PyTorch 官方安装器](https://pytorch.org/get-started/locally/)
-安装与驱动匹配的 CUDA 版本，再安装项目依赖：
+安装器会创建 `.venv`、安装依赖、检测 `nvidia-smi` 与驱动版本，并在兼容的 NVIDIA
+电脑上用 PyTorch 官方索引替换通用 CPU wheel，最后实际运行 CUDA 张量计算。没有
+NVIDIA GPU 时会安全保留 CPU 版。也可以强制指定：
 
 ```powershell
-pip install -r requirements.txt
+.\scripts\install_windows.ps1 -ComputePlatform cpu
+.\scripts\install_windows.ps1 -ComputePlatform cu126
+.\scripts\install_windows.ps1 -ComputePlatform cu130
+```
+
+如果希望手动安装，请先创建虚拟环境，再按
+[PyTorch 官方安装器](https://pytorch.org/get-started/locally/)选择 Windows、Pip
+和与驱动兼容的 CUDA 版本，然后运行 `pip install -r requirements.txt`。完成后可用
+以下命令验证；只有返回 `True` 才代表当前虚拟环境真正启用了 CUDA：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 ```
 
 Whisper 需要系统 FFmpeg；其官方安装和 Python 调用方式见

@@ -1,6 +1,7 @@
-# Install a CUDA-enabled PyTorch build first when NVIDIA GPU acceleration is
-# required; see https://pytorch.org/get-started/locally/
+# On Windows, scripts/install_windows.ps1 replaces this generic wheel with the
+# correct official CUDA wheel when a compatible NVIDIA driver is detected.
 torch>=2.1.0
 openai-whisper>=20231117
 opencv-python>=4.8.0,<5.0
 requests>=2.31.0,<3.0
+customtkinter>=6.0.0,<7.0
