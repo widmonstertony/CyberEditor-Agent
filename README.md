@@ -1,5 +1,18 @@
 # CyberEditor-Agent
 
+## Windows 桌面 UI / Desktop UI
+
+安装依赖后，双击仓库根目录的 `launch_ui.bat` 即可启动图形界面，也可以在
+PowerShell 中运行：
+
+```powershell
+.\.venv\Scripts\python.exe gui.py
+```
+
+桌面界面提供素材选择、Whisper/Ollama 参数、断点续跑模式、Resolve 开关、实时日志、
+阶段进度、停止任务和打开输出目录等功能。UI 只使用 Python 标准库 Tkinter，并通过
+子进程调用原有 `main.py`，不会改变严格串行与显存释放策略。
+
 完全本地、隐私优先、面向 Windows 的 AI 长视频自动剪辑 MVP。
 
 CyberEditor-Agent 使用 Whisper 提取带时间戳台词，以 OpenCV 生成轻量场景打点，
