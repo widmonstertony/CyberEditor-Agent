@@ -17,7 +17,6 @@ from __future__ import annotations
 import ctypes
 from dataclasses import asdict
 import json
-import locale
 import os
 from pathlib import Path
 import queue
@@ -38,11 +37,18 @@ from .gui import (
     WorkflowOptions,
     build_runtime_environment,
     detect_hardware,
+    detect_media_fps,
     detect_system_theme,
     detect_torch_runtime,
     enable_windows_high_dpi,
     get_primary_work_area,
+    parse_frame_rate,
     recommend_automatic_settings,
+)
+from .ui_i18n import (
+    detect_system_language,
+    resolve_language,
+    translate,
 )
 
 
@@ -64,165 +70,6 @@ COLORS = {
     "danger_hover": ("#F9DCE2", "#532538"),
     "console": ("#F6F8FC", "#090F1B"),
 }
-
-TRANSLATIONS: Dict[str, Dict[str, str]] = {
-    "zh": {
-        "tagline": "本地 · 隐私 · 严格串行 AI 工作流",
-        "open_output": "打开输出",
-        "theme_system": "跟随系统", "theme_dark": "深色", "theme_light": "浅色",
-        "language_system": "跟随系统", "language_zh": "中文", "language_en": "English",
-        "python": "PYTHON", "ffmpeg": "FFMPEG", "cuda": "PYTORCH / CUDA",
-        "ollama": "OLLAMA", "resolve": "DAVINCI", "detecting": "检测中…",
-        "ready": "可用", "online": "在线", "not_found": "未找到",
-        "not_connected": "未连接", "installed": "已安装",
-        "models_count": "{count} 个模型", "not_installed": "未安装",
-        "gpu_cuda_ready": "{version} · CUDA 可用",
-        "gpu_cpu_only": "{version} · 仅 CPU",
-        "project_media": "项目与素材", "workflow_mode": "工作流模式",
-        "flow_full": "完整流程", "flow_director": "从 AI 导演继续",
-        "flow_resolve": "仅执行 Resolve", "source_video": "源视频",
-        "proxy_media": "代理素材（可选）", "runtime_data": "运行数据目录",
-        "browse": "浏览", "select_folder": "选择", "project_fps": "项目 FPS",
-        "ai_hardware": "AI 与硬件", "hardware_profile": "硬件配置",
-        "profile_auto": "自动检测", "profile_conservative": "节能",
-        "profile_balanced": "均衡", "profile_performance": "高性能",
-        "profile_custom": "自定义",
-        "detecting_hardware": "正在检测硬件并计算安全参数…",
-        "whisper_model": "Whisper 模型", "whisper_device": "Whisper 设备",
-        "source_language": "语音语言（可选，如 zh/en）",
-        "ollama_model": "Ollama 模型", "ollama_context": "上下文长度",
-        "ollama_url": "Ollama 地址", "chunk_minutes": "分块分钟数（10–15）",
-        "resolve_settings": "DaVinci Resolve", "timeline_name": "时间线名称",
-        "project_name": "工程名称", "skip_resolve": "暂不执行 Resolve",
-        "strict_fps": "严格校验 JSON 与工程 FPS",
-        "run_center": "任务中心", "serial_badge": "SERIAL / VRAM SAFE",
-        "window_effect": "Windows 11 Mica · 原生贴靠布局",
-        "ready_stage": "准备就绪",
-        "ready_hint": "选择素材后启动；重型模块始终一次只运行一个。",
-        "starting": "正在启动", "extracting": "1/3  提取素材",
-        "directing": "2/3  AI 导演", "assembling": "3/3  Resolve 组装",
-        "whisper_released": "Whisper 显存已释放",
-        "ollama_released": "Ollama 显存已释放", "completed": "全部完成",
-        "stopping": "正在停止", "stopped": "已停止",
-        "failed": "运行失败（退出码 {code}）", "start": "开始串行工作流",
-        "stop": "停止", "live_log": "实时日志",
-        "view_timeline": "查看 timeline_cuts.json", "recheck": "重新检测环境",
-        "custom_settings": "自定义参数", "auto_settings": "自动配置",
-        "settings_applied": "已应用自动配置",
-        "ui_ready_log": "现代界面已启动。请选择素材并开始运行。\n",
-        "environment_log": "环境检测", "hardware_log": "硬件检测",
-        "launch_log": "启动严格串行工作流", "command_log": "命令",
-        "workflow_success": "✓ 工作流成功完成\n",
-        "workflow_stopped": "工作流已停止\n",
-        "workflow_failed": "✕ 工作流失败，退出码 {code}\n",
-        "stop_title": "停止任务",
-        "stop_question": "确定停止当前任务吗？已完成的中间文件会保留。",
-        "close_title": "任务正在运行",
-        "close_question": "关闭界面将停止当前任务。是否继续？",
-        "cannot_start": "无法启动", "launch_failed": "启动失败",
-        "no_output": "尚无输出", "no_output_detail": "尚未生成文件：\n{path}",
-        "select_video": "选择源视频", "select_proxy": "选择代理素材",
-        "select_data": "选择运行数据目录", "stop_requested": "用户请求停止任务\n",
-    },
-    "en": {
-        "tagline": "LOCAL · PRIVATE · STRICT SERIAL AI WORKFLOW",
-        "open_output": "Open output",
-        "theme_system": "System", "theme_dark": "Dark", "theme_light": "Light",
-        "language_system": "System", "language_zh": "中文", "language_en": "English",
-        "python": "PYTHON", "ffmpeg": "FFMPEG", "cuda": "PYTORCH / CUDA",
-        "ollama": "OLLAMA", "resolve": "DAVINCI", "detecting": "Detecting…",
-        "ready": "Ready", "online": "Online", "not_found": "Not found",
-        "not_connected": "Not connected", "installed": "Installed",
-        "models_count": "{count} models", "not_installed": "Not installed",
-        "gpu_cuda_ready": "{version} · CUDA ready",
-        "gpu_cpu_only": "{version} · CPU only",
-        "project_media": "Project & media", "workflow_mode": "Workflow mode",
-        "flow_full": "Full pipeline", "flow_director": "Resume at AI director",
-        "flow_resolve": "Resolve only", "source_video": "Source video",
-        "proxy_media": "Proxy media (optional)",
-        "runtime_data": "Runtime data directory", "browse": "Browse",
-        "select_folder": "Choose", "project_fps": "Project FPS",
-        "ai_hardware": "AI & hardware", "hardware_profile": "Hardware profile",
-        "profile_auto": "Auto detect", "profile_conservative": "Conservative",
-        "profile_balanced": "Balanced", "profile_performance": "Performance",
-        "profile_custom": "Custom",
-        "detecting_hardware": "Detecting hardware and calculating safe settings…",
-        "whisper_model": "Whisper model", "whisper_device": "Whisper device",
-        "source_language": "Speech language (optional, e.g. zh/en)",
-        "ollama_model": "Ollama model", "ollama_context": "Context length",
-        "ollama_url": "Ollama URL", "chunk_minutes": "Chunk minutes (10–15)",
-        "resolve_settings": "DaVinci Resolve", "timeline_name": "Timeline name",
-        "project_name": "Project name", "skip_resolve": "Skip Resolve for now",
-        "strict_fps": "Strict JSON/project FPS validation",
-        "run_center": "Run center", "serial_badge": "SERIAL / VRAM SAFE",
-        "window_effect": "Windows 11 Mica · native Snap Layouts",
-        "ready_stage": "Ready",
-        "ready_hint": "Choose media and start. Only one heavy stage runs at a time.",
-        "starting": "Starting", "extracting": "1/3  Extracting media",
-        "directing": "2/3  AI directing", "assembling": "3/3  Resolve assembly",
-        "whisper_released": "Whisper VRAM released",
-        "ollama_released": "Ollama VRAM released", "completed": "Completed",
-        "stopping": "Stopping", "stopped": "Stopped",
-        "failed": "Failed (exit code {code})", "start": "Start serial workflow",
-        "stop": "Stop", "live_log": "Live log",
-        "view_timeline": "View timeline_cuts.json", "recheck": "Recheck environment",
-        "custom_settings": "Custom settings", "auto_settings": "Automatic settings",
-        "settings_applied": "Automatic settings applied",
-        "ui_ready_log": "Modern UI ready. Select media and start the workflow.\n",
-        "environment_log": "Environment", "hardware_log": "Hardware",
-        "launch_log": "Starting strict serial workflow", "command_log": "Command",
-        "workflow_success": "✓ Workflow completed successfully\n",
-        "workflow_stopped": "Workflow stopped\n",
-        "workflow_failed": "✕ Workflow failed with exit code {code}\n",
-        "stop_title": "Stop workflow",
-        "stop_question": "Stop now? Completed intermediate files will be kept.",
-        "close_title": "Workflow running",
-        "close_question": "Closing the UI will stop the active workflow. Continue?",
-        "cannot_start": "Cannot start", "launch_failed": "Launch failed",
-        "no_output": "No output",
-        "no_output_detail": "This file has not been generated yet:\n{path}",
-        "select_video": "Select source video", "select_proxy": "Select proxy media",
-        "select_data": "Select runtime data directory",
-        "stop_requested": "Stop requested by user\n",
-    },
-}
-
-
-def detect_system_language() -> str:
-    """
-    Detect Chinese versus English Windows UI language.
-    检测 Windows 界面语言应使用中文还是英文。
-    """
-    language = ""
-    if os.name == "nt":
-        try:
-            buffer = ctypes.create_unicode_buffer(85)
-            if ctypes.windll.kernel32.GetUserDefaultLocaleName(buffer, len(buffer)):
-                language = buffer.value
-        except (AttributeError, OSError):
-            pass
-    if not language:
-        try:
-            language = locale.getlocale()[0] or ""
-        except (ValueError, TypeError):
-            pass
-    return "zh" if language.casefold().startswith("zh") else "en"
-
-
-def resolve_language(mode: str) -> str:
-    """Resolve System/Chinese/English to an active language. / 解析系统/中文/英文为实际语言。"""
-    return detect_system_language() if mode == "system" else (
-        mode if mode in TRANSLATIONS else "en"
-    )
-
-
-def translate(language: str, key: str, **values: object) -> str:
-    """Translate one UI key with optional named values. / 翻译一个 UI 键并替换可选具名变量。"""
-    text = TRANSLATIONS.get(language, TRANSLATIONS["en"]).get(
-        key, TRANSLATIONS["en"].get(key, key)
-    )
-    return text.format(**values) if values else text
-
 
 def apply_windows_11_effects(window: tk.Misc, dark: bool) -> List[str]:
     """
@@ -261,6 +108,242 @@ def apply_windows_11_effects(window: tk.Misc, dark: bool) -> List[str]:
     set_attribute(33, 2, "rounded-corners")
     set_attribute(38, 2, "mica-backdrop")
     return applied
+
+
+class ModernDropdown(ctk.CTkFrame):
+    """
+    Rounded single-surface selector with a modern popup menu.
+    带现代弹出菜单的圆角单一表面选择器。
+
+    CustomTkinter's stock option menu uses a visibly split arrow button. This
+    control uses one calm surface, a subtle chevron, and a rounded popover that
+    matches the rest of the Windows 11 interface.
+    CustomTkinter 原生选项菜单带有明显的分割箭头按钮。本控件改用统一表面、
+    轻量下箭头和与 Windows 11 界面一致的圆角浮层。
+    """
+
+    def __init__(
+        self,
+        master: object,
+        values: Sequence[str],
+        selected: str,
+        command: object,
+        width: int = 180,
+        height: int = 36,
+    ) -> None:
+        """Create the selector and retain canonical display values. / 创建选择器并保存规范显示值。"""
+        super().__init__(
+            master,
+            width=width,
+            height=height,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        self._values = [str(item) for item in values]
+        self._value = str(selected)
+        self._command = command
+        self._popup: Optional[ctk.CTkToplevel] = None
+        self._height = int(height)
+        self.grid_columnconfigure(0, weight=1)
+        self.button = ctk.CTkButton(
+            self,
+            text=self._value,
+            command=self._toggle_popup,
+            height=height,
+            corner_radius=11,
+            anchor="w",
+            fg_color=COLORS["field"],
+            hover=False,
+            border_width=1,
+            border_color=COLORS["border"],
+            text_color=COLORS["text"],
+            font=ctk.CTkFont(size=11),
+            cursor="hand2",
+        )
+        self.button.grid(row=0, column=0, sticky="ew")
+        self.chevron = ctk.CTkLabel(
+            self,
+            text="⌄",
+            width=28,
+            height=height - 4,
+            fg_color=COLORS["field"],
+            corner_radius=9,
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=17, weight="bold"),
+            cursor="hand2",
+        )
+        self.chevron.place(relx=1.0, rely=0.5, x=-7, anchor="e")
+        self.chevron.bind("<Button-1>", lambda _event: self._toggle_popup())
+        for widget in (self.button, self.chevron):
+            widget.bind("<Enter>", self._schedule_hover_refresh, add="+")
+            widget.bind("<Leave>", self._schedule_hover_refresh, add="+")
+
+    def get(self) -> str:
+        """Return the selected display value. / 返回所选显示值。"""
+        return self._value
+
+    def set(self, value: str) -> None:
+        """Update the selected value without firing the command. / 更新所选值但不触发回调。"""
+        self._value = str(value)
+        self.button.configure(text=self._value)
+
+    def set_values(self, values: Sequence[str]) -> None:
+        """Replace popup choices while retaining a valid selection. / 替换浮层选项并保留有效选择。"""
+        self._values = [str(item) for item in values]
+        if self._values and self._value not in self._values:
+            self.set(self._values[0])
+
+    def set_state(self, state: str) -> None:
+        """Enable or disable the complete selector. / 启用或禁用整个选择器。"""
+        self.button.configure(state=state)
+        self.chevron.configure(
+            text_color=COLORS["muted"] if state != "disabled" else COLORS["border"]
+        )
+
+    def _schedule_hover_refresh(self, _event: object = None) -> None:
+        """Keep the field and chevron on one hover surface. / 保持输入区和箭头使用同一悬停表面。"""
+        self.after_idle(self._refresh_hover_surface)
+
+    def _refresh_hover_surface(self) -> None:
+        """Apply hover only when the pointer remains inside the selector. / 仅当指针仍在选择器内时应用悬停色。"""
+        pointer_x = self.winfo_pointerx()
+        pointer_y = self.winfo_pointery()
+        inside = (
+            self.winfo_rootx() <= pointer_x < self.winfo_rootx() + self.winfo_width()
+            and self.winfo_rooty() <= pointer_y < self.winfo_rooty() + self.winfo_height()
+        )
+        color = COLORS["card_alt"] if inside else COLORS["field"]
+        self.button.configure(fg_color=color)
+        self.chevron.configure(fg_color=color)
+
+    def _toggle_popup(self) -> None:
+        """Open the popover or close the existing one. / 打开浮层或关闭现有浮层。"""
+        if self._popup is not None and self._popup.winfo_exists():
+            self._close_popup()
+            return
+        if not self._values:
+            return
+        self.update_idletasks()
+        popup = ctk.CTkToplevel(self)
+        self._popup = popup
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.transient(self.winfo_toplevel())
+        popup.configure(fg_color=COLORS["card"])
+        popup.grid_columnconfigure(0, weight=1)
+        popup.grid_rowconfigure(0, weight=1)
+
+        # ``winfo_width`` and root coordinates are physical pixels after
+        # per-monitor DPI awareness is enabled. CTkToplevel.geometry() applies
+        # CustomTkinter's window scale to width/height once more, so convert
+        # only the size back to logical pixels and keep x/y as screen pixels.
+        # 启用逐显示器 DPI 后，winfo_width/屏幕坐标使用物理像素；CTk 会再次缩放
+        # geometry 的宽高。因此这里只反算尺寸，x/y 继续使用物理屏幕坐标。
+        try:
+            window_scale = max(
+                1.0,
+                float(self.winfo_toplevel()._get_window_scaling()),  # noqa: SLF001
+            )
+        except (AttributeError, TypeError, ValueError):
+            window_scale = 1.0
+
+        screen_width = int(self.winfo_screenwidth())
+        screen_height = int(self.winfo_screenheight())
+        width = max(170, int(round(self.winfo_width() / window_scale)))
+        width = min(width, max(170, int((screen_width - 36) / window_scale)))
+        row_height = 38
+        visible_rows = min(7, len(self._values))
+        height = visible_rows * row_height + 14
+        physical_width = int(round(width * window_scale))
+        physical_height = int(round(height * window_scale))
+        x = int(self.winfo_rootx())
+        y = int(self.winfo_rooty() + self.winfo_height() + 6)
+        x = min(max(18, x), max(18, screen_width - physical_width - 18))
+        if y + physical_height > screen_height - 18:
+            y = max(18, int(self.winfo_rooty() - physical_height - 6))
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+
+        if len(self._values) > visible_rows:
+            surface: ctk.CTkBaseClass = ctk.CTkScrollableFrame(
+                popup,
+                fg_color=COLORS["card"],
+                corner_radius=14,
+                border_width=1,
+                border_color=COLORS["border"],
+                scrollbar_button_color=COLORS["border"],
+                scrollbar_button_hover_color=COLORS["accent"],
+            )
+        else:
+            surface = ctk.CTkFrame(
+                popup,
+                fg_color=COLORS["card"],
+                corner_radius=14,
+                border_width=1,
+                border_color=COLORS["border"],
+            )
+        surface.grid(row=0, column=0, sticky="nsew")
+        surface.grid_columnconfigure(0, weight=1)
+        for row, value in enumerate(self._values):
+            selected = value == self._value
+            item = ctk.CTkButton(
+                surface,
+                text=("✓  " if selected else "   ") + value,
+                command=lambda choice=value: self._select(choice),
+                height=34,
+                corner_radius=9,
+                anchor="w",
+                fg_color=("#DDF8F1", "#173B35") if selected else "transparent",
+                hover_color=COLORS["card_alt"],
+                text_color=COLORS["text"],
+                font=ctk.CTkFont(size=11, weight="bold" if selected else "normal"),
+            )
+            item.grid(row=row, column=0, sticky="ew", padx=7, pady=(7 if row == 0 else 1, 1))
+        popup.bind("<Escape>", lambda _event: self._close_popup())
+        popup.bind("<FocusOut>", self._on_popup_focus_out)
+        popup.deiconify()
+        popup.lift()
+        popup.after(
+            20,
+            lambda: (
+                apply_windows_11_effects(
+                    popup, ctk.get_appearance_mode().casefold() == "dark"
+                ),
+                popup.focus_force(),
+            ),
+        )
+
+    def _on_popup_focus_out(self, _event: object) -> None:
+        """Close after focus moves outside the popup hierarchy. / 焦点移出浮层层级后关闭。"""
+        if self._popup is not None:
+            self._popup.after(100, self._close_if_focus_lost)
+
+    def _close_if_focus_lost(self) -> None:
+        """Close only when no popup descendant owns focus. / 仅在浮层子控件均无焦点时关闭。"""
+        popup = self._popup
+        if popup is None or not popup.winfo_exists():
+            return
+        focused = popup.focus_get()
+        if focused is None or not str(focused).startswith(str(popup)):
+            self._close_popup()
+
+    def _select(self, value: str) -> None:
+        """Commit one choice, close the popover, and notify the owner. / 提交选项、关闭浮层并通知所有者。"""
+        self.set(value)
+        self._close_popup()
+        if callable(self._command):
+            self._command(value)
+
+    def _close_popup(self) -> None:
+        """Destroy the active popover safely. / 安全销毁当前浮层。"""
+        popup, self._popup = self._popup, None
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+
+    def destroy(self) -> None:
+        """Close the popover before destroying the selector. / 销毁选择器前先关闭浮层。"""
+        self._close_popup()
+        super().destroy()
 
 
 class ModernCyberEditorApp:
@@ -314,6 +397,7 @@ class ModernCyberEditorApp:
         self.root.after(100, self._drain_messages)
         self.root.after(150, self._refresh_native_effects)
         self.root.after(650, self._start_environment_check)
+        self.root.after(900, self._start_initial_fps_detection)
         self.root.after(2500, self._poll_system_preferences)
 
     def t(self, key: str, **values: object) -> str:
@@ -352,7 +436,22 @@ class ModernCyberEditorApp:
         self.chunk_var = tk.StringVar(
             value=str(data.get("chunk_minutes", 12.0))
         )
-        self.fps_var = tk.StringVar(value=str(data.get("project_fps", 25.0)))
+        self.fps_mode = str(data.get("fps_mode", "auto"))
+        if self.fps_mode != "auto":
+            try:
+                restored_fps = parse_frame_rate(self.fps_mode)
+            except ValueError:
+                self.fps_mode = "auto"
+            else:
+                self.fps_mode = (
+                    f"{restored_fps:.6f}".rstrip("0").rstrip(".")
+                )
+        # Never present a saved numeric fallback as a fresh media probe. The
+        # restored source is probed after first paint; handoff JSON is checked
+        # when a run starts. This avoids a misleading “Auto · 25 fps” when no
+        # source is selected. / 不把设置中的数值兜底伪装成新鲜素材检测结果：
+        # 首帧后重新检测恢复的素材，启动时再检查交接 JSON。
+        self.detected_project_fps = 0.0
         self.ctx_var = tk.StringVar(value=str(data.get("num_ctx", 8192)))
         self.timeline_var = tk.StringVar(
             value=str(data.get("timeline_name", "CyberEditor Timeline"))
@@ -501,15 +600,16 @@ class ModernCyberEditorApp:
     def _top_menu(
         self, parent: ctk.CTkFrame, values: List[str], selected: str,
         command: object, column: int, width: int
-    ) -> ctk.CTkOptionMenu:
+    ) -> ModernDropdown:
         """Create one compact header option menu. / 创建一个紧凑的页眉选项菜单。"""
-        menu = ctk.CTkOptionMenu(
-            parent, values=values, command=command, width=width, height=34,
-            corner_radius=10, fg_color=COLORS["card_alt"],
-            button_color=COLORS["border"],
-            button_hover_color=COLORS["accent"], text_color=COLORS["text"]
+        menu = ModernDropdown(
+            parent,
+            values=values,
+            selected=selected,
+            command=command,
+            width=width,
+            height=34,
         )
-        menu.set(selected)
         menu.grid(row=0, column=column, rowspan=2, padx=4)
         return menu
 
@@ -574,7 +674,28 @@ class ModernCyberEditorApp:
         fps_row = ctk.CTkFrame(parent, fg_color="transparent")
         fps_row.grid(row=5, column=0, sticky="ew", pady=(4, 12))
         fps_row.grid_columnconfigure(0, weight=1)
-        self._entry_field(fps_row, 0, self.t("project_fps"), self.fps_var)
+        auto_fps_display = self._fps_auto_display()
+        fps_values = [
+            auto_fps_display, "23.976", "24", "25", "29.97",
+            "30", "50", "59.94", "60",
+        ]
+        if self.fps_mode != "auto" and self.fps_mode not in fps_values:
+            fps_values.append(self.fps_mode)
+        self._fps_display_to_mode = {
+            value: ("auto" if index == 0 else value)
+            for index, value in enumerate(fps_values)
+        }
+        selected_fps = (
+            auto_fps_display if self.fps_mode == "auto" else self.fps_mode
+        )
+        self.fps_menu = self._option_field(
+            fps_row,
+            0,
+            self.t("project_fps"),
+            fps_values,
+            selected_fps,
+            self._on_fps_change,
+        )
 
         self._section_title(parent, 6, self.t("ai_hardware"))
         profile_values = [
@@ -657,7 +778,7 @@ class ModernCyberEditorApp:
             text_color=COLORS["text"]
         ).grid(row=0, column=1, sticky="w")
         if self.available_ollama_models:
-            self.ollama_menu.configure(values=[
+            self.ollama_menu.set_values([
                 str(item["name"]) for item in self.available_ollama_models
             ])
 
@@ -820,7 +941,7 @@ class ModernCyberEditorApp:
         self, parent: ctk.CTkBaseClass, row: int, label: str,
         values: List[str], selected: str, command: object,
         column: int = 0, columnspan: int = 1
-    ) -> ctk.CTkOptionMenu:
+    ) -> ModernDropdown:
         """Create one labeled option menu. / 创建一个带标签的选项菜单。"""
         frame = ctk.CTkFrame(parent, fg_color="transparent")
         frame.grid(
@@ -834,14 +955,13 @@ class ModernCyberEditorApp:
             frame, text=label, anchor="w", text_color=COLORS["muted"],
             font=ctk.CTkFont(size=10)
         ).grid(row=0, column=0, sticky="ew", pady=(0, 3))
-        menu = ctk.CTkOptionMenu(
-            frame, values=values, command=command, height=36,
-            corner_radius=10, fg_color=COLORS["field"],
-            button_color=COLORS["border"],
-            button_hover_color=COLORS["accent"],
-            text_color=COLORS["text"]
+        menu = ModernDropdown(
+            frame,
+            values=values,
+            selected=selected,
+            command=command,
+            height=36,
         )
-        menu.set(selected)
         menu.grid(row=1, column=0, sticky="ew")
         return menu
 
@@ -859,6 +979,157 @@ class ModernCyberEditorApp:
                 self.skip_resolve_switch.configure(state="disabled")
         elif hasattr(self, "skip_resolve_switch"):
             self.skip_resolve_switch.configure(state="normal")
+
+    def _fps_auto_display(self) -> str:
+        """Format the automatic FPS choice with its detected value. / 格式化带检测值的自动 FPS 选项。"""
+        if self.detected_project_fps > 0:
+            return self.t(
+                "fps_auto_detected",
+                fps=self._format_fps(self.detected_project_fps),
+            )
+        return self.t("fps_auto")
+
+    @staticmethod
+    def _format_fps(fps: float) -> str:
+        """Display common integer/NTSC frame rates without noise. / 无多余小数地显示常见整数/NTSC 帧率。"""
+        standards = (
+            (23.976, "23.976"), (24.0, "24"), (25.0, "25"),
+            (29.97, "29.97"), (30.0, "30"), (50.0, "50"),
+            (59.94, "59.94"), (60.0, "60"),
+        )
+        for expected, label in standards:
+            if abs(float(fps) - expected) < 0.01:
+                return label
+        return f"{float(fps):.3f}".rstrip("0").rstrip(".")
+
+    def _on_fps_change(self, display_value: str) -> None:
+        """Select automatic source FPS or an explicit timeline rate. / 选择自动源素材 FPS 或明确时间线帧率。"""
+        self.fps_mode = self._fps_display_to_mode.get(
+            display_value, display_value
+        )
+        if self.fps_mode == "auto":
+            candidate = (
+                self.video_var.get().strip()
+                or self.proxy_var.get().strip()
+            )
+            if candidate:
+                self._start_fps_detection(candidate)
+        self._save_current_preferences()
+
+    def _start_initial_fps_detection(self) -> None:
+        """Detect FPS for a restored media path after first paint. / 首帧显示后检测已恢复素材路径的 FPS。"""
+        if self.fps_mode != "auto":
+            return
+        candidate = (
+            self.video_var.get().strip() or self.proxy_var.get().strip()
+        )
+        if candidate and self._absolute_path(candidate).is_file():
+            self._start_fps_detection(candidate)
+
+    def _start_fps_detection(self, source: str) -> None:
+        """Probe media FPS in a disposable background process. / 在一次性后台进程中检测素材 FPS。"""
+        if self.fps_mode == "auto":
+            self.detected_project_fps = 0.0
+            if hasattr(self, "fps_menu"):
+                self.fps_menu.set(self.t("fps_auto"))
+
+        def worker() -> None:
+            try:
+                fps = detect_media_fps(self._absolute_path(source))
+                self.messages.put(("fps", (fps, source)))
+            except ValueError:
+                self.messages.put(("fps_error", self.t("fps_detection_failed")))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_detected_fps(self, fps: float, source: str) -> None:
+        """Accept a non-stale source FPS result and refresh the selector. / 接受未过期的源 FPS 结果并刷新选择器。"""
+        current_candidates = {
+            str(self._absolute_path(value))
+            for value in (
+                self.video_var.get().strip(),
+                self.proxy_var.get().strip(),
+            )
+            if value
+        }
+        if str(self._absolute_path(source)) not in current_candidates:
+            return
+        self.detected_project_fps = parse_frame_rate(fps)
+        if self.fps_mode == "auto" and hasattr(self, "fps_menu"):
+            display = self._fps_auto_display()
+            manual_values = [
+                "23.976", "24", "25", "29.97", "30", "50", "59.94", "60"
+            ]
+            values = [display] + manual_values
+            self._fps_display_to_mode = {
+                value: ("auto" if index == 0 else value)
+                for index, value in enumerate(values)
+            }
+            self.fps_menu.set_values(values)
+            self.fps_menu.set(display)
+        self._append_log(
+            self.t(
+                "fps_detected_log",
+                fps=self._format_fps(self.detected_project_fps),
+            ) + "\n"
+        )
+        self._save_current_preferences()
+
+    def _resolve_project_fps(self, required: bool) -> float:
+        """
+        Resolve manual, media, or handoff-artifact FPS.
+        解析手动、素材或交接产物中的 FPS。
+
+        Parameters / 参数:
+            required:
+                Raise a friendly error instead of using an internal save-only
+                fallback. / 检测失败时抛出友好错误，而非使用仅保存设置的内部兜底。
+        """
+        if self.fps_mode != "auto":
+            return parse_frame_rate(self.fps_mode)
+        if not required:
+            return self.detected_project_fps or 25.0
+
+        for value in (
+            self.video_var.get().strip(),
+            self.proxy_var.get().strip(),
+        ):
+            if not value:
+                continue
+            path = self._absolute_path(value)
+            if not path.is_file():
+                continue
+            try:
+                fps = detect_media_fps(path)
+            except ValueError:
+                continue
+            self._apply_detected_fps(fps, str(path))
+            return fps
+
+        data_dir = self._absolute_path(
+            self.data_var.get().strip() or "data/ui-run"
+        )
+        artifact_candidates = (
+            (data_dir / "timeline_cuts.json", ("project_fps",)),
+            (data_dir / "raw_data.json", ("video", "fps")),
+        )
+        for path, keys in artifact_candidates:
+            if not path.is_file():
+                continue
+            try:
+                value: object = json.loads(path.read_text(encoding="utf-8"))
+                for key in keys:
+                    value = value[key]  # type: ignore[index]
+                fps = parse_frame_rate(value)
+            except (OSError, ValueError, KeyError, IndexError, TypeError):
+                continue
+            self.detected_project_fps = fps
+            if hasattr(self, "fps_menu"):
+                self.fps_menu.set(self._fps_auto_display())
+            return fps
+        if self.detected_project_fps > 0:
+            return self.detected_project_fps
+        raise ValueError(self.t("fps_detection_failed"))
 
     def _on_profile_change(self, display_value: str) -> None:
         """Apply and save the selected hardware profile. / 应用并保存选定的硬件配置。"""
@@ -1008,8 +1279,9 @@ class ModernCyberEditorApp:
             self._apply_flow_rules()
         self.root.after(2500, self._poll_system_preferences)
 
-    def _collect_options(self) -> WorkflowOptions:
+    def _collect_options(self, require_fps: bool = True) -> WorkflowOptions:
         """Normalize current UI values into workflow options. / 将当前界面值规范化为工作流选项。"""
+        project_fps = self._resolve_project_fps(required=require_fps)
         return WorkflowOptions(
             video=self.video_var.get().strip(),
             proxy=self.proxy_var.get().strip(),
@@ -1018,13 +1290,14 @@ class ModernCyberEditorApp:
             hardware_profile=self.profile_key,
             theme=self.theme_mode,
             ui_language=self.language_mode,
+            fps_mode=self.fps_mode,
             whisper_model=self.whisper_var.get().strip(),
             whisper_device=self.device_var.get().strip(),
             language=self.speech_language_var.get().strip(),
             ollama_model=self.ollama_model_var.get().strip(),
             ollama_url=self.ollama_url_var.get().strip(),
             chunk_minutes=float(self.chunk_var.get()),
-            project_fps=float(self.fps_var.get()),
+            project_fps=project_fps,
             num_ctx=int(self.ctx_var.get()),
             timeline_name=(
                 self.timeline_var.get().strip() or "CyberEditor Timeline"
@@ -1128,7 +1401,7 @@ class ModernCyberEditorApp:
         self._render_environment_state()
         model_names = [str(item["name"]) for item in models]
         if model_names and hasattr(self, "ollama_menu"):
-            self.ollama_menu.configure(values=model_names)
+            self.ollama_menu.set_values(model_names)
             if self.ollama_model_var.get() not in model_names:
                 self.ollama_model_var.set(model_names[0])
                 self.ollama_menu.set(model_names[0])
@@ -1149,6 +1422,10 @@ class ModernCyberEditorApp:
                 f"Context={self.ctx_var.get()}, "
                 f"Chunk={self.chunk_var.get()}m\n"
             )
+        # Persist migrations such as the new automatic FPS mode after the
+        # environment and hardware profile have been applied.
+        # 环境与硬件方案应用完成后，保存“自动 FPS”等新版设置迁移结果。
+        self._save_current_preferences()
 
     def _render_environment_state(self) -> None:
         """Update status cards from canonical environment state. / 根据规范环境状态更新状态卡。"""
@@ -1320,6 +1597,11 @@ class ModernCyberEditorApp:
                     self._finish_workflow(int(payload))
                 elif kind == "environment":
                     self._apply_environment_result(payload)
+                elif kind == "fps":
+                    fps, source = payload  # type: ignore[misc]
+                    self._apply_detected_fps(float(fps), str(source))
+                elif kind == "fps_error":
+                    self._append_log(str(payload) + "\n")
         except queue.Empty:
             pass
         self.root.after(100, self._drain_messages)
@@ -1407,6 +1689,7 @@ class ModernCyberEditorApp:
             self.video_var.set(path)
             if not self.proxy_var.get().strip():
                 self.proxy_var.set(path)
+            self._start_fps_detection(path)
 
     def _choose_proxy(self) -> None:
         """Select an optional proxy media file. / 选择可选代理素材。"""
@@ -1419,6 +1702,8 @@ class ModernCyberEditorApp:
         )
         if path:
             self.proxy_var.set(path)
+            if not self.video_var.get().strip():
+                self._start_fps_detection(path)
 
     def _choose_data_dir(self) -> None:
         """Select the runtime artifact directory. / 选择运行产物目录。"""
@@ -1493,7 +1778,7 @@ class ModernCyberEditorApp:
     def _save_current_preferences(self) -> None:
         """Save current choices without requiring valid media. / 无需有效素材即可保存当前选择。"""
         try:
-            self._save_settings(self._collect_options())
+            self._save_settings(self._collect_options(require_fps=False))
         except (OSError, ValueError, tk.TclError):
             pass
 

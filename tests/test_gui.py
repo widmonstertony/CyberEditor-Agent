@@ -11,9 +11,10 @@ from src.gui import (
     detect_system_theme,
     enable_windows_high_dpi,
     get_primary_work_area,
+    parse_frame_rate,
     recommend_automatic_settings,
 )
-from src.modern_gui import resolve_language, translate
+from src.ui_i18n import resolve_language, translate
 
 
 class WorkflowOptionsTests(unittest.TestCase):
@@ -142,6 +143,13 @@ class WorkflowOptionsTests(unittest.TestCase):
 
     def test_system_theme_has_supported_value(self) -> None:
         self.assertIn(detect_system_theme(), {"light", "dark"})
+
+    def test_ntsc_frame_rate_is_parsed_exactly(self) -> None:
+        self.assertAlmostEqual(
+            parse_frame_rate("30000/1001"),
+            29.97003,
+            places=5,
+        )
 
     def test_interface_translations_cover_chinese_and_english(self) -> None:
         self.assertEqual(translate("zh", "start"), "开始串行工作流")

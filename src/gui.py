@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import asdict, dataclass
+from fractions import Fraction
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -531,6 +532,98 @@ def build_runtime_environment() -> Dict[str, str]:
     return environment
 
 
+def parse_frame_rate(value: object) -> float:
+    """
+    Parse an FFprobe frame-rate value such as ``30000/1001``.
+    解析 FFprobe 帧率值，例如 ``30000/1001``。
+
+    Parameters / 参数:
+        value:
+            Number or rational string reported by FFprobe.
+            FFprobe 返回的数字或有理数字符串。
+
+    Returns / 返回:
+        A positive FPS rounded to six decimals. / 四舍五入到六位小数的正 FPS。
+
+    Raises / 异常:
+        ValueError:
+            If the value is missing, zero, negative, or implausible.
+            当数值缺失、为零、为负数或明显不合理时抛出。
+    """
+    try:
+        fps = float(Fraction(str(value).strip()))
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise ValueError(f"Invalid frame rate: {value!r}") from exc
+    if not 1.0 <= fps <= 240.0:
+        raise ValueError(f"Frame rate outside 1-240 fps: {fps}")
+    return round(fps, 6)
+
+
+def detect_media_fps(path: Path) -> float:
+    """
+    Read the source video FPS with FFprobe without importing OpenCV.
+    使用 FFprobe 读取源视频 FPS，且不导入 OpenCV。
+
+    Parameters / 参数:
+        path:
+            Existing source or proxy media file. / 已存在的源素材或代理文件。
+
+    Returns / 返回:
+        The average video-stream frame rate. / 视频流平均帧率。
+
+    The helper runs FFprobe as a short-lived process so the desktop UI remains
+    free of media/ML imports and cannot retain GPU memory.
+    本函数通过短生命周期进程运行 FFprobe，使桌面 UI 不导入媒体/机器学习包，
+    也不会保留 GPU 内存。
+    """
+    media_path = Path(path).expanduser().resolve()
+    if not media_path.is_file():
+        raise ValueError(f"Media file not found: {media_path}")
+    environment = build_runtime_environment()
+    ffprobe = shutil.which("ffprobe", path=environment.get("PATH"))
+    if not ffprobe:
+        raise ValueError("ffprobe was not found on PATH.")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=avg_frame_rate,r_frame_rate",
+                "-of",
+                "json",
+                str(media_path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+            creationflags=_hidden_creation_flags(),
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"Could not run ffprobe: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        raise ValueError(f"ffprobe failed: {detail}")
+    try:
+        payload = json.loads(result.stdout)
+        stream = payload["streams"][0]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise ValueError("ffprobe did not report a video stream.") from exc
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        try:
+            return parse_frame_rate(stream.get(key))
+        except (ValueError, AttributeError):
+            continue
+    raise ValueError("ffprobe did not report a valid video frame rate.")
+
+
 @dataclass
 class WorkflowOptions:
     """Serializable UI workflow configuration. / 可序列化的界面工作流配置。"""
@@ -542,6 +635,7 @@ class WorkflowOptions:
     hardware_profile: str = "auto"
     theme: str = "system"
     ui_language: str = "system"
+    fps_mode: str = "auto"
     whisper_model: str = "small"
     whisper_device: str = "auto"
     language: str = ""
@@ -1332,6 +1426,7 @@ class CyberEditorApp:
 
     def _collect_options(self) -> WorkflowOptions:
         """Read and normalize current UI values. / 读取并规范化当前界面值。"""
+        project_fps = parse_frame_rate(self.fps_var.get())
         return WorkflowOptions(
             video=self.video_var.get().strip(),
             proxy=self.proxy_var.get().strip(),
@@ -1341,19 +1436,29 @@ class CyberEditorApp:
                 self.profile_var.get(), "auto"
             ),
             theme=THEME_LABELS.get(self.theme_var.get(), "system"),
+            # The dependency-free fallback UI still exposes an explicit numeric
+            # field, so preserve it as a manual choice when the modern UI later
+            # reads the same settings file. / 后备界面仍使用数值输入框，因此把它
+            # 保存为手动选择，避免现代界面将其误解为自动检测。
+            fps_mode=self._format_fps_mode(project_fps),
             whisper_model=self.whisper_var.get().strip(),
             whisper_device=self.device_var.get().strip(),
             language=self.language_var.get().strip(),
             ollama_model=self.ollama_model_var.get().strip(),
             ollama_url=self.ollama_url_var.get().strip(),
             chunk_minutes=float(self.chunk_var.get()),
-            project_fps=float(self.fps_var.get()),
+            project_fps=project_fps,
             num_ctx=int(self.ctx_var.get()),
             timeline_name=self.timeline_var.get().strip() or "CyberEditor Timeline",
             project_name=self.project_var.get().strip() or "CyberEditor Project",
             skip_resolve=bool(self.skip_resolve_var.get()),
             strict_fps=bool(self.strict_fps_var.get()),
         )
+
+    @staticmethod
+    def _format_fps_mode(fps: float) -> str:
+        """Serialize a manual FPS without unnecessary zeros. / 序列化手动 FPS 并去除多余零。"""
+        return f"{fps:.6f}".rstrip("0").rstrip(".")
 
     def _apply_flow_rules(self, _event: object = None) -> None:
         """Keep mode-dependent controls internally consistent. / 保持模式相关控件的一致性。"""

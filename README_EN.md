@@ -38,8 +38,14 @@ VRAM using standard-library and operating-system interfaces. It uses
 support in a disposable child process. The result selects a Whisper model,
 device mode, 10–15 minute chunk size, Ollama context, and the best
 already-installed Ollama model within a safe memory budget. Auto mode never
-downloads a model and never guesses FPS, which must match the source and Resolve
-project.
+downloads a model or changes media properties based on hardware performance.
+
+`Project FPS` defaults to **Auto from source media**, not a fixed 25. After a
+source is selected, a short-lived `ffprobe` process reads `avg_frame_rate` or
+`r_frame_rate`, including fractional rates such as 23.976, 29.97, and 59.94.
+If no readable source is available, the UI checks `timeline_cuts.json` and then
+`raw_data.json`. It reports a clear error before starting only when every source
+fails; common timeline rates remain available in the modern custom dropdown.
 
 The top-right menus switch theme (`System`, `Dark`, `Light`) and interface
 language (`System`, `中文`, `English`) immediately and remember both choices.
@@ -126,6 +132,7 @@ CyberEditor-Agent/
 │  ├─ __init__.py
 │  ├─ gui.py                     # Dependency-free fallback and shared probes
 │  ├─ modern_gui.py              # Windows 11, 4K, Chinese/English UI
+│  ├─ ui_i18n.py                 # GUI-independent bilingual strings
 │  ├─ extractor.py               # Whisper + OpenCV extraction
 │  ├─ director.py                # Chunked Ollama director
 │  └─ resolve_executor.py        # DaVinci Resolve assembly

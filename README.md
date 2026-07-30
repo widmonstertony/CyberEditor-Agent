@@ -19,7 +19,12 @@ PowerShell 中运行：
 通过 `nvidia-smi`（可用时）读取准确显存，并在一次性子进程中确认当前 PyTorch 是否
 真的支持 CUDA。它会自动选择 Whisper 模型、设备模式、10–15 分钟分块时长、
 Ollama 上下文，以及在内存预算内最合适的**已安装** Ollama 模型。自动档不会下载
-模型，也不会修改必须与素材/工程一致的 FPS。
+模型，也不会让硬件性能档修改素材属性。
+
+“工程 FPS”默认是**自动读取源素材**，不是固定 25。选择原片后，界面使用短生命周期
+`ffprobe` 进程读取 `avg_frame_rate` / `r_frame_rate`，并支持 23.976、29.97、59.94
+等分数帧率；没有可读取素材时，会依次尝试 `timeline_cuts.json` 和 `raw_data.json`。
+只有检测失败才会在启动前提示用户，仍可从现代下拉菜单手动选择常用工程帧率。
 
 右上角主题菜单支持跟随系统、深色和浅色；语言菜单支持跟随 Windows、中文和 English，
 两者都可即时切换并保存。界面启用 Per-Monitor DPI Awareness V2、Windows 11 Mica
@@ -102,6 +107,7 @@ CyberEditor-Agent/
 │  ├─ __init__.py
 │  ├─ gui.py                     # 无额外 UI 依赖的后备控制器与公共检测逻辑
 │  ├─ modern_gui.py              # Windows 11 / 4K / 中英文现代界面
+│  ├─ ui_i18n.py                 # 不依赖 GUI 包的中英文文案
 │  ├─ extractor.py               # Whisper + OpenCV 数据提取
 │  ├─ director.py                # Ollama 分块导演
 │  └─ resolve_executor.py        # DaVinci Resolve 自动组装
