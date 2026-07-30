@@ -110,6 +110,64 @@ def apply_windows_11_effects(window: tk.Misc, dark: bool) -> List[str]:
     return applied
 
 
+class DropdownFieldButton(ctk.CTkButton):
+    """
+    Single-surface button with a font-independent vector chevron.
+    带无字体矢量箭头的单一表面按钮。
+
+    A Unicode chevron can fall back to a CJK font and look like the letter
+    ``v`` at high DPI. Drawing two rounded strokes directly on the button's
+    scaled canvas avoids both font fallback and a separate icon background.
+    Unicode 箭头可能回退到中文字体，并在高 DPI 下显示得像字母 ``v``。这里直接
+    在按钮自身的缩放画布上绘制两条圆头线段，同时消除字体回退和独立图标底色。
+    """
+
+    def __init__(self, master: object, **kwargs: object) -> None:
+        """Create the field button and initialize icon state. / 创建输入按钮并初始化图标状态。"""
+        self._chevron_color: object = COLORS["muted"]
+        self._expanded = False
+        super().__init__(master, **kwargs)
+
+    def _draw(self, no_color_updates: bool = False) -> None:
+        """Draw a DPI-scaled chevron on the existing button canvas. / 在按钮画布上绘制随 DPI 缩放的箭头。"""
+        super()._draw(no_color_updates)
+        if not hasattr(self, "_canvas") or not self._canvas.winfo_exists():
+            return
+        self._canvas.delete("vector_chevron")
+        width = float(self._apply_widget_scaling(self._current_width))
+        height = float(self._apply_widget_scaling(self._current_height))
+        half_width = float(self._apply_widget_scaling(3.5))
+        half_height = float(self._apply_widget_scaling(2.0))
+        line_width = max(1.0, float(self._apply_widget_scaling(1.35)))
+        center_x = width - float(self._apply_widget_scaling(17.0))
+        center_y = height / 2.0
+        direction = -1.0 if self._expanded else 1.0
+        self._canvas.create_line(
+            center_x - half_width,
+            center_y - direction * half_height,
+            center_x,
+            center_y + direction * half_height,
+            center_x + half_width,
+            center_y - direction * half_height,
+            fill=self._apply_appearance_mode(self._chevron_color),
+            width=line_width,
+            capstyle=tk.ROUND,
+            joinstyle=tk.ROUND,
+            tags="vector_chevron",
+        )
+
+    def set_chevron_color(self, color: object) -> None:
+        """Update the chevron stroke without changing the field. / 只更新箭头线条颜色。"""
+        self._chevron_color = color
+        self._draw()
+
+    def set_expanded(self, expanded: bool) -> None:
+        """Point upward while the menu is open. / 菜单打开时让箭头朝上。"""
+        if self._expanded != bool(expanded):
+            self._expanded = bool(expanded)
+            self._draw()
+
+
 class ModernDropdown(ctk.CTkFrame):
     """
     Rounded single-surface selector with a modern popup menu.
@@ -145,7 +203,7 @@ class ModernDropdown(ctk.CTkFrame):
         self._popup: Optional[ctk.CTkToplevel] = None
         self._height = int(height)
         self.grid_columnconfigure(0, weight=1)
-        self.button = ctk.CTkButton(
+        self.button = DropdownFieldButton(
             self,
             text=self._value,
             command=self._toggle_popup,
@@ -161,22 +219,12 @@ class ModernDropdown(ctk.CTkFrame):
             cursor="hand2",
         )
         self.button.grid(row=0, column=0, sticky="ew")
-        self.chevron = ctk.CTkLabel(
-            self,
-            text="⌄",
-            width=28,
-            height=height - 4,
-            fg_color=COLORS["field"],
-            corner_radius=9,
-            text_color=COLORS["muted"],
-            font=ctk.CTkFont(size=17, weight="bold"),
-            cursor="hand2",
+        self.button.bind(
+            "<Enter>", self._schedule_hover_refresh, add="+"
         )
-        self.chevron.place(relx=1.0, rely=0.5, x=-7, anchor="e")
-        self.chevron.bind("<Button-1>", lambda _event: self._toggle_popup())
-        for widget in (self.button, self.chevron):
-            widget.bind("<Enter>", self._schedule_hover_refresh, add="+")
-            widget.bind("<Leave>", self._schedule_hover_refresh, add="+")
+        self.button.bind(
+            "<Leave>", self._schedule_hover_refresh, add="+"
+        )
 
     def get(self) -> str:
         """Return the selected display value. / 返回所选显示值。"""
@@ -196,8 +244,8 @@ class ModernDropdown(ctk.CTkFrame):
     def set_state(self, state: str) -> None:
         """Enable or disable the complete selector. / 启用或禁用整个选择器。"""
         self.button.configure(state=state)
-        self.chevron.configure(
-            text_color=COLORS["muted"] if state != "disabled" else COLORS["border"]
+        self.button.set_chevron_color(
+            COLORS["muted"] if state != "disabled" else COLORS["border"],
         )
 
     def _schedule_hover_refresh(self, _event: object = None) -> None:
@@ -214,7 +262,12 @@ class ModernDropdown(ctk.CTkFrame):
         )
         color = COLORS["card_alt"] if inside else COLORS["field"]
         self.button.configure(fg_color=color)
-        self.chevron.configure(fg_color=color)
+        stroke = (
+            COLORS["border"]
+            if self.button.cget("state") == "disabled"
+            else COLORS["muted"]
+        )
+        self.button.set_chevron_color(stroke)
 
     def _toggle_popup(self) -> None:
         """Open the popover or close the existing one. / 打开浮层或关闭现有浮层。"""
@@ -288,7 +341,7 @@ class ModernDropdown(ctk.CTkFrame):
             selected = value == self._value
             item = ctk.CTkButton(
                 surface,
-                text=("✓  " if selected else "   ") + value,
+                text=value,
                 command=lambda choice=value: self._select(choice),
                 height=34,
                 corner_radius=9,
@@ -301,6 +354,7 @@ class ModernDropdown(ctk.CTkFrame):
             item.grid(row=row, column=0, sticky="ew", padx=7, pady=(7 if row == 0 else 1, 1))
         popup.bind("<Escape>", lambda _event: self._close_popup())
         popup.bind("<FocusOut>", self._on_popup_focus_out)
+        self.button.set_expanded(True)
         popup.deiconify()
         popup.lift()
         popup.after(
@@ -337,6 +391,7 @@ class ModernDropdown(ctk.CTkFrame):
     def _close_popup(self) -> None:
         """Destroy the active popover safely. / 安全销毁当前浮层。"""
         popup, self._popup = self._popup, None
+        self.button.set_expanded(False)
         if popup is not None and popup.winfo_exists():
             popup.destroy()
 
