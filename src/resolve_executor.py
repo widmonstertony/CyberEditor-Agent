@@ -1214,10 +1214,28 @@ class DaVinciExecutor:
                 )
                 last_percent = percent
             state = str(status.get("JobStatus") or "").casefold()
-            if state in {"complete", "completed"}:
+            complete_states = {
+                "complete",
+                "completed",
+                "完成",
+                "已完成",
+                "成功",
+                "渲染完成",
+            }
+            failed_states = {
+                "failed",
+                "cancelled",
+                "canceled",
+                "失败",
+                "渲染失败",
+                "取消",
+                "已取消",
+                "错误",
+            }
+            if state in complete_states:
                 self.logger.info("Final render complete: %s", self.render_dir)
                 return dict(status)
-            if state in {"failed", "cancelled", "canceled"}:
+            if state in failed_states:
                 raise ResolveExecutorError(
                     f"最终渲染失败 / Final render failed: {status}"
                 )
@@ -1233,7 +1251,14 @@ class DaVinciExecutor:
                 in_progress = bool(self.project.IsRenderingInProgress())
             except Exception:
                 in_progress = True
-            if not in_progress and state not in {"complete", "completed"}:
+            # Resolve localizes JobStatus (for example Chinese returns “完成”).
+            # A stopped job at 100% is also unambiguously complete even when a
+            # future locale uses a status string unknown to this client.
+            # Resolve 会本地化 JobStatus；任务停止且进度为 100% 时可可靠视为完成。
+            if not in_progress and percent >= 100:
+                self.logger.info("Final render complete: %s", self.render_dir)
+                return dict(status)
+            if not in_progress:
                 raise ResolveExecutorError(
                     f"渲染提前停止 / Rendering stopped unexpectedly: {status}"
                 )

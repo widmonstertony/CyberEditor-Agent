@@ -403,7 +403,41 @@ class ResolveExecutorTests(unittest.TestCase):
             self.assertEqual(
                 executor.project.settings["TargetDir"], str(output.resolve())
             )
-            self.assertEqual(executor.project.settings["CustomName"], "documentary")
+            self.assertEqual(
+                executor.project.settings["CustomName"], "documentary"
+            )
+
+    def test_final_render_accepts_localized_complete_status(self):
+        class LocalizedRenderProject:
+            def SetRenderSettings(self, settings):
+                return True
+
+            def AddRenderJob(self):
+                return "job-localized"
+
+            def StartRendering(self, job_ids, interactive):
+                return True
+
+            def GetRenderJobStatus(self, job_id):
+                return {
+                    "JobStatus": "完成",
+                    "CompletionPercentage": 100,
+                }
+
+            def IsRenderingInProgress(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as temporary:
+            executor = DaVinciExecutor(
+                "timeline_cuts.json",
+                render_enabled=True,
+                render_dir=Path(temporary),
+            )
+            executor.project = LocalizedRenderProject()
+
+            status = executor.render_final()
+
+            self.assertEqual(status["JobStatus"], "完成")
 
     def test_mocked_run(self):
         with tempfile.TemporaryDirectory() as temporary:
