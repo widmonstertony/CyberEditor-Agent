@@ -4,11 +4,13 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from src.gui import (
     WorkflowOptions,
     build_runtime_environment,
     console_python_executable,
+    detect_torch_runtime,
     detect_system_theme,
     enable_windows_high_dpi,
     get_primary_work_area,
@@ -29,6 +31,30 @@ class WorkflowOptionsTests(unittest.TestCase):
 
             self.assertEqual(
                 console_python_executable(str(pythonw)), str(python.resolve())
+            )
+
+    def test_torch_detection_uses_console_python_from_gui_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pythonw = root / "pythonw.exe"
+            python = root / "python.exe"
+            pythonw.touch()
+            python.touch()
+            completed = mock.Mock(
+                stdout=(
+                    '{"torch_available":true,"torch_version":"test+cu",'
+                    '"torch_cuda":true,"torch_device":"Test GPU"}\n'
+                )
+            )
+
+            with mock.patch("src.gui.sys.executable", str(pythonw)), mock.patch(
+                "src.gui.subprocess.run", return_value=completed
+            ) as run:
+                runtime = detect_torch_runtime()
+
+            self.assertTrue(runtime["torch_cuda"])
+            self.assertEqual(
+                run.call_args.args[0][0], str(python.resolve())
             )
 
     def test_full_workflow_builds_expected_flags(self) -> None:

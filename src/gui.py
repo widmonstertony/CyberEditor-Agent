@@ -405,7 +405,7 @@ def detect_torch_runtime() -> Dict[str, object]:
     )
     try:
         result = subprocess.run(
-            [sys.executable, "-c", script],
+            [console_python_executable(sys.executable), "-c", script],
             capture_output=True,
             text=True,
             encoding="utf-8",
