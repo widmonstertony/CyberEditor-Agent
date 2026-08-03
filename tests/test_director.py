@@ -75,9 +75,58 @@ class VisionSession(FakeSession):
             return FakeResponse({"capabilities": ["completion", "vision"]})
         if json.get("keep_alive") == 0:
             return FakeResponse({"done": True, "response": ""})
-        if "Build one coherent documentary edit" in json.get("prompt", ""):
+        prompt = json.get("prompt", "")
+        if "Create the director treatment" in prompt:
+            generated = {
+                "title": "Preparation to payoff",
+                "logline": "A crew turns preparation into one precise action.",
+                "central_theme": "coordination",
+                "chronology_policy": "strict_chronological",
+                "target_duration_sec": 45,
+                "opening_beat": "Introduce the crew",
+                "development_beat": "Build anticipation",
+                "payoff_beat": "Complete the action",
+                "ending_beat": "Hold on the result",
+                "color_intent": "Natural skin with controlled contrast",
+                "creative_look": "cinematic_warm",
+                "music_mood": "restrained anticipation",
+                "music_energy_arc": "quiet build to a clear finish",
+                "editorial_rules": ["Preserve chronology", "Reject repetition"],
+                "story_anchors": [
+                    {
+                        "asset_id": "asset-1",
+                        "cut_in_sec": 0,
+                        "cut_out_sec": 3,
+                        "beat": "opening",
+                        "reason": "Ground the opening",
+                    },
+                    {
+                        "asset_id": "asset-1",
+                        "cut_in_sec": 3,
+                        "cut_out_sec": 5,
+                        "beat": "payoff",
+                        "reason": "Show the payoff",
+                    },
+                    {
+                        "asset_id": "asset-1",
+                        "cut_in_sec": 5,
+                        "cut_out_sec": 8,
+                        "beat": "ending",
+                        "reason": "Complete the ending",
+                    },
+                ],
+            }
+        elif "Build one coherent documentary edit" in prompt:
             generated = {
                 "project_summary": "A coherent multi-camera story",
+                "music_plan": {
+                    "track_file": "",
+                    "reason": "No library supplied",
+                    "target_level_db": -20,
+                    "fade_in_sec": 2,
+                    "fade_out_sec": 3,
+                    "duck_dialogue": True,
+                },
                 "sequence": [
                     {
                         "candidate_id": "C0001",
@@ -207,6 +256,22 @@ class AIDirectorTests(unittest.TestCase):
         self.assertEqual(merged[0]["cut_out_sec"], 8.0)
         self.assertEqual(merged[0]["reason_for_cut"], "A；B")
         self.assertEqual(merged[0]["confidence"], 0.8)
+
+    def test_merge_never_creates_a_candidate_longer_than_fifteen_seconds(self):
+        merged = self.make_director().merge_decisions(
+            [
+                {
+                    "file_name": "proxy.mp4", "cut_in_sec": 0.0,
+                    "cut_out_sec": 10.0, "reason_for_cut": "A", "confidence": 0.9,
+                },
+                {
+                    "file_name": "proxy.mp4", "cut_in_sec": 10.1,
+                    "cut_out_sec": 20.0, "reason_for_cut": "B", "confidence": 0.9,
+                },
+            ]
+        )
+
+        self.assertEqual(len(merged), 2)
 
     def test_parse_fenced_json(self):
         parsed = AIDirector.parse_generated_json(
@@ -345,7 +410,14 @@ class AIDirectorTests(unittest.TestCase):
 
             image_requests = [item for item in session.posts if item.get("images")]
             self.assertEqual(len(image_requests), 1)
-            self.assertEqual(output["schema_version"], "2.0")
+            self.assertEqual(output["schema_version"], "3.0")
+            self.assertEqual(
+                output["color_pipeline"]["input_gamma"], "S-Log3"
+            )
+            self.assertEqual(
+                output["director_treatment"]["chronology_policy"],
+                "strict_chronological",
+            )
             self.assertEqual(output["clips"][0]["file_name"], str(source))
             self.assertEqual(
                 output["clips"][0]["transition_to_next"], "cross_dissolve"

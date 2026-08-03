@@ -30,10 +30,14 @@ progress, safe cancellation, environment checks, and output shortcuts.
 
 The full workflow does not merely concatenate every file. Each source is
 transcribed and sampled into time-distributed real frames. A vision model
-reviews each 10–15 minute window with both images and speech, and a second
-global-director pass chooses candidates from every source, orders them across
-files, and plans cuts/dissolves/fades, audio cleanup, basic looks, and gentle
-push-ins, gain, stabilization, and tracking. The result can include an editable
+first writes a project-wide treatment with theme, four story beats, target
+runtime, color intent, and music mood. It then reviews each 10–15 minute window
+with both images and speech. A second global-director pass keeps only the
+minority of shots that serve that treatment. Local validation enforces actual
+source order and in-file timecode, plus per-shot and total-runtime limits. It
+plans cuts/dissolves/fades, audio cleanup, creative looks, gentle push-ins,
+gain, stabilization, tracking, and music selected only from the user's local
+licensed library. The result can include an editable
 Resolve timeline, an immediately watchable FFmpeg 1080p review, and a final
 movie rendered by Resolve's Deliver pipeline.
 
@@ -94,6 +98,23 @@ recording settings, the files may be XAVC S, XAVC HS, or XAVC S-I and may be
 8-bit or 10-bit 4:2:2. Resolve Studio is the practical choice for common PP8 4K
 10-bit 4:2:2 footage and is required for this project's external timeline
 automation.
+
+The UI defaults `Source camera color profile` to Sony PP8. The director JSON
+records a technical color pipeline, and the Resolve executor applies it before
+any media is imported:
+
+```text
+Sony S-Gamut3.Cine / S-Log3
+        → DaVinci Wide Gamut / Intermediate
+        → Rec.709 Gamma 2.4
+```
+
+If Resolve rejects any required setting, execution stops instead of silently
+rendering flat log footage. The FFmpeg review uses a standard-library-generated
+3D LUT for the same technical normalization before the restrained creative
+look. When the current project already contains a timeline, PP8 execution
+creates an isolated `Director Cut` project rather than changing that project's
+global color settings.
 
 References:
 [Blackmagic Design edition comparison](https://www.blackmagicdesign.com/products/davinciresolve),
@@ -398,7 +419,11 @@ running:
 # Reuse raw_data.json and rerun only the director and Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen2.5:32b"
+  --ollama-model "qwen3.5:35b-a3b" `
+  --creative-brief "Tell the preparation-to-payoff story in shooting order" `
+  --target-duration-sec 80 `
+  --camera-profile sony_pp8_slog3_sgamut3cine `
+  --music-folder "D:\Music\Licensed"
 
 # Reuse timeline_cuts.json and run only Resolve
 python main.py --skip-extraction --skip-director `
@@ -431,7 +456,29 @@ The director produces this core structure:
 
 ```json
 {
-  "project_fps": 25.0,
+  "schema_version": "3.0",
+  "project_fps": 59.94,
+  "director_treatment": {
+    "title": "Preparation to synchronization",
+    "central_theme": "Messy preparation resolves into precise teamwork",
+    "chronology_policy": "strict_chronological",
+    "target_duration_sec": 82.5,
+    "creative_look": "cinematic_warm"
+  },
+  "color_pipeline": {
+    "camera_profile": "sony_pp8_slog3_sgamut3cine",
+    "input_color_space": "Sony S-Gamut3.Cine",
+    "input_gamma": "S-Log3",
+    "timeline_color_space": "DaVinci WG",
+    "timeline_gamma": "DaVinci Intermediate",
+    "output_color_space": "Rec.709",
+    "output_gamma": "Gamma 2.4"
+  },
+  "music_plan": {
+    "file_name": "D:\\Music\\Licensed\\restrained-build.wav",
+    "target_level_db": -20.0,
+    "duck_dialogue": true
+  },
   "clips": [
     {
       "clip_id": 1,
@@ -465,8 +512,10 @@ out-point up, then subtracts one frame to match Resolve's inclusive `endFrame`.
   method. The FFmpeg preview truly renders the AI transition, denoise, look,
   and motion plan. The editable Resolve timeline applies supported Voice
   Isolation, CDL, and transform properties and stores the full plan in markers.
-- The script reuses the current Resolve timeline. It creates
-  `CyberEditor Timeline` only when there is no current timeline.
+- A normal Rec.709 plan may reuse an empty current project. When a PP8
+  transform is required and the current project already contains a timeline,
+  the script creates an isolated `Director Cut` project so existing global
+  color settings are not changed.
 - If one Resolve append operation fails, the API offers no reliable
   transaction rollback. The log reports how many clips were appended so the
   user can inspect and undo the partial timeline.

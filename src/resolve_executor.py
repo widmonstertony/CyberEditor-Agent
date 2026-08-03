@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -168,6 +169,8 @@ class DaVinciExecutor:
         self.media_pool: Any = None
         self.timeline: Any = None
         self.created_project = False
+        self.color_pipeline: Dict[str, Any] = {}
+        self.music_plan: Dict[str, Any] = {}
 
     def run(self) -> Sequence[Any]:
         """
@@ -183,6 +186,7 @@ class DaVinciExecutor:
         self.project_manager, self.project = self.ensure_project()
         if self.created_project:
             self.initialize_new_project_fps(json_fps)
+        self.configure_color_pipeline()
         self.media_pool = self.project.GetMediaPool()
         if self.media_pool is None:
             raise ResolveExecutorError(
@@ -193,6 +197,7 @@ class DaVinciExecutor:
         self.compare_fps(json_fps, active_fps)
         prepared = self.prepare_clips(clips, active_fps)
         appended = self.append_clips(prepared)
+        self.append_music_bed(active_fps, prepared)
         self.apply_timeline_audio_preset()
         self.run_macro_fallback()
         self.save_project()
@@ -226,6 +231,10 @@ class DaVinciExecutor:
             raise ResolveExecutorError(
                 "JSON 根节点必须是对象 / JSON root must be an object."
             )
+        pipeline = payload.get("color_pipeline")
+        self.color_pipeline = pipeline if isinstance(pipeline, dict) else {}
+        music = payload.get("music_plan")
+        self.music_plan = music if isinstance(music, dict) else {}
         fps = self._positive_decimal(payload.get("project_fps"), "project_fps")
         raw_clips = payload.get("clips")
         if not isinstance(raw_clips, list) or not raw_clips:
@@ -438,6 +447,44 @@ class DaVinciExecutor:
                 "无法获取 Project Manager / Could not obtain Project Manager."
             )
         project = manager.GetCurrentProject()
+        current_project_name = self._safe_name(project, "") if project is not None else ""
+        expected_color_names = {
+            self.project_name.casefold(),
+            f"{self.project_name} director cut".casefold(),
+        }
+        needs_isolated_color_project = (
+            project is not None
+            and bool(self.color_pipeline.get("enabled"))
+            and (
+                self._safe_int_call(project, "GetTimelineCount") > 0
+                or not any(
+                    current_project_name.casefold().startswith(name)
+                    for name in expected_color_names
+                )
+            )
+        )
+        if needs_isolated_color_project:
+            project_names = self._project_names(manager)
+            name = self._unique_name(
+                f"{self.project_name} Director Cut", project_names
+            )
+            try:
+                project = manager.CreateProject(name)
+            except Exception as exc:
+                raise ResolveExecutorError(
+                    "当前工程已有时间线，无法安全切换 Sony Log 色彩管理，且新建导演工程失败。"
+                    f" / Could not create an isolated color-managed project: {exc}"
+                ) from exc
+            if project is None:
+                raise ResolveExecutorError(
+                    "无法为 PP8 创建独立色彩管理工程 / Could not create an isolated PP8 project."
+                )
+            self.created_project = True
+            self.logger.info(
+                "为避免修改已有工程，已创建独立导演工程“%s” / Created isolated director project '%s'",
+                name, name,
+            )
+            return manager, project
         if project is not None:
             current_name = self._safe_name(project, "unnamed")
             normalized_name = current_name.strip().casefold()
@@ -558,6 +605,58 @@ class DaVinciExecutor:
                 fps_text,
                 fps_text,
             )
+
+    def configure_color_pipeline(self) -> None:
+        """
+        Configure Resolve Color Management before importing any source media.
+        在导入任何素材前配置 Resolve 色彩管理。
+
+        The exact setting values below are accepted by Resolve 21 on Windows.
+        Every required write is checked so PP8 footage cannot silently render flat.
+
+        下列设置值已在 Windows Resolve 21 实机验证。每一步都会检查返回值，避免
+        PP8 素材在技术还原失败时仍悄悄输出灰片。
+        """
+        if not bool(self.color_pipeline.get("enabled")):
+            return
+        if str(self.color_pipeline.get("camera_profile") or "").casefold() != (
+            "sony_pp8_slog3_sgamut3cine"
+        ):
+            raise ResolveExecutorError(
+                "启用了未知色彩配置 / Unknown enabled color pipeline."
+            )
+        setter = getattr(self.project, "SetSetting", None)
+        if not callable(setter):
+            raise ResolveExecutorError(
+                "当前 Resolve 工程不提供 SetSetting，无法安全还原 Sony PP8。"
+                " / Resolve project does not expose SetSetting for PP8 color management."
+            )
+        settings = (
+            ("colorScienceMode", "davinciYRGBColorManaged"),
+            ("isAutoColorManage", "0"),
+            ("separateColorSpaceAndGamma", "1"),
+            ("colorSpaceInput", "Sony S-Gamut3.Cine"),
+            ("colorSpaceInputGamma", "S-Log3"),
+            ("colorSpaceTimeline", "DaVinci WG"),
+            ("colorSpaceTimelineGamma", "DaVinci Intermediate"),
+            ("colorSpaceOutput", "Rec.709"),
+            ("colorSpaceOutputGamma", "Gamma 2.4"),
+        )
+        for key, value in settings:
+            try:
+                accepted = setter(key, value)
+            except Exception as exc:
+                raise ResolveExecutorError(
+                    f"Resolve 色彩设置失败 {key}={value}: {exc}"
+                ) from exc
+            if accepted is False:
+                raise ResolveExecutorError(
+                    f"Resolve 拒绝关键色彩设置 {key}={value}；已停止，避免输出未还原 PP8。"
+                    " / Resolve rejected a required color setting; stopped to prevent flat output."
+                )
+        self.logger.info(
+            "Sony PP8 已还原：S-Gamut3.Cine/S-Log3 → DaVinci WG/Intermediate → Rec.709 Gamma 2.4"
+        )
 
     def ensure_timeline(self) -> Any:
         """
@@ -814,6 +913,143 @@ class DaVinciExecutor:
                 decision.clip_id,
             )
         return result_items
+
+    def append_music_bed(
+        self,
+        fps: Decimal,
+        prepared: Sequence[Tuple[ClipDecision, Dict[str, Any]]],
+    ) -> Sequence[Any]:
+        """
+        Loop the AI-selected local music file on audio track 2.
+        将 AI 从本地曲库选中的配乐循环追加到音轨 2。
+
+        Parameters / 参数:
+            fps: Active Resolve timeline frame rate. / 当前 Resolve 时间线帧率。
+            prepared: Validated picture edits used to calculate program length.
+                用于计算成片长度的已校验画面剪辑。
+        """
+        music_text = str(self.music_plan.get("file_name") or "").strip()
+        if not music_text:
+            self.logger.info(
+                "未提供本地授权配乐库；本次不添加音乐 / No local licensed music selected"
+            )
+            return []
+        path = Path(music_text).expanduser().resolve()
+        if not path.is_file():
+            raise ResolveExecutorError(
+                f"找不到导演选择的配乐 / Selected music not found: {path}"
+            )
+        imported = self._import_media(path)
+        if len(imported) != 1:
+            matches = self._items_for_path(path)
+            if len(matches) != 1:
+                raise ResolveExecutorError(
+                    f"无法唯一导入配乐 / Could not uniquely import music: {path}"
+                )
+            music_item = matches[0]
+        else:
+            music_item = imported[0]
+        music_seconds = self._probe_media_duration(path)
+        if music_seconds <= 0:
+            raise ResolveExecutorError(
+                f"无法读取配乐时长 / Could not read music duration: {path}"
+            )
+        program_frames = sum(
+            max(
+                1,
+                int(
+                    ((decision.cut_out_sec - decision.cut_in_sec) * fps).to_integral_value(
+                        rounding=ROUND_CEILING
+                    )
+                ),
+            )
+            for decision, _ in prepared
+        )
+        music_frames = max(
+            1,
+            int((Decimal(str(music_seconds)) * fps).to_integral_value(rounding=ROUND_CEILING)),
+        )
+        try:
+            audio_tracks = int(self.timeline.GetTrackCount("audio") or 0)
+        except Exception:
+            audio_tracks = 1
+        add_track = getattr(self.timeline, "AddTrack", None)
+        while audio_tracks < 2 and callable(add_track):
+            if add_track("audio", "stereo") is False:
+                break
+            audio_tracks += 1
+        if audio_tracks < 2:
+            raise ResolveExecutorError(
+                "无法创建配乐音轨 2 / Could not create music audio track 2."
+            )
+        try:
+            record_frame = int(self.timeline.GetStartFrame() or 0)
+        except Exception:
+            record_frame = 0
+        appended: List[Any] = []
+        cursor = 0
+        while cursor < program_frames:
+            segment_frames = min(music_frames, program_frames - cursor)
+            clip_info = {
+                "mediaPoolItem": music_item,
+                "startFrame": 0,
+                "endFrame": segment_frames - 1,
+                "mediaType": 2,
+                "trackIndex": 2,
+                "recordFrame": record_frame + cursor,
+            }
+            result = self.media_pool.AppendToTimeline([clip_info])
+            items = self._coerce_items(result)
+            if result is None or result is False or (not items and result is not True):
+                raise ResolveExecutorError(
+                    "Resolve 无法把配乐追加到音轨 2 / Could not append music to track 2."
+                )
+            appended.extend(items)
+            cursor += segment_frames
+        level = max(
+            Decimal("-36"),
+            min(
+                Decimal("-6"),
+                self._decimal(
+                    self.music_plan.get("target_level_db", -20),
+                    "music_plan.target_level_db",
+                ),
+            ),
+        )
+        for timeline_item in appended:
+            setter = getattr(timeline_item, "SetProperty", None)
+            if callable(setter):
+                try:
+                    setter("Volume", float(level))
+                except Exception:
+                    pass
+        self.logger.info(
+            "已添加配乐：%s（音轨 2，%.1f dB）/ Music added on track 2",
+            path.name, float(level),
+        )
+        return appended
+
+    @staticmethod
+    def _probe_media_duration(path: Path) -> float:
+        """Read media duration with ffprobe. / 使用 ffprobe 读取媒体时长。"""
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return 0.0
+        try:
+            completed = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return float((completed.stdout or "0").strip()) if completed.returncode == 0 else 0.0
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return 0.0
 
     def apply_clip_effects(self, timeline_item: Any, decision: ClipDecision) -> None:
         """

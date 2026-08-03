@@ -210,6 +210,30 @@ class ResolveExecutorTests(unittest.TestCase):
 
         self.assertEqual(project.fps, "59.94")
 
+    def test_sony_pp8_color_management_is_required_before_import(self):
+        class ColorProject(FakeProject):
+            def __init__(self):
+                super().__init__()
+                self.settings = {}
+
+            def SetSetting(self, key, value):
+                self.settings[key] = value
+                return True
+
+        project = ColorProject()
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.project = project
+        executor.color_pipeline = {
+            "enabled": True,
+            "camera_profile": "sony_pp8_slog3_sgamut3cine",
+        }
+
+        executor.configure_color_pipeline()
+
+        self.assertEqual(project.settings["colorSpaceInput"], "Sony S-Gamut3.Cine")
+        self.assertEqual(project.settings["colorSpaceInputGamma"], "S-Log3")
+        self.assertEqual(project.settings["colorSpaceOutputGamma"], "Gamma 2.4")
+
     def test_timeline_creation_falls_back_to_documented_overload(self):
         project = FakeProject()
 

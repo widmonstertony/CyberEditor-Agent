@@ -529,6 +529,18 @@ class ModernCyberEditorApp:
         # 首帧后重新检测恢复的素材，启动时再检查交接 JSON。
         self.detected_project_fps = 0.0
         self.ctx_var = tk.StringVar(value=str(data.get("num_ctx", 8192)))
+        self.creative_brief_var = tk.StringVar(
+            value=str(data.get("creative_brief", ""))
+        )
+        self.target_duration_var = tk.StringVar(
+            value=str(data.get("target_duration_sec", 0.0))
+        )
+        self.camera_profile_var = tk.StringVar(
+            value=str(data.get("camera_profile", "sony_pp8_slog3_sgamut3cine"))
+        )
+        self.music_folder_var = tk.StringVar(
+            value=str(data.get("music_folder", ""))
+        )
         self.timeline_var = tk.StringVar(
             value=str(data.get("timeline_name", "CyberEditor Timeline"))
         )
@@ -851,9 +863,42 @@ class ModernCyberEditorApp:
             column=0, columnspan=2
         )
 
-        self._section_title(parent, 10, self.t("resolve_settings"))
+        self._section_title(parent, 10, self.t("director_settings"))
+        self._entry_field(
+            parent, 11, self.t("creative_brief"), self.creative_brief_var
+        )
+        directing = ctk.CTkFrame(parent, fg_color="transparent")
+        directing.grid(row=12, column=0, sticky="ew")
+        directing.grid_columnconfigure((0, 1), weight=1, uniform="directing")
+        self._entry_field(
+            directing, 0, self.t("target_duration"), self.target_duration_var,
+            column=0
+        )
+        camera_values = [
+            self.t("camera_sony_pp8"), self.t("camera_rec709"), self.t("camera_auto")
+        ]
+        self._camera_display_to_key = dict(zip(
+            camera_values,
+            ("sony_pp8_slog3_sgamut3cine", "rec709", "auto"),
+        ))
+        current_camera = self.camera_profile_var.get()
+        if current_camera not in self._camera_display_to_key.values():
+            current_camera = "sony_pp8_slog3_sgamut3cine"
+            self.camera_profile_var.set(current_camera)
+        self.camera_menu = self._option_field(
+            directing, 0, self.t("camera_profile"), camera_values,
+            next(label for label, key in self._camera_display_to_key.items()
+                 if key == current_camera),
+            self._on_camera_profile_change, column=1
+        )
+        self._path_field(
+            parent, 13, self.t("music_folder"), self.music_folder_var,
+            self._choose_music_folder, self.t("select_folder")
+        )
+
+        self._section_title(parent, 14, self.t("resolve_settings"))
         resolve = ctk.CTkFrame(parent, fg_color="transparent")
-        resolve.grid(row=11, column=0, sticky="ew")
+        resolve.grid(row=15, column=0, sticky="ew")
         resolve.grid_columnconfigure((0, 1), weight=1, uniform="resolve")
         self._entry_field(
             resolve, 0, self.t("timeline_name"), self.timeline_var, column=0
@@ -883,7 +928,7 @@ class ModernCyberEditorApp:
             self.macro_profile_var, column=0, columnspan=2
         )
         switches = ctk.CTkFrame(parent, fg_color="transparent")
-        switches.grid(row=12, column=0, sticky="ew", pady=(7, 14))
+        switches.grid(row=16, column=0, sticky="ew", pady=(7, 14))
         switches.grid_columnconfigure((0, 1), weight=1)
         self.run_resolve_switch = ctk.CTkSwitch(
             switches, text=self.t("run_resolve"),
@@ -1172,6 +1217,15 @@ class ModernCyberEditorApp:
                 self._start_fps_detection(candidate)
         self._save_current_preferences()
 
+    def _on_camera_profile_change(self, display_value: str) -> None:
+        """Store the technical camera input profile. / 保存技术相机输入色彩配置。"""
+        self.camera_profile_var.set(
+            self._camera_display_to_key.get(
+                display_value, "sony_pp8_slog3_sgamut3cine"
+            )
+        )
+        self._save_current_preferences()
+
     def _start_initial_fps_detection(self) -> None:
         """Detect FPS for a restored media path after first paint. / 首帧显示后检测已恢复素材路径的 FPS。"""
         if self.fps_mode != "auto":
@@ -1451,6 +1505,10 @@ class ModernCyberEditorApp:
             chunk_minutes=float(self.chunk_var.get()),
             project_fps=project_fps,
             num_ctx=int(self.ctx_var.get()),
+            creative_brief=self.creative_brief_var.get().strip(),
+            target_duration_sec=float(self.target_duration_var.get() or 0),
+            camera_profile=self.camera_profile_var.get().strip(),
+            music_folder=self.music_folder_var.get().strip(),
             timeline_name=(
                 self.timeline_var.get().strip() or "CyberEditor Timeline"
             ),
@@ -1970,6 +2028,13 @@ class ModernCyberEditorApp:
         )
         if path:
             self.data_var.set(path)
+
+    def _choose_music_folder(self) -> None:
+        """Select a local licensed music library. / 选择本地已授权配乐库。"""
+        path = filedialog.askdirectory(title=self.t("select_music_folder"))
+        if path:
+            self.music_folder_var.set(path)
+            self._save_current_preferences()
 
     def _open_output(self) -> None:
         """Open or create the selected output directory. / 打开或创建所选输出目录。"""

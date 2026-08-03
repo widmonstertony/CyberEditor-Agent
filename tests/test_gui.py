@@ -75,6 +75,28 @@ class WorkflowOptionsTests(unittest.TestCase):
             self.assertIn("--input-folder", command)
             self.assertNotIn("--skip-preview", command)
 
+    def test_director_intent_color_and_music_flags_are_forwarded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "source.mp4"
+            music = root / "music"
+            video.touch()
+            music.mkdir()
+            options = WorkflowOptions(
+                video=str(video),
+                creative_brief="A chronological behind-the-scenes short",
+                target_duration_sec=75,
+                camera_profile="sony_pp8_slog3_sgamut3cine",
+                music_folder=str(music),
+            )
+
+            command = options.build_command("python.exe", root)
+
+            self.assertIn("--creative-brief", command)
+            self.assertIn("--target-duration-sec", command)
+            self.assertIn("--camera-profile", command)
+            self.assertIn("--music-folder", command)
+
     def test_resolve_only_requires_timeline_and_enables_resolve(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

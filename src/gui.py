@@ -722,6 +722,10 @@ class WorkflowOptions:
     chunk_minutes: float = 12.0
     project_fps: float = 25.0
     num_ctx: int = 8192
+    creative_brief: str = ""
+    target_duration_sec: float = 0.0
+    camera_profile: str = "sony_pp8_slog3_sgamut3cine"
+    music_folder: str = ""
     timeline_name: str = "CyberEditor Timeline"
     project_name: str = "CyberEditor Project"
     skip_resolve: bool = True
@@ -802,6 +806,18 @@ class WorkflowOptions:
             raise ValueError("项目 FPS 必须大于 0 / Project FPS must be positive.")
         if int(self.num_ctx) < 2048:
             raise ValueError("Ollama 上下文至少为 2048 / Ollama context must be >= 2048.")
+        if float(self.target_duration_sec) < 0:
+            raise ValueError("目标时长不能为负数 / Target duration cannot be negative.")
+        if self.camera_profile not in {
+            "sony_pp8_slog3_sgamut3cine", "rec709", "auto"
+        }:
+            raise ValueError("未知相机色彩配置 / Unknown camera color profile.")
+        if self.music_folder and not _absolute_path(
+            self.music_folder, project_root
+        ).is_dir():
+            raise ValueError(
+                f"配乐目录不存在 / Music folder not found:\n{self.music_folder}"
+            )
         if self.render_final and self.skip_resolve:
             raise ValueError(
                 "最终渲染需要启用 Resolve / Final rendering requires Resolve."
@@ -846,6 +862,10 @@ class WorkflowOptions:
             str(self.project_fps),
             "--num-ctx",
             str(self.num_ctx),
+            "--target-duration-sec",
+            str(self.target_duration_sec),
+            "--camera-profile",
+            self.camera_profile,
             "--timeline-name",
             self.timeline_name,
             "--project-name",
@@ -853,6 +873,12 @@ class WorkflowOptions:
             "--log-level",
             "INFO",
         ]
+        if self.creative_brief.strip():
+            command.extend(["--creative-brief", self.creative_brief.strip()])
+        if self.music_folder.strip():
+            command.extend(
+                ["--music-folder", str(_absolute_path(self.music_folder, project_root))]
+            )
         explicit_videos = self.videos or ([self.video] if self.video else [])
         for video in explicit_videos:
             command.extend(

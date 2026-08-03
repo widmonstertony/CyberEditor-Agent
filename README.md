@@ -17,9 +17,11 @@ PowerShell 中运行：
 子进程调用原有 `main.py`；常驻 UI 不导入 PyTorch，不会改变严格串行与显存释放策略。
 
 完整流程不是把所有视频简单首尾相接。每个素材会被依次转写并抽取时间分布均匀的真实
-画面；视觉模型对每个 10–15 分钟窗口结合画面和台词挑选候选片段，第二遍全局导演再从
-全部素材的候选中决定使用哪些、如何跨文件排序，以及硬切/叠化/淡黑、音频降噪、基础
-色彩风格、音量、防抖、跟踪和轻微推镜。最终可同时输出 Resolve 可编辑时间线、
+画面；AI 先根据全部素材生成包含主题、四段叙事节拍、目标时长、配色意图和音乐情绪的
+导演阐述，再让视觉模型对每个 10–15 分钟窗口结合画面和台词挑选候选片段。第二遍全局
+导演只保留服务主题的少数镜头；本地校验器强制按真实素材顺序与素材内时间码排列，并限制
+单镜头与总成片时长。它同时规划硬切/叠化/淡黑、音频降噪、创意色彩、音量、防抖、跟踪、
+轻微推镜，以及从用户本地授权曲库中选择的配乐。最终可同时输出 Resolve 可编辑时间线、
 FFmpeg 1080p 审片预览，以及由 Resolve Deliver 页面真正渲染的最终成片。
 
 “性能配置”默认使用 `自动检测 / Auto`：界面以标准库读取 CPU、系统内存和 GPU，
@@ -59,6 +61,19 @@ UI 启动时会检测本机 Ollama；若已安装但服务未运行，会自动�
 不是 RAW 视频格式。相机可能按所选记录格式生成 XAVC S、XAVC HS 或 XAVC S-I，
 并可能为 8-bit 或 10-bit 4:2:2。对于常见的 PP8 4K 10-bit 4:2:2 素材以及本项目的
 外部自动组装流程，建议直接安装 Resolve Studio。
+
+界面中的“原素材色彩配置”默认选择 Sony PP8。导演 JSON 会记录技术色彩管线；Resolve
+执行器在导入任何素材前强制设置：
+
+```text
+Sony S-Gamut3.Cine / S-Log3
+        → DaVinci Wide Gamut / Intermediate
+        → Rec.709 Gamma 2.4
+```
+
+任何关键设置被 Resolve 拒绝都会停止执行，不再静默输出灰片。FFmpeg 审片预览也会用
+标准库运行时生成的 3D LUT 做同一技术还原，再叠加 AI 选择的克制创意风格。若当前工程
+已有时间线，PP8 流程会新建独立的 `Director Cut` 工程，避免修改用户已有工程色彩设置。
 
 参考：
 [Blackmagic Design 版本对比](https://www.blackmagicdesign.com/products/davinciresolve)、
@@ -342,7 +357,11 @@ data/cybereditor.log
 # 已有 raw_data.json，只重跑导演与 Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen2.5:32b"
+  --ollama-model "qwen3.5:35b-a3b" `
+  --creative-brief "按拍摄时间讲述团队从准备到完成动作的过程" `
+  --target-duration-sec 80 `
+  --camera-profile sony_pp8_slog3_sgamut3cine `
+  --music-folder "D:\Music\Licensed"
 
 # 已有 timeline_cuts.json，只执行 Resolve
 python main.py --skip-extraction --skip-director `
@@ -375,7 +394,29 @@ from src.resolve_executor import DaVinciExecutor
 
 ```json
 {
-  "project_fps": 25.0,
+  "schema_version": "3.0",
+  "project_fps": 59.94,
+  "director_treatment": {
+    "title": "从准备到同步",
+    "central_theme": "混乱的准备最终凝聚成准确的团队动作",
+    "chronology_policy": "strict_chronological",
+    "target_duration_sec": 82.5,
+    "creative_look": "cinematic_warm"
+  },
+  "color_pipeline": {
+    "camera_profile": "sony_pp8_slog3_sgamut3cine",
+    "input_color_space": "Sony S-Gamut3.Cine",
+    "input_gamma": "S-Log3",
+    "timeline_color_space": "DaVinci WG",
+    "timeline_gamma": "DaVinci Intermediate",
+    "output_color_space": "Rec.709",
+    "output_gamma": "Gamma 2.4"
+  },
+  "music_plan": {
+    "file_name": "D:\\Music\\Licensed\\restrained-build.wav",
+    "target_level_db": -20.0,
+    "duck_dialogue": true
+  },
   "clips": [
     {
       "clip_id": 1,
@@ -405,8 +446,8 @@ from src.resolve_executor import DaVinciExecutor
 - Resolve 公共脚本 API 没有稳定的通用转场插入方法。FFmpeg 预览会真正执行 AI 选择
   的转场/降噪/运动效果；Resolve 时间线应用 Voice Isolation、CDL、缩放等受支持效果，
   并用片段标记保留完整效果计划，供后续人工精修。
-- 脚本会复用当前 Resolve 时间线；如果没有当前时间线，才创建
-  `CyberEditor Timeline`。
+- 普通 Rec.709 计划可复用当前空工程；需要 PP8 技术还原且当前工程已有时间线时，脚本
+  会创建独立 `Director Cut` 工程，防止全局色彩设置污染已有项目。
 - 如果中途某个 Resolve 片段追加失败，API 没有可靠事务回滚；日志会指出已追加
   数量，用户需要检查时间线并撤销。
 - 视觉理解由支持图片输入的 Ollama 模型完成。普通 `qwen2.5:3b` 是纯文本烟雾测试

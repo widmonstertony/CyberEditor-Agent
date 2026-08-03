@@ -280,11 +280,19 @@ class WorkflowOrchestrator:
                     str(args.project_fps),
                     "--num-ctx",
                     str(args.num_ctx),
+                    "--target-duration-sec",
+                    str(args.target_duration_sec),
+                    "--camera-profile",
+                    args.camera_profile,
                     "--timeout",
                     str(args.ollama_timeout),
                     "--log-level",
                     args.log_level,
                 ]
+                if args.creative_brief.strip():
+                    command.extend(["--creative-brief", args.creative_brief.strip()])
+                if args.music_folder:
+                    command.extend(["--music-folder", str(args.music_folder)])
                 try:
                     self._run_stage("导演 / Direct", command)
                 finally:
@@ -672,6 +680,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-minutes", type=float, default=12.0)
     parser.add_argument("--project-fps", type=float, default=25.0)
     parser.add_argument("--num-ctx", type=int, default=8192)
+    parser.add_argument("--creative-brief", default="")
+    parser.add_argument("--target-duration-sec", type=float, default=0.0)
+    parser.add_argument(
+        "--camera-profile",
+        default="sony_pp8_slog3_sgamut3cine",
+        choices=("sony_pp8_slog3_sgamut3cine", "rec709", "auto"),
+    )
+    parser.add_argument("--music-folder")
     parser.add_argument("--ollama-timeout", type=int, default=1800)
     parser.add_argument("--timeline-name", default="CyberEditor Timeline")
     parser.add_argument("--project-name", default="CyberEditor Project")

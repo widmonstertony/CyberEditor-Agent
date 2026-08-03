@@ -28,7 +28,67 @@ from typing import Any, Dict, List, Optional, Sequence
 
 LOGGER_NAME = "cybereditor.director"
 DIRECTOR_CHECKPOINT_VERSION = 1
-DIRECTOR_PROMPT_VERSION = "2026-08-02.1"
+DIRECTOR_PROMPT_VERSION = "2026-08-03.0-director-treatment"
+
+TREATMENT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "logline": {"type": "string", "minLength": 1},
+        "central_theme": {"type": "string", "minLength": 1},
+        "chronology_policy": {
+            "type": "string",
+            "enum": ["strict_chronological", "teaser_then_chronological"],
+        },
+        "target_duration_sec": {"type": "number", "minimum": 30, "maximum": 600},
+        "opening_beat": {"type": "string", "minLength": 1},
+        "development_beat": {"type": "string", "minLength": 1},
+        "payoff_beat": {"type": "string", "minLength": 1},
+        "ending_beat": {"type": "string", "minLength": 1},
+        "color_intent": {"type": "string", "minLength": 1},
+        "creative_look": {
+            "type": "string",
+            "enum": ["clean_neutral", "cinematic_warm", "cool_steel", "high_contrast"],
+        },
+        "music_mood": {"type": "string", "minLength": 1},
+        "music_energy_arc": {"type": "string", "minLength": 1},
+        "editorial_rules": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 2,
+            "maxItems": 8,
+        },
+        "story_anchors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string", "minLength": 1},
+                    "cut_in_sec": {"type": "number", "minimum": 0},
+                    "cut_out_sec": {"type": "number", "minimum": 0},
+                    "beat": {
+                        "type": "string",
+                        "enum": ["opening", "development", "payoff", "ending"],
+                    },
+                    "reason": {"type": "string", "minLength": 1},
+                },
+                "required": [
+                    "asset_id", "cut_in_sec", "cut_out_sec", "beat", "reason"
+                ],
+                "additionalProperties": False,
+            },
+            "minItems": 3,
+            "maxItems": 12,
+        },
+    },
+    "required": [
+        "title", "logline", "central_theme", "chronology_policy",
+        "target_duration_sec", "opening_beat", "development_beat",
+        "payoff_beat", "ending_beat", "color_intent", "creative_look",
+        "music_mood", "music_energy_arc", "editorial_rules", "story_anchors",
+    ],
+    "additionalProperties": False,
+}
 
 DECISION_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -175,6 +235,22 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "project_summary": {"type": "string"},
+        "music_plan": {
+            "type": "object",
+            "properties": {
+                "track_file": {"type": "string"},
+                "reason": {"type": "string"},
+                "target_level_db": {"type": "number", "minimum": -36, "maximum": -6},
+                "fade_in_sec": {"type": "number", "minimum": 0, "maximum": 10},
+                "fade_out_sec": {"type": "number", "minimum": 0, "maximum": 10},
+                "duck_dialogue": {"type": "boolean"},
+            },
+            "required": [
+                "track_file", "reason", "target_level_db", "fade_in_sec",
+                "fade_out_sec", "duck_dialogue",
+            ],
+            "additionalProperties": False,
+        },
         "sequence": {
             "type": "array",
             "items": {
@@ -233,7 +309,7 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
             },
         },
     },
-    "required": ["project_summary", "sequence"],
+    "required": ["project_summary", "music_plan", "sequence"],
     "additionalProperties": False,
 }
 
@@ -283,6 +359,10 @@ class AIDirector:
         num_ctx: int = 8192,
         timeout_sec: int = 1800,
         merge_gap_sec: float = 0.4,
+        creative_brief: str = "",
+        target_duration_sec: float = 0.0,
+        camera_profile: str = "sony_pp8_slog3_sgamut3cine",
+        music_folder: Optional[os.PathLike] = None,
         session: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -301,6 +381,10 @@ class AIDirector:
             raise DirectorError(
                 "merge_gap_sec 不能为负数 / cannot be negative."
             )
+        if target_duration_sec < 0:
+            raise DirectorError(
+                "目标时长不能为负数 / target_duration_sec cannot be negative."
+            )
 
         self.model = model.strip()
         self.base_url = base_url.rstrip("/")
@@ -309,6 +393,26 @@ class AIDirector:
         self.num_ctx = int(num_ctx)
         self.timeout_sec = int(timeout_sec)
         self.merge_gap_sec = float(merge_gap_sec)
+        self.creative_brief = " ".join(str(creative_brief or "").split())
+        self.target_duration_sec = float(target_duration_sec)
+        self.camera_profile = str(camera_profile or "").strip().casefold()
+        if self.camera_profile not in {
+            "sony_pp8_slog3_sgamut3cine", "rec709", "auto"
+        }:
+            raise DirectorError(
+                "不支持的相机色彩配置 / Unsupported camera profile: "
+                f"{camera_profile}"
+            )
+        self.music_folder = (
+            Path(music_folder).expanduser().resolve() if music_folder else None
+        )
+        if self.music_folder is not None and not self.music_folder.is_dir():
+            raise DirectorError(
+                f"配乐目录不存在 / Music folder not found: {self.music_folder}"
+            )
+        self._active_treatment: Dict[str, Any] = {}
+        self._active_target_duration_sec = 0.0
+        self._music_files: List[Path] = []
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         self._session = session
 
@@ -426,6 +530,89 @@ class AIDirector:
         )
         return output
 
+    def revalidate_existing_plan(
+        self,
+        raw_data_path: os.PathLike,
+        plan_path: os.PathLike,
+    ) -> Dict[str, Any]:
+        """
+        Reapply deterministic story, overlap, runtime, and color gates.
+        对已有计划重新应用确定性的叙事、重叠、时长与色彩守门。
+
+        This recovery path uses ``candidate_audit`` and never contacts Ollama,
+        making validator improvements cheap to apply after a long model pass.
+
+        此恢复路径读取 ``candidate_audit``，不会连接 Ollama；长时间模型审片完成后，
+        可低成本应用更新后的本地校验规则。
+        """
+        raw_path = Path(raw_data_path).expanduser().resolve()
+        destination = Path(plan_path).expanduser().resolve()
+        raw_data = self.load_raw_data(raw_path)
+        assets = raw_data.get("assets")
+        if not isinstance(assets, list):
+            raise DirectorError(
+                "重新校验只支持多素材 schema 3.0 / Revalidation requires a multi-asset plan."
+            )
+        try:
+            payload = json.loads(destination.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as exc:
+            raise DirectorError(
+                f"无法读取已有剪辑计划 / Cannot read existing plan: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise DirectorError("已有剪辑计划格式无效 / Existing plan is invalid.")
+        audit = payload.get("candidate_audit")
+        if not isinstance(audit, list) or not audit:
+            raise DirectorError(
+                "已有计划没有 candidate_audit，必须重新运行 AI 导演。"
+                " / Existing plan has no candidate audit; rerun the director."
+            )
+        self._active_target_duration_sec = self._finite_float(
+            payload.get("target_duration_sec", self.target_duration_sec or 90),
+            "target_duration_sec",
+        )
+        treatment_payload = payload.get("director_treatment")
+        treatment = self.validate_treatment(
+            treatment_payload if isinstance(treatment_payload, dict) else {},
+            assets,
+        )
+        candidates = self.candidates_from_treatment(treatment, assets)
+        candidates.extend(
+            dict(item) for item in audit
+            if isinstance(item, dict) and not item.get("protected_story_anchor")
+        )
+        candidates = self.merge_decisions(candidates)
+        for index, candidate in enumerate(candidates, start=1):
+            candidate["candidate_id"] = f"C{index:04d}"
+        final_clips = self._remove_overlaps(candidates)
+        global_look = {
+            "clean_neutral": "neutral", "cinematic_warm": "warm",
+            "cool_steel": "cool", "high_contrast": "contrast",
+        }.get(str(treatment.get("creative_look") or ""), "neutral")
+        for clip in final_clips:
+            if str(clip.get("color_look") or "neutral") in {"source", "neutral"}:
+                clip["color_look"] = global_look
+        final_clips = self._fit_target_duration(final_clips, treatment)
+        for index, clip in enumerate(final_clips, start=1):
+            clip["clip_id"] = index
+        payload.update(
+            {
+                "director_treatment": treatment,
+                "target_duration_sec": self._active_target_duration_sec,
+                "color_pipeline": self.build_color_pipeline(treatment),
+                "candidate_count": len(candidates),
+                "candidate_audit": candidates,
+                "clips": final_clips,
+                "revalidated_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        self._atomic_write_json(payload, destination)
+        self.logger.info(
+            "已有计划重新校验完成：%d 个镜头 / Existing plan revalidated: %d clips",
+            len(final_clips), len(final_clips),
+        )
+        return payload
+
     def _run_multi_asset(
         self,
         raw_data: Dict[str, Any],
@@ -445,7 +632,7 @@ class AIDirector:
         """
         assets = raw_data["assets"]
         chunks: List[Dict[str, Any]] = []
-        for asset in assets:
+        for asset_order, asset in enumerate(assets):
             asset_chunks = self.chunk_raw_data(asset)
             source_name = str(
                 asset.get("proxy_file_name")
@@ -463,6 +650,7 @@ class AIDirector:
                 chunk["asset_label"] = Path(
                     str(asset.get("source_video") or source_name)
                 ).name
+                chunk["source_order"] = asset_order
                 chunks.append(chunk)
 
         checkpoint_path = destination.with_name(
@@ -489,6 +677,11 @@ class AIDirector:
         candidates: List[Dict[str, Any]] = []
         try:
             self.check_ollama(require_vision=True)
+            self._music_files = self.discover_music_files()
+            treatment_payload = self.request_treatment(assets)
+            treatment = self.validate_treatment(treatment_payload, assets)
+            self._active_treatment = treatment
+            candidates.extend(self.candidates_from_treatment(treatment, assets))
             for index, chunk in enumerate(chunks, start=1):
                 chunk_key = self._director_chunk_key(chunk)
                 cached_decisions = completed_chunks.get(chunk_key)
@@ -522,6 +715,7 @@ class AIDirector:
                     str(chunk["source_name"]),
                     schema=CANDIDATE_SCHEMA,
                     include_images=True,
+                    treatment=treatment,
                 )
                 decisions = self.validate_chunk_decisions(
                     response_payload,
@@ -530,6 +724,7 @@ class AIDirector:
                 )
                 for decision in decisions:
                     decision["asset_id"] = str(chunk["asset_id"])
+                    decision["source_order"] = int(chunk["source_order"])
                 candidates.extend(decisions)
                 completed_chunks[chunk_key] = [dict(item) for item in decisions]
                 self._write_director_checkpoint(
@@ -549,15 +744,17 @@ class AIDirector:
                 raise DirectorError(
                     "视觉导演未找到任何可用片段 / Visual director found no usable clips."
                 )
-            sequence_payload = self.request_sequence(candidates, assets)
-            final_clips = self.validate_sequence(sequence_payload, candidates)
+            sequence_payload = self.request_sequence(candidates, assets, treatment)
+            final_clips = self.validate_sequence(
+                sequence_payload, candidates, treatment
+            )
         finally:
             self.unload_model()
 
         for index, clip in enumerate(final_clips, start=1):
             clip["clip_id"] = index
         output: Dict[str, Any] = {
-            "schema_version": "2.0",
+            "schema_version": "3.0",
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "project_fps": self.project_fps,
             "source_raw_data": str(raw_path),
@@ -565,7 +762,14 @@ class AIDirector:
             "chunk_duration_sec": self.chunk_duration_sec,
             "asset_count": len(assets),
             "candidate_count": len(candidates),
+            "candidate_audit": candidates,
             "project_summary": str(sequence_payload.get("project_summary") or "").strip(),
+            "director_treatment": treatment,
+            "target_duration_sec": self._active_target_duration_sec,
+            "color_pipeline": self.build_color_pipeline(treatment),
+            "music_plan": self.validate_music_plan(
+                sequence_payload.get("music_plan")
+            ),
             "effects_engine": {
                 "review": "ffmpeg",
                 "editable_timeline": "davinci_resolve",
@@ -901,6 +1105,7 @@ class AIDirector:
         source_name: str,
         schema: Optional[Dict[str, Any]] = None,
         include_images: bool = False,
+        treatment: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Request one non-streaming, schema-constrained Ollama completion.
@@ -917,7 +1122,9 @@ class AIDirector:
         prompt_chunk = dict(chunk)
         prompt_chunk["keyframes"] = selected_frames
         active_schema = schema or DECISION_SCHEMA
-        prompt = self.build_prompt(prompt_chunk, source_name, active_schema)
+        prompt = self.build_prompt(
+            prompt_chunk, source_name, active_schema, treatment=treatment
+        )
         return self._request_json(prompt, active_schema, images)
 
     def _request_json(
@@ -1029,6 +1236,7 @@ class AIDirector:
         chunk: Dict[str, Any],
         source_name: str,
         schema: Optional[Dict[str, Any]] = None,
+        treatment: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Build a compact prompt grounded by absolute timestamps and schema.
@@ -1052,10 +1260,14 @@ class AIDirector:
             for index, item in enumerate(chunk["keyframes"], start=1)
         ]
         schema_text = json.dumps(schema or DECISION_SCHEMA, ensure_ascii=False)
+        treatment_text = json.dumps(
+            treatment or {}, ensure_ascii=False, separators=(",", ":")
+        )
         return (
             "Analyze only this source-video window: "
             "{start:.3f}s to {end:.3f}s.\n"
-            "Select coherent ranges worth keeping as documentary candidates. Use "
+            "Follow the DIRECTOR TREATMENT below. Select only concise, coherent "
+            "ranges that actively serve its theme and beats. Use "
             "absolute seconds in this source, not time relative to the chunk. "
             "Inspect every attached image in the listed IMAGE order. Prefer complete "
             "sentences, expressive visuals, stable/focused shots, meaningful B-roll, "
@@ -1066,24 +1278,344 @@ class AIDirector:
             "refer to optional user-exported Resolve presets and should be 'none' unless "
             "the look is clearly justified. Strong audio cleanup is for visibly/noisily "
             "problematic speech; transitions should serve the story, not decorate it. "
-            "Every range must remain inside this window and cut_out_sec must be "
-            "greater than cut_in_sec. An empty decisions array is allowed.\n"
+            "Every range must remain inside this window, cut_out_sec must be "
+            "greater than cut_in_sec, and each candidate must be no longer than "
+            "15 seconds. Do not keep an entire setup conversation. An empty "
+            "decisions array is preferred when this source adds no new story value.\n"
+            "Source order in the shoot: {source_order}. Preserve production chronology.\n"
             "Source/proxy media: {source}\n"
+            "DIRECTOR TREATMENT: {treatment}\n"
             "Required JSON schema: {schema}\n\n"
             "TRANSCRIPT:\n{transcript}\n\nKEYFRAMES:\n{keyframes}"
         ).format(
             start=float(chunk["start_sec"]),
             end=float(chunk["end_sec"]),
             source=source_name,
+            source_order=int(chunk.get("source_order", 0)),
+            treatment=treatment_text,
             schema=schema_text,
             transcript="\n".join(transcript_lines) or "(none)",
             keyframes="\n".join(keyframe_lines) or "(none)",
         )
 
+    def request_treatment(
+        self, assets: Sequence[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Create one project-wide director treatment before selecting shots.
+        在选择镜头前生成一份覆盖全项目的导演阐述。
+
+        Parameters / 参数:
+            assets: Validated source assets in their real shooting order.
+                按真实拍摄顺序排列的已校验素材。
+        """
+        total_duration = sum(float(item.get("duration_sec", 0)) for item in assets)
+        automatic_target = min(180.0, max(45.0, total_duration * 0.12))
+        requested_target = self.target_duration_sec or automatic_target
+        self._active_target_duration_sec = round(requested_target, 1)
+        compact_assets: List[Dict[str, Any]] = []
+        for source_order, asset in enumerate(assets):
+            transcript = " ".join(
+                "[{:.1f}-{:.1f}] {}".format(
+                    float(segment.get("start_sec", 0)),
+                    float(segment.get("end_sec", 0)),
+                    " ".join(str(segment.get("text", "")).split()),
+                )
+                for segment in asset.get("transcript", [])
+                if isinstance(segment, dict)
+            )
+            compact_assets.append(
+                {
+                    "source_order": source_order,
+                    "asset_id": asset.get("asset_id", ""),
+                    "file": Path(str(asset.get("source_video") or "")).name,
+                    "duration_sec": round(float(asset.get("duration_sec", 0)), 2),
+                    "transcript": transcript[:5000],
+                    "keyframe_count": len(asset.get("keyframes", [])),
+                }
+            )
+        brief = self.creative_brief or (
+            "Discover the strongest truthful theme in the footage. Make a concise "
+            "director-led short with a clear setup, development, payoff, and ending."
+        )
+        prompt = (
+            "Create the director treatment before any shot selection. The sources "
+            "are listed in real shooting order. Default to strict chronology; use a "
+            "very short teaser only if it materially improves comprehension. Do not "
+            "make a chronological dump: identify one central theme, reject setup "
+            "chatter that does not serve it, and design a complete emotional arc. "
+            "Choose 4-8 story_anchors from the supplied exact asset_id and absolute "
+            "timestamps. Anchors must cover at least three beats and at least three "
+            "different sources when the footage supports it; each anchor must be "
+            "1.5-15 seconds and cannot cross an asset duration. Include a complete "
+            "ending action rather than a one-word tail. "
+            "Use the exact requested target duration (within one second). The camera "
+            "profile is technical input metadata, not a creative look. Return JSON only.\n"
+            f"USER CREATIVE BRIEF: {brief}\n"
+            f"REQUESTED TARGET DURATION: {self._active_target_duration_sec:.1f} seconds\n"
+            f"CAMERA PROFILE: {self.camera_profile}\n"
+            f"AVAILABLE LOCAL MUSIC: {json.dumps([p.name for p in self._music_files], ensure_ascii=False)}\n"
+            f"SCHEMA: {json.dumps(TREATMENT_SCHEMA, ensure_ascii=False)}\n"
+            f"SOURCES: {json.dumps(compact_assets, ensure_ascii=False)}"
+        )
+        self.logger.info(
+            "正在生成导演阐述与叙事弧线 / Creating director treatment and story arc"
+        )
+        return self._request_json(prompt, TREATMENT_SCHEMA)
+
+    def validate_treatment(
+        self, payload: Dict[str, Any], assets: Sequence[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Validate treatment text and enforce the locally requested runtime.
+        校验导演阐述，并强制采用本地请求的成片时长。
+        """
+        if not isinstance(payload, dict):
+            raise DirectorError("导演阐述必须是对象 / Treatment must be an object.")
+        required_text = (
+            "title", "logline", "central_theme", "opening_beat",
+            "development_beat", "payoff_beat", "ending_beat",
+            "color_intent", "music_mood", "music_energy_arc",
+        )
+        treatment: Dict[str, Any] = {}
+        for key in required_text:
+            value = " ".join(str(payload.get(key) or "").split())
+            if not value:
+                raise DirectorError(
+                    f"导演阐述缺少 {key} / Treatment is missing {key}."
+                )
+            treatment[key] = value
+        policy = str(payload.get("chronology_policy") or "").casefold()
+        if policy not in {"strict_chronological", "teaser_then_chronological"}:
+            policy = "strict_chronological"
+        # The default product promise is a time-flow edit. A non-linear teaser is
+        # accepted only when the user explicitly asks for one in the creative brief.
+        if "teaser" not in self.creative_brief.casefold() and "预告" not in self.creative_brief:
+            policy = "strict_chronological"
+        treatment["chronology_policy"] = policy
+        treatment["target_duration_sec"] = self._active_target_duration_sec
+        look = str(payload.get("creative_look") or "clean_neutral").casefold()
+        look = look if look in {
+            "clean_neutral", "cinematic_warm", "cool_steel", "high_contrast"
+        } else "clean_neutral"
+        color_language = treatment["color_intent"].casefold()
+        if any(token in color_language for token in ("gold", "golden", "warm", "金色", "暖")):
+            look = "cinematic_warm"
+        elif any(token in color_language for token in ("steel", "cool", "冷", "钢")):
+            look = "cool_steel"
+        elif any(token in color_language for token in ("high contrast", "高对比")):
+            look = "high_contrast"
+        treatment["creative_look"] = look
+        rules = payload.get("editorial_rules")
+        treatment["editorial_rules"] = [
+            " ".join(str(value).split()) for value in (rules if isinstance(rules, list) else [])
+            if str(value).strip()
+        ][:8] or [
+            "Every selected shot must serve the central theme.",
+            "Preserve real production chronology and finish on the payoff.",
+        ]
+        treatment["source_count"] = len(assets)
+        by_id = {str(asset.get("asset_id")): asset for asset in assets}
+        anchors: List[Dict[str, Any]] = []
+        raw_anchors = payload.get("story_anchors")
+        for raw_anchor in raw_anchors if isinstance(raw_anchors, list) else []:
+            if not isinstance(raw_anchor, dict):
+                continue
+            asset_id = str(raw_anchor.get("asset_id") or "").strip()
+            asset = by_id.get(asset_id)
+            if asset is None:
+                continue
+            try:
+                cut_in = self._finite_float(raw_anchor.get("cut_in_sec"), "story_anchor.in")
+                cut_out = self._finite_float(raw_anchor.get("cut_out_sec"), "story_anchor.out")
+            except DirectorError:
+                continue
+            duration = float(asset.get("duration_sec", 0))
+            cut_in = max(0.0, min(duration, cut_in))
+            cut_out = max(cut_in, min(duration, cut_out, cut_in + 15.0))
+            beat = str(raw_anchor.get("beat") or "").casefold()
+            reason = " ".join(str(raw_anchor.get("reason") or "").split())
+            if cut_out - cut_in < 1.5 or beat not in {
+                "opening", "development", "payoff", "ending"
+            } or not reason:
+                continue
+            anchors.append({
+                "asset_id": asset_id,
+                "cut_in_sec": round(cut_in, 3),
+                "cut_out_sec": round(cut_out, 3),
+                "beat": beat,
+                "reason": reason,
+            })
+        if len(anchors) < 3:
+            anchors = self._fallback_story_anchors(assets)
+            self.logger.warning(
+                "AI 导演锚点不足，已按台词时间流补足 / Treatment anchors were incomplete; added chronological transcript anchors"
+            )
+        if anchors:
+            source_order_by_id = {
+                str(asset.get("asset_id")): source_order
+                for source_order, asset in enumerate(assets)
+            }
+            latest_index = max(
+                range(len(anchors)),
+                key=lambda index: (
+                    source_order_by_id.get(str(anchors[index]["asset_id"]), -1),
+                    float(anchors[index]["cut_in_sec"]),
+                ),
+            )
+            for index, anchor in enumerate(anchors):
+                if anchor["beat"] == "ending" and index != latest_index:
+                    anchor["beat"] = "development"
+            anchors[latest_index]["beat"] = "ending"
+            latest_asset = by_id[str(anchors[latest_index]["asset_id"])]
+            latest_duration = float(latest_asset.get("duration_sec", 0))
+            latest_anchor = anchors[latest_index]
+            if float(latest_anchor["cut_out_sec"]) - float(latest_anchor["cut_in_sec"]) < 5.0:
+                expanded_out = min(
+                    latest_duration, float(latest_anchor["cut_in_sec"]) + 5.0
+                )
+                expanded_in = max(0.0, expanded_out - 5.0)
+                latest_anchor["cut_in_sec"] = round(expanded_in, 3)
+                latest_anchor["cut_out_sec"] = round(expanded_out, 3)
+        treatment["story_anchors"] = anchors[:12]
+        return treatment
+
+    def _fallback_story_anchors(
+        self, assets: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Build safe chronological anchors when model anchors are invalid. / 模型锚点无效时构建安全时间流锚点。"""
+        usable = [
+            asset for asset in assets
+            if isinstance(asset.get("transcript"), list) and asset.get("transcript")
+        ]
+        if not usable:
+            return []
+        positions = sorted({0, len(usable) // 3, (2 * len(usable)) // 3, len(usable) - 1})
+        beats = ("opening", "development", "payoff", "ending")
+        anchors: List[Dict[str, Any]] = []
+        for beat, position in zip(beats, positions):
+            asset = usable[position]
+            segments = [item for item in asset.get("transcript", []) if isinstance(item, dict)]
+            start = max(0.0, float(segments[0].get("start_sec", 0)))
+            end = min(float(asset.get("duration_sec", 0)), start + 8.0)
+            if end - start >= 1.5:
+                anchors.append({
+                    "asset_id": str(asset.get("asset_id") or ""),
+                    "cut_in_sec": round(start, 3),
+                    "cut_out_sec": round(end, 3),
+                    "beat": beat,
+                    "reason": f"Chronological {beat} fallback grounded in source transcript.",
+                })
+        return anchors
+
+    def candidates_from_treatment(
+        self,
+        treatment: Dict[str, Any],
+        assets: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Convert global treatment anchors into protected edit candidates. / 将全局导演锚点转换为受保护候选。"""
+        by_id = {
+            str(asset.get("asset_id")): (source_order, asset)
+            for source_order, asset in enumerate(assets)
+        }
+        role_map = {
+            "opening": "opening", "development": "context",
+            "payoff": "climax", "ending": "closing",
+        }
+        candidates: List[Dict[str, Any]] = []
+        for anchor in treatment.get("story_anchors", []):
+            match = by_id.get(str(anchor.get("asset_id") or ""))
+            if match is None:
+                continue
+            source_order, asset = match
+            beat = str(anchor.get("beat") or "development")
+            source = str(asset.get("proxy_file_name") or asset.get("source_video") or "")
+            candidates.append({
+                "file_name": source,
+                "asset_id": str(asset.get("asset_id") or ""),
+                "source_order": source_order,
+                "cut_in_sec": float(anchor["cut_in_sec"]),
+                "cut_out_sec": float(anchor["cut_out_sec"]),
+                "reason_for_cut": str(anchor.get("reason") or "Treatment anchor"),
+                "visual_summary": str(anchor.get("reason") or "Treatment anchor"),
+                "story_role": role_map.get(beat, "context"),
+                "confidence": 0.78,
+                "quality_score": 0.78,
+                "transition_to_next": "cut",
+                "transition_duration_sec": 0.0,
+                "audio_cleanup": "light",
+                "color_look": "neutral",
+                "motion": "static",
+                "volume_db": 0.0,
+                "drx_preset": "none",
+                "stabilization": "none",
+                "tracking": "none",
+                "smart_reframe": False,
+                "protected_story_anchor": True,
+                "treatment_beat": beat,
+            })
+        return candidates
+
+    def discover_music_files(self) -> List[Path]:
+        """List supported local, user-owned music files. / 列出支持的本地用户配乐文件。"""
+        if self.music_folder is None:
+            return []
+        allowed = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"}
+        return sorted(
+            (path.resolve() for path in self.music_folder.rglob("*")
+             if path.is_file() and path.suffix.casefold() in allowed),
+            key=lambda path: str(path).casefold(),
+        )[:200]
+
+    def build_color_pipeline(self, treatment: Dict[str, Any]) -> Dict[str, Any]:
+        """Build technical input transform plus creative intent. / 构建技术输入变换与创意色彩意图。"""
+        if self.camera_profile == "rec709":
+            return {
+                "camera_profile": "rec709",
+                "enabled": False,
+                "creative_look": treatment.get("creative_look", "clean_neutral"),
+            }
+        return {
+            "camera_profile": "sony_pp8_slog3_sgamut3cine",
+            "enabled": True,
+            "input_color_space": "Sony S-Gamut3.Cine",
+            "input_gamma": "S-Log3",
+            "timeline_color_space": "DaVinci WG",
+            "timeline_gamma": "DaVinci Intermediate",
+            "output_color_space": "Rec.709",
+            "output_gamma": "Gamma 2.4",
+            "creative_look": treatment.get("creative_look", "clean_neutral"),
+            "color_intent": treatment.get("color_intent", ""),
+        }
+
+    def validate_music_plan(self, payload: Any) -> Dict[str, Any]:
+        """Resolve a model-selected track only within the supplied library. / 仅在用户配乐库中解析模型选择。"""
+        value = payload if isinstance(payload, dict) else {}
+        requested = str(value.get("track_file") or "").strip()
+        selected = next(
+            (path for path in self._music_files
+             if requested.casefold() in {path.name.casefold(), str(path).casefold()}),
+            None,
+        )
+        if requested and selected is None:
+            self.logger.warning(
+                "AI 选择了配乐库之外的文件 %r，已安全忽略 / Ignoring music outside the supplied library",
+                requested,
+            )
+        return {
+            "file_name": str(selected) if selected else "",
+            "reason": " ".join(str(value.get("reason") or "").split()),
+            "target_level_db": round(min(-6.0, max(-36.0, float(value.get("target_level_db", -20)))), 1),
+            "fade_in_sec": round(min(10.0, max(0.0, float(value.get("fade_in_sec", 2)))), 2),
+            "fade_out_sec": round(min(10.0, max(0.0, float(value.get("fade_out_sec", 3)))), 2),
+            "duck_dialogue": value.get("duck_dialogue", True) is True,
+        }
+
     def request_sequence(
         self,
         candidates: Sequence[Dict[str, Any]],
         assets: Sequence[Dict[str, Any]],
+        treatment: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Ask the model to choose and order candidates across every source.
@@ -1095,6 +1627,7 @@ class AIDirector:
                 {
                     "candidate_id": item["candidate_id"],
                     "asset_id": item.get("asset_id", ""),
+                    "source_order": item.get("source_order", 0),
                     "source": Path(str(item["file_name"])).name,
                     "in": item["cut_in_sec"],
                     "out": item["cut_out_sec"],
@@ -1116,24 +1649,36 @@ class AIDirector:
             )
         asset_names = [
             {
+                "source_order": source_order,
                 "asset_id": asset.get("asset_id", ""),
                 "file": Path(str(asset.get("source_video") or "")).name,
                 "duration_sec": asset.get("duration_sec", 0),
             }
-            for asset in assets
+            for source_order, asset in enumerate(assets)
         ]
+        treatment = treatment or self._active_treatment
+        music_choices = [path.name for path in self._music_files]
         prompt = (
             "You have already inspected representative frames and transcripts "
             "from every source video. Build one coherent documentary edit from "
             "the candidate list below. Select only useful candidate_id values, "
-            "never invent or duplicate an id, and order them for narrative flow "
-            "rather than source-file order. Establish context, develop the story, "
+            "never invent or duplicate an id. Follow the treatment. Preserve the "
+            "real source_order and in-file timestamp chronology; narrative quality "
+            "must come from selection and juxtaposition, not scrambling the shoot. "
+            "Establish context, develop the story, "
             "use B-roll to cover or bridge speech, avoid repetitive points, and "
             "finish deliberately. Preserve complete thoughts. Choose restrained "
             "transitions and effects from the schema; default to hard cuts, use "
             "cross dissolves for genuine time/mood changes, and fade_black only "
-            "for major chapter endings. Return JSON only.\n"
+            "for major chapter endings. Keep the sum of selected clip durations "
+            f"between {self._active_target_duration_sec * 0.85:.1f} and "
+            f"{self._active_target_duration_sec * 1.10:.1f} seconds. Select only "
+            "the strongest minority of candidates; never include everything. For "
+            "music_plan.track_file choose exactly one AVAILABLE MUSIC filename or "
+            "an empty string when no music is supplied. Return JSON only.\n"
             f"Required JSON schema: {json.dumps(SEQUENCE_SCHEMA, ensure_ascii=False)}\n"
+            f"DIRECTOR TREATMENT:\n{json.dumps(treatment, ensure_ascii=False)}\n"
+            f"AVAILABLE MUSIC:\n{json.dumps(music_choices, ensure_ascii=False)}\n"
             f"ASSETS:\n{json.dumps(asset_names, ensure_ascii=False)}\n"
             f"CANDIDATES:\n{json.dumps(compact_candidates, ensure_ascii=False)}"
         )
@@ -1148,6 +1693,7 @@ class AIDirector:
         self,
         payload: Dict[str, Any],
         candidates: Sequence[Dict[str, Any]],
+        treatment: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Validate global ordering and apply only constrained effect overrides.
@@ -1247,7 +1793,196 @@ class AIDirector:
                 smart_reframe if isinstance(smart_reframe, bool) else False
             )
             final.append(clip)
-        return final
+        # The executor receives a real time-flow edit. Model ordering is advisory;
+        # local validation prevents a visually plausible response from jumping from
+        # the last take back to early setup footage.
+        active_treatment = treatment or self._active_treatment
+        global_look = {
+            "clean_neutral": "neutral",
+            "cinematic_warm": "warm",
+            "cool_steel": "cool",
+            "high_contrast": "contrast",
+        }.get(str(active_treatment.get("creative_look") or ""), "neutral")
+        final.sort(
+            key=lambda item: (
+                int(item.get("source_order", 0)),
+                float(item.get("cut_in_sec", 0)),
+                float(item.get("cut_out_sec", 0)),
+            )
+        )
+        final = self._complete_story_coverage(final, candidates, active_treatment)
+        final = self._remove_overlaps(final)
+        for clip in final:
+            if str(clip.get("color_look") or "neutral") in {"source", "neutral"}:
+                clip["color_look"] = global_look
+        return self._fit_target_duration(final, active_treatment)
+
+    def _remove_overlaps(
+        self, clips: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Remove repeated source frames while retaining chronological tails. / 删除重复源画面并保留后续时间段。"""
+        cleaned: List[Dict[str, Any]] = []
+        last_out_by_file: Dict[str, float] = {}
+        for raw_clip in clips:
+            clip = dict(raw_clip)
+            file_key = str(clip.get("file_name") or "").casefold()
+            cut_in = float(clip["cut_in_sec"])
+            cut_out = float(clip["cut_out_sec"])
+            previous_out = last_out_by_file.get(file_key, -1.0)
+            if cut_in < previous_out:
+                cut_in = previous_out
+            if cut_out - cut_in < 1.5:
+                continue
+            clip["cut_in_sec"] = round(cut_in, 3)
+            cleaned.append(clip)
+            last_out_by_file[file_key] = cut_out
+        return cleaned
+
+    def _complete_story_coverage(
+        self,
+        selected: Sequence[Dict[str, Any]],
+        candidates: Sequence[Dict[str, Any]],
+        treatment: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Fill missing treatment beats and minimum runtime from inspected candidates.
+        从已审片候选中补齐缺失叙事节拍与最低时长。
+        """
+        result = [dict(item) for item in selected]
+        used = {str(item.get("candidate_id") or "") for item in result}
+        target = float(treatment.get("target_duration_sec") or 90.0)
+        minimum = target * 0.85
+
+        def duration(item: Dict[str, Any]) -> float:
+            return float(item["cut_out_sec"]) - float(item["cut_in_sec"])
+
+        available_sources = {
+            int(item.get("source_order", 0)) for item in candidates
+        }
+        selected_sources = {
+            int(item.get("source_order", 0)) for item in result
+        }
+        missing_sources = sorted(available_sources - selected_sources)
+        for source_order in missing_sources:
+            options = [
+                item for item in candidates
+                if int(item.get("source_order", 0)) == source_order
+                and str(item.get("candidate_id") or "") not in used
+            ]
+            if not options:
+                continue
+            choice = max(
+                options,
+                key=lambda item: (
+                    bool(item.get("protected_story_anchor")),
+                    float(item.get("quality_score", 0.5))
+                    + float(item.get("confidence", 0.5)),
+                ),
+            )
+            result.append(dict(choice))
+            used.add(str(choice.get("candidate_id") or ""))
+
+        ranked = sorted(
+            (
+                item for item in candidates
+                if str(item.get("candidate_id") or "") not in used
+            ),
+            key=lambda item: (
+                bool(item.get("protected_story_anchor")),
+                float(item.get("quality_score", 0.5))
+                + float(item.get("confidence", 0.5)),
+            ),
+            reverse=True,
+        )
+        while sum(duration(item) for item in result) < minimum and ranked:
+            choice = ranked.pop(0)
+            result.append(dict(choice))
+            used.add(str(choice.get("candidate_id") or ""))
+        result.sort(
+            key=lambda item: (
+                int(item.get("source_order", 0)),
+                float(item.get("cut_in_sec", 0)),
+            )
+        )
+        return result
+
+    def _fit_target_duration(
+        self,
+        clips: Sequence[Dict[str, Any]],
+        treatment: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Enforce a concise runtime while preserving opening and final payoff.
+        强制控制成片时长，同时保留开场与最终高潮。
+        """
+        copied = [dict(item) for item in clips]
+        if not copied:
+            return []
+        target = float(
+            treatment.get("target_duration_sec")
+            or self._active_target_duration_sec
+            or self.target_duration_sec
+            or 90.0
+        )
+        budget = max(30.0, target * 1.10)
+
+        def duration(item: Dict[str, Any]) -> float:
+            return float(item["cut_out_sec"]) - float(item["cut_in_sec"])
+
+        if sum(duration(item) for item in copied) <= budget:
+            return copied
+
+        role_bonus = {
+            "opening": 0.25, "climax": 0.35, "closing": 0.40,
+            "bridge": 0.05, "context": 0.0, "interview": 0.05, "broll": 0.05,
+        }
+        payoff_index = max(
+            range(len(copied)),
+            key=lambda index: (
+                role_bonus.get(str(copied[index].get("story_role")), 0.0),
+                int(copied[index].get("source_order", 0)),
+                float(copied[index].get("cut_in_sec", 0)),
+            ),
+        )
+        protected_indices = []
+        protected_beats = set()
+        for index, item in enumerate(copied):
+            beat = str(item.get("treatment_beat") or "")
+            if item.get("protected_story_anchor") and beat not in protected_beats:
+                protected_indices.append(index)
+                protected_beats.add(beat)
+        keep_indices = {0, len(copied) - 1, payoff_index, *protected_indices}
+        used = sum(duration(copied[index]) for index in keep_indices)
+        ranked = sorted(
+            (index for index in range(len(copied)) if index not in keep_indices),
+            key=lambda index: (
+                float(copied[index].get("quality_score", 0.5))
+                + float(copied[index].get("confidence", 0.5))
+                + role_bonus.get(str(copied[index].get("story_role")), 0.0)
+                + (0.5 if copied[index].get("protected_story_anchor") else 0.0)
+            ),
+            reverse=True,
+        )
+        for index in ranked:
+            clip_duration = duration(copied[index])
+            if used + clip_duration <= budget:
+                keep_indices.add(index)
+                used += clip_duration
+        selected = [item for index, item in enumerate(copied) if index in keep_indices]
+        if len(selected) < 3 and len(copied) >= 3:
+            middle = len(copied) // 2
+            selected.append(copied[middle])
+        selected.sort(
+            key=lambda item: (
+                int(item.get("source_order", 0)),
+                float(item.get("cut_in_sec", 0)),
+            )
+        )
+        self.logger.info(
+            "时长守门：%d 个模型片段压缩为 %d 个，目标 %.1fs / Runtime guard: %d clips -> %d, target %.1fs",
+            len(copied), len(selected), target, len(copied), len(selected), target,
+        )
+        return selected
 
     def _encode_images(
         self, frames: Sequence[Dict[str, Any]]
@@ -1379,6 +2114,12 @@ class AIDirector:
                 )
             cut_in = max(chunk_start, cut_in)
             cut_out = min(chunk_end, cut_out)
+            if cut_out - cut_in > 15.0:
+                self.logger.warning(
+                    "候选片段超过 15 秒，已截短：%.3f-%.3f / Candidate exceeded 15s and was shortened",
+                    cut_in, cut_out,
+                )
+                cut_out = cut_in + 15.0
             if cut_in < 0 or cut_out - cut_in < 0.2:
                 raise DirectorError(
                     f"decisions[{index}] 时间范围过短或无效 / range is invalid."
@@ -1507,6 +2248,7 @@ class AIDirector:
         ordered = sorted(
             (dict(item) for item in decisions),
             key=lambda item: (
+                int(item.get("source_order", 0)),
                 str(item["file_name"]).casefold(),
                 float(item["cut_in_sec"]),
                 float(item["cut_out_sec"]),
@@ -1525,6 +2267,13 @@ class AIDirector:
             touches = (
                 float(current["cut_in_sec"])
                 <= float(previous["cut_out_sec"]) + self.merge_gap_sec
+                and max(
+                    float(previous["cut_out_sec"]),
+                    float(current["cut_out_sec"]),
+                ) - min(
+                    float(previous["cut_in_sec"]),
+                    float(current["cut_in_sec"]),
+                ) <= 15.0
             )
             if same_media and touches:
                 previous["cut_out_sec"] = round(
@@ -1548,6 +2297,12 @@ class AIDirector:
                     ),
                     3,
                 )
+                previous["protected_story_anchor"] = bool(
+                    previous.get("protected_story_anchor")
+                    or current.get("protected_story_anchor")
+                )
+                if current.get("protected_story_anchor"):
+                    previous["treatment_beat"] = current.get("treatment_beat", "")
             else:
                 merged.append(current)
         return merged
@@ -1665,6 +2420,10 @@ class AIDirector:
             "chunk_duration_sec": self.chunk_duration_sec,
             "num_ctx": self.num_ctx,
             "prompt_version": DIRECTOR_PROMPT_VERSION,
+            "creative_brief": self.creative_brief,
+            "target_duration_sec": self.target_duration_sec,
+            "camera_profile": self.camera_profile,
+            "music_folder": str(self.music_folder or ""),
         }
         digest.update(
             json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -1763,6 +2522,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--merge-gap", type=float, default=0.4)
     parser.add_argument(
+        "--creative-brief",
+        default="",
+        help="创作意图/主题要求 / creative theme or directing brief",
+    )
+    parser.add_argument(
+        "--target-duration-sec",
+        type=float,
+        default=0.0,
+        help="目标成片秒数，0=自动 / target runtime in seconds; 0=automatic",
+    )
+    parser.add_argument(
+        "--camera-profile",
+        default="sony_pp8_slog3_sgamut3cine",
+        choices=("sony_pp8_slog3_sgamut3cine", "rec709", "auto"),
+    )
+    parser.add_argument("--music-folder")
+    parser.add_argument(
+        "--revalidate-existing",
+        action="store_true",
+        help="不调用 Ollama，仅重新应用本地守门 / reapply local gates without Ollama",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -1783,9 +2564,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             num_ctx=args.num_ctx,
             timeout_sec=args.timeout,
             merge_gap_sec=args.merge_gap,
+            creative_brief=args.creative_brief,
+            target_duration_sec=args.target_duration_sec,
+            camera_profile=args.camera_profile,
+            music_folder=args.music_folder,
             logger=logger,
         )
-        director.run(args.raw_data, args.output, args.proxy_file_name)
+        if args.revalidate_existing:
+            director.revalidate_existing_plan(args.raw_data, args.output)
+        else:
+            director.run(args.raw_data, args.output, args.proxy_file_name)
         return 0
     except DirectorError as exc:
         logger.error("%s", exc)
