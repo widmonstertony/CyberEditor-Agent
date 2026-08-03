@@ -439,10 +439,71 @@ class DaVinciExecutor:
             )
         project = manager.GetCurrentProject()
         if project is not None:
+            current_name = self._safe_name(project, "unnamed")
+            normalized_name = current_name.strip().casefold()
+            try:
+                current_page = self.resolve.GetCurrentPage()
+            except Exception:
+                current_page = None
+            is_transient_untitled = (
+                normalized_name
+                in {
+                    "untitled",
+                    "untitled project",
+                    "未命名项目",
+                    "未命名工程",
+                }
+                and current_page is None
+                and self._safe_int_call(project, "GetTimelineCount") == 0
+            )
+            if is_transient_untitled:
+                self.logger.info(
+                    "检测到未进入编辑页面的临时空工程“%s”；将创建/加载“%s” / "
+                    "Detected transient untitled project; creating/loading '%s'",
+                    current_name,
+                    self.project_name,
+                    self.project_name,
+                )
+                project_names = self._project_names(manager)
+                matching_name = next(
+                    (
+                        name
+                        for name in project_names
+                        if name.casefold() == self.project_name.casefold()
+                    ),
+                    None,
+                )
+                try:
+                    if matching_name is not None:
+                        project = manager.LoadProject(matching_name)
+                    else:
+                        project = manager.CreateProject(
+                            self._unique_name(self.project_name, project_names)
+                        )
+                        self.created_project = project is not None
+                except Exception as exc:
+                    raise ResolveExecutorError(
+                        "临时 Untitled Project 无法进入编辑页面，且创建指定工程失败。"
+                        f" / Could not replace transient project: {exc}"
+                    ) from exc
+                if project is None:
+                    raise ResolveExecutorError(
+                        "无法创建/加载可编辑工程。请在 Resolve Project Manager 中手动"
+                        f"创建“{self.project_name}”后重试。 / Could not create or load "
+                        "an editable project."
+                    )
+                self.logger.info(
+                    "已%s工程“%s” / %s project '%s'",
+                    "创建" if self.created_project else "加载",
+                    self._safe_name(project, self.project_name),
+                    "Created" if self.created_project else "Loaded",
+                    self._safe_name(project, self.project_name),
+                )
+                return manager, project
             self.logger.info(
                 "使用当前工程“%s” / Using current project '%s'",
-                self._safe_name(project, "unnamed"),
-                self._safe_name(project, "unnamed"),
+                current_name,
+                current_name,
             )
             return manager, project
 
@@ -472,7 +533,10 @@ class DaVinciExecutor:
                 "新工程不支持 SetSetting；保留默认 FPS / New project exposes no SetSetting; keeping default FPS"
             )
             return
-        fps_text = self._decimal_text(fps)
+        # FFprobe commonly reports exact NTSC rationals (59.94006), while
+        # Resolve accepts their conventional decimal setting (59.94).
+        # FFprobe 常返回精确 NTSC 小数，Resolve 工程设置使用常规三位小数。
+        fps_text = self._decimal_text(fps.quantize(Decimal("0.001")))
         try:
             changed = setter("timelineFrameRate", fps_text)
         except Exception as exc:
@@ -527,10 +591,36 @@ class DaVinciExecutor:
             raise ResolveExecutorError(
                 f"创建时间线失败 / Timeline creation failed: {exc}"
             ) from exc
-        if timeline is None or not self.project.SetCurrentTimeline(timeline):
+        if timeline is None:
+            # Some Resolve states reject CreateEmptyTimeline but accept the
+            # documented CreateTimelineFromClips overload with an empty list.
+            fallback = getattr(self.media_pool, "CreateTimelineFromClips", None)
+            if callable(fallback):
+                try:
+                    timeline = fallback(self.timeline_name, [])
+                except Exception:
+                    timeline = None
+        if timeline is None:
             raise ResolveExecutorError(
                 f"无法创建/激活时间线 / Cannot create/activate timeline: {self.timeline_name}"
             )
+        try:
+            activated = self.project.SetCurrentTimeline(timeline)
+        except Exception:
+            activated = False
+        if not activated:
+            try:
+                current = self.project.GetCurrentTimeline()
+            except Exception:
+                current = None
+            if (
+                current is None
+                or self._safe_name(current, "")
+                != self._safe_name(timeline, self.timeline_name)
+            ):
+                raise ResolveExecutorError(
+                    f"时间线已创建但无法激活 / Timeline created but cannot be activated: {self.timeline_name}"
+                )
         self.logger.info(
             "已创建时间线“%s” / Created timeline '%s'",
             self.timeline_name,
@@ -573,7 +663,10 @@ class DaVinciExecutor:
         Warn or fail when JSON and Resolve FPS differ.
         JSON 与 Resolve FPS 不一致时警告或失败。
         """
-        if json_fps == resolve_fps:
+        # Treat exact NTSC rational values from ffprobe as equal to Resolve's
+        # rounded UI values (e.g. 59.94006 and 59.94).
+        # 将 ffprobe 的精确 NTSC 值与 Resolve UI 的舍入值视为同一帧率。
+        if abs(json_fps - resolve_fps) <= Decimal("0.001"):
             return
         message = (
             f"FPS 不一致：JSON={self._decimal_text(json_fps)}，"

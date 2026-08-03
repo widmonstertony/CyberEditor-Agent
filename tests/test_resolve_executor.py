@@ -8,7 +8,12 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from src.resolve_executor import ClipDecision, DaVinciExecutor, Decimal
+from src.resolve_executor import (
+    ClipDecision,
+    DaVinciExecutor,
+    Decimal,
+    ResolveExecutorError,
+)
 
 
 class FakeItem:
@@ -148,6 +153,82 @@ class ResolveExecutorTests(unittest.TestCase):
 
         executor = DaVinciExecutor("timeline_cuts.json")
         self.assertEqual(executor._media_fps(NativeFpsItem()), Decimal("50"))
+
+    def test_transient_untitled_project_is_replaced_with_named_project(self):
+        transient = FakeProject()
+        transient.name = "Untitled Project"
+
+        class Manager:
+            def __init__(self):
+                self.current = transient
+
+            def GetCurrentProject(self):
+                return self.current
+
+            def GetProjectListInCurrentFolder(self):
+                return []
+
+            def CreateProject(self, name):
+                self.current = FakeProject()
+                self.current.name = name
+                return self.current
+
+        manager = Manager()
+
+        class Resolve:
+            def GetProjectManager(self):
+                return manager
+
+            def GetCurrentPage(self):
+                return None
+
+        executor = DaVinciExecutor(
+            "timeline_cuts.json", project_name="CyberEditor Project"
+        )
+        executor.resolve = Resolve()
+
+        returned_manager, project = executor.ensure_project()
+
+        self.assertIs(returned_manager, manager)
+        self.assertEqual(project.GetName(), "CyberEditor Project")
+        self.assertTrue(executor.created_project)
+
+    def test_ntsc_fps_rounding_is_accepted_in_strict_mode(self):
+        executor = DaVinciExecutor(
+            "timeline_cuts.json", strict_fps=True
+        )
+        executor.compare_fps(Decimal("59.94006"), Decimal("59.94"))
+        with self.assertRaises(ResolveExecutorError):
+            executor.compare_fps(Decimal("60"), Decimal("59.94"))
+
+    def test_new_project_fps_uses_resolve_ntsc_decimal(self):
+        project = FakeProject()
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.project = project
+
+        executor.initialize_new_project_fps(Decimal("59.94006"))
+
+        self.assertEqual(project.fps, "59.94")
+
+    def test_timeline_creation_falls_back_to_documented_overload(self):
+        project = FakeProject()
+
+        class FallbackMediaPool(FakeMediaPool):
+            def CreateEmptyTimeline(self, name):
+                return None
+
+            def CreateTimelineFromClips(self, name, clips):
+                self.project.timeline = FakeTimeline(name, self.project.fps)
+                return self.project.timeline
+
+        project.media_pool = FallbackMediaPool(project)
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.project = project
+        executor.media_pool = project.media_pool
+
+        timeline = executor.ensure_timeline()
+
+        self.assertEqual(timeline.GetName(), "CyberEditor Timeline")
 
     def test_resolve_process_detection_ignores_windows_code_page(self):
         completed = SimpleNamespace(
