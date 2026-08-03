@@ -233,6 +233,20 @@ class AIDirectorTests(unittest.TestCase):
         ]
         self.assertEqual(texts, ["a", "b", "c"])
 
+    def test_treatment_excerpt_samples_start_middle_and_end_within_budget(self):
+        segments = [
+            {"start_sec": index * 10, "end_sec": index * 10 + 5, "text": f"line-{index} " + "x" * 40}
+            for index in range(20)
+        ]
+
+        excerpt, count = AIDirector._compact_transcript_excerpt(segments, 360)
+
+        self.assertEqual(count, 20)
+        self.assertLessEqual(len(excerpt), 361)
+        self.assertIn("line-0", excerpt)
+        self.assertIn("line-19", excerpt)
+        self.assertTrue(any(f"line-{index}" in excerpt for index in range(7, 14)))
+
     def test_merge_overlap_and_reason(self):
         merged = self.make_director().merge_decisions(
             [
@@ -303,6 +317,47 @@ class AIDirectorTests(unittest.TestCase):
         self.assertIn("beat_snap", result[0])
         self.assertEqual(result[1]["cut_out_sec"], 6.0)
         self.assertNotIn("beat_snap", result[1])
+
+    def test_multi_cue_music_plan_is_bounded_to_analyzed_candidates(self):
+        director = self.make_director()
+        director._music_analysis = {
+            "tracks": [
+                {
+                    "file_name": str(Path("authorized.wav").resolve()),
+                    "duration_sec": 30,
+                    "tempo_bpm": 100,
+                    "strong_beats_sec": [1.0, 2.0, 3.0],
+                    "license": "user-confirmed rights",
+                }
+            ]
+        }
+        director._music_files = [Path("authorized.wav").resolve()]
+
+        plan = director.validate_music_plan(
+            {
+                "strategy": "build then breathe",
+                "silence_regions": [],
+                "cues": [
+                    {
+                        "cue_id": "M1",
+                        "track_file": "authorized.wav",
+                        "story_beat": "opening",
+                        "timeline_in_sec": 0,
+                        "timeline_out_sec": 8,
+                        "track_in_sec": 1,
+                        "track_out_sec": 9,
+                        "target_lufs": -24,
+                        "duck_under_dialogue_db": -9,
+                    },
+                    {"cue_id": "bad", "track_file": "invented.wav"},
+                ],
+            },
+            program_duration_sec=10,
+        )
+
+        self.assertEqual(len(plan["cues"]), 1)
+        self.assertEqual(plan["cues"][0]["track_file"], "authorized.wav")
+        self.assertEqual(plan["mode"], "multi_cue_pre_mix")
 
     def test_empty_thinking_response_retries_without_qwen_thinking(self):
         session = EmptyThinkingSession()
@@ -466,7 +521,9 @@ class AIDirectorTests(unittest.TestCase):
             output = director.run(raw_path, output_path)
 
             image_requests = [item for item in session.posts if item.get("images")]
-            self.assertEqual(len(image_requests), 1)
+            # The first multimodal pass sees representative project frames;
+            # the second request inspects the source chunk in detail.
+            self.assertEqual(len(image_requests), 2)
             self.assertEqual(output["schema_version"], "3.0")
             self.assertEqual(
                 output["color_pipeline"]["sources"]["asset-1"]["resolve_input_gamma"],
@@ -481,6 +538,7 @@ class AIDirectorTests(unittest.TestCase):
                 output["clips"][0]["transition_to_next"], "cross_dissolve"
             )
             self.assertEqual(output["clips"][0]["audio_cleanup"], "strong")
+            self.assertTrue(output["clips"][0]["has_dialogue"])
             self.assertTrue(output_path.is_file())
 
 

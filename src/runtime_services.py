@@ -101,12 +101,19 @@ def find_ollama_executables() -> Tuple[Optional[Path], Optional[Path]]:
         cli_candidates.append(root / "ollama.exe")
         app_candidates.append(root / "ollama app.exe")
 
+    def safe_file(path: Path) -> bool:
+        """Ignore inaccessible per-user installs during discovery. / 检测时忽略无权访问的用户安装。"""
+        try:
+            return path.is_file()
+        except OSError:
+            return False
+
     found_cli = next(
-        (path.resolve() for path in _unique_paths(cli_candidates) if path.is_file()),
+        (path.resolve() for path in _unique_paths(cli_candidates) if safe_file(path)),
         None,
     )
     found_app = next(
-        (path.resolve() for path in _unique_paths(app_candidates) if path.is_file()),
+        (path.resolve() for path in _unique_paths(app_candidates) if safe_file(path)),
         None,
     )
     return found_cli, found_app

@@ -375,39 +375,54 @@ class ReviewRenderer:
             current_duration += durations[index] - transition_duration
 
         final_audio = current_audio
-        music_path_text = str(self.music_plan.get("file_name") or "").strip()
+        bed_path_text = str(self.music_plan.get("bed_file") or "").strip()
+        music_path_text = bed_path_text or str(self.music_plan.get("file_name") or "").strip()
         if music_path_text:
             music_path = Path(music_path_text).expanduser().resolve()
             if not music_path.is_file():
                 raise ReviewRenderError(
                     f"找不到导演选择的配乐 / Selected music not found: {music_path}"
                 )
-            command.extend(["-stream_loop", "-1", "-i", str(music_path)])
+            if bed_path_text:
+                command.extend(["-i", str(music_path)])
+            else:
+                command.extend(["-stream_loop", "-1", "-i", str(music_path)])
             music_input = input_index
-            level = max(-36.0, min(-6.0, self._finite(
-                self.music_plan.get("target_level_db", -20.0),
-                "music_plan.target_level_db",
-            )))
-            fade_in = max(0.0, min(10.0, self._finite(
-                self.music_plan.get("fade_in_sec", 2.0),
-                "music_plan.fade_in_sec",
-            )))
-            fade_out = max(0.0, min(10.0, self._finite(
-                self.music_plan.get("fade_out_sec", 3.0),
-                "music_plan.fade_out_sec",
-            )))
-            fade_out_start = max(0.0, current_duration - fade_out)
-            filters.append(
-                f"[{music_input}:a:0]atrim=0:{self._number(current_duration)},"
-                "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,"
-                f"volume={self._number(level)}dB,afade=t=in:st=0:d={self._number(fade_in)},"
-                f"afade=t=out:st={self._number(fade_out_start)}:d={self._number(fade_out)}[musicbed]"
-            )
-            filters.append(
-                f"[{current_audio}][musicbed]amix=inputs=2:duration=first:normalize=0,"
-                "alimiter=limit=0.95[programaudio]"
-            )
-            final_audio = "programaudio"
+            if bed_path_text:
+                filters.append(
+                    f"[{music_input}:a:0]atrim=0:{self._number(current_duration)},"
+                    "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[musicbed]"
+                )
+                filters.append(
+                    f"[{current_audio}][musicbed]amix=inputs=2:duration=first:normalize=0,"
+                    "alimiter=limit=0.95[programaudio]"
+                )
+                final_audio = "programaudio"
+            else:
+                level = max(-36.0, min(-6.0, self._finite(
+                    self.music_plan.get("target_level_db", -20.0),
+                    "music_plan.target_level_db",
+                )))
+                fade_in = max(0.0, min(10.0, self._finite(
+                    self.music_plan.get("fade_in_sec", 2.0),
+                    "music_plan.fade_in_sec",
+                )))
+                fade_out = max(0.0, min(10.0, self._finite(
+                    self.music_plan.get("fade_out_sec", 3.0),
+                    "music_plan.fade_out_sec",
+                )))
+                fade_out_start = max(0.0, current_duration - fade_out)
+                filters.append(
+                    f"[{music_input}:a:0]atrim=0:{self._number(current_duration)},"
+                    "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"volume={self._number(level)}dB,afade=t=in:st=0:d={self._number(fade_in)},"
+                    f"afade=t=out:st={self._number(fade_out_start)}:d={self._number(fade_out)}[musicbed]"
+                )
+                filters.append(
+                    f"[{current_audio}][musicbed]amix=inputs=2:duration=first:normalize=0,"
+                    "alimiter=limit=0.95[programaudio]"
+                )
+                final_audio = "programaudio"
 
         command.extend(
             [

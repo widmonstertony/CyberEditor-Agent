@@ -57,6 +57,29 @@ class ReviewRendererTests(unittest.TestCase):
             self.assertIn("LUT_3D_SIZE 5", text)
             self.assertAlmostEqual(decode_slog3(420 / 1023), 0.18, places=4)
 
+    def test_preconformed_music_bed_is_not_looped_or_reprocessed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = root / "a.mp4"
+            bed = root / "music_bed.wav"
+            media.touch()
+            bed.touch()
+            renderer = ReviewRenderer(root / "plan.json", root / "review.mp4")
+            renderer.music_plan = {"bed_file": str(bed)}
+
+            with mock.patch.object(renderer, "_has_audio", return_value=True):
+                command, graph, _ = renderer.build_command(
+                    "ffmpeg",
+                    "ffprobe",
+                    25.0,
+                    [RenderClip(str(media), 0, 4, "cut", 0, "none")],
+                )
+
+            self.assertNotIn("-stream_loop", command)
+            self.assertIn(str(bed.resolve()), command)
+            self.assertIn("[musicbed]", graph)
+            self.assertNotIn("afade=t=in", graph)
+
 
 if __name__ == "__main__":
     unittest.main()

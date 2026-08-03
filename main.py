@@ -304,24 +304,16 @@ class WorkflowOrchestrator:
                     len(assets),
                 )
 
+            treatment_path = self.data_dir / "director_treatment.json"
+            music_brief = self.data_dir / "music_brief.json"
             music_analysis = self.data_dir / "music_analysis.json"
-            if not args.skip_director and args.music_folder:
-                music_command = [
-                    self.python_executable,
-                    "-m",
-                    "src.music_analyzer",
-                    "--library",
-                    str(args.music_folder),
-                    "--output",
-                    str(music_analysis),
-                    "--query",
-                    str(args.creative_brief or "documentary cinematic"),
-                    "--log-level",
-                    args.log_level,
-                ]
-                self._run_stage("授权配乐搜索与鼓点分析 / Licensed music and beats", music_command)
-                self._require_file(music_analysis, "配乐分析未生成 music_analysis.json")
-                self._release_barrier("Librosa CPU music analysis")
+            music_cache = self.data_dir / "music-candidates"
+            music_bed = self.data_dir / "music" / "music_bed.wav"
+            provider = str(getattr(args, "music_provider", "off") or "off")
+            # Preserve older CLI/UI integrations: supplying a local folder means
+            # local-provider mode even when the new flag is absent.
+            if provider == "off" and getattr(args, "music_folder", None):
+                provider = "local"
 
             if not args.skip_director:
                 try:
@@ -336,6 +328,100 @@ class WorkflowOrchestrator:
                         "已自动启动 Ollama 服务（尚未加载模型）"
                         " / Ollama service auto-started; no model is loaded yet"
                     )
+                preliminary_command = [
+                    self.python_executable,
+                    "-m",
+                    "src.director",
+                    "--raw-data",
+                    str(raw_data),
+                    "--model",
+                    args.ollama_model,
+                    "--text-model",
+                    args.director_model or args.ollama_model,
+                    "--ollama-url",
+                    args.ollama_url,
+                    "--chunk-minutes",
+                    str(args.chunk_minutes),
+                    "--project-fps",
+                    str(args.project_fps),
+                    "--num-ctx",
+                    str(args.num_ctx),
+                    "--target-duration-sec",
+                    str(args.target_duration_sec),
+                    "--camera-profile",
+                    args.camera_profile,
+                    "--timeout",
+                    str(args.ollama_timeout),
+                    "--treatment-only",
+                    "--treatment-output",
+                    str(treatment_path),
+                    "--music-brief-output",
+                    str(music_brief),
+                    "--log-level",
+                    args.log_level,
+                ]
+                if args.creative_brief.strip():
+                    preliminary_command.extend(
+                        ["--creative-brief", args.creative_brief.strip()]
+                    )
+                try:
+                    self._run_stage(
+                        "音乐导演初审 / Music director first pass",
+                        preliminary_command,
+                    )
+                finally:
+                    self._force_ollama_unload(args.ollama_model, args.ollama_url)
+                self._require_file(treatment_path, "导演初审未生成 director_treatment.json")
+                self._require_file(music_brief, "导演初审未生成 music_brief.json")
+                self._release_barrier("Ollama music-director first pass")
+
+                if provider != "off":
+                    music_command = [
+                        self.python_executable,
+                        "-m",
+                        "src.music_analyzer",
+                        "--provider",
+                        provider,
+                        "--cache-dir",
+                        str(music_cache),
+                        "--brief",
+                        str(music_brief),
+                        "--output",
+                        str(music_analysis),
+                        "--query",
+                        str(args.creative_brief or "documentary cinematic"),
+                        "--limit",
+                        str(getattr(args, "music_candidate_limit", 8)),
+                        "--log-level",
+                        args.log_level,
+                    ]
+                    if provider == "local":
+                        if not getattr(args, "music_folder", None):
+                            raise WorkflowError(
+                                "本地配乐模式需要曲库文件夹 / Local music mode requires --music-folder."
+                            )
+                        music_command.extend(["--library", str(args.music_folder)])
+                    elif provider == "jamendo":
+                        music_command.extend([
+                            "--jamendo-client-id",
+                            str(getattr(args, "jamendo_client_id", "") or ""),
+                        ])
+                    elif provider == "yt_dlp":
+                        if bool(getattr(args, "music_rights_confirmed", False)):
+                            music_command.append("--rights-confirmed")
+                        music_command.extend([
+                            "--rights-claim",
+                            str(getattr(args, "music_rights_claim", "") or ""),
+                        ])
+                    self._run_stage(
+                        "联网候选获取与 CPU 音乐听诊 / Music retrieval and CPU analysis",
+                        music_command,
+                    )
+                    self._require_file(
+                        music_analysis, "配乐听诊未生成 music_analysis.json"
+                    )
+                    self._release_barrier("CPU music retrieval and analysis")
+
                 command = [
                     self.python_executable,
                     "-m",
@@ -360,6 +446,8 @@ class WorkflowOrchestrator:
                     str(args.target_duration_sec),
                     "--camera-profile",
                     args.camera_profile,
+                    "--treatment-file",
+                    str(treatment_path),
                     "--timeout",
                     str(args.ollama_timeout),
                     "--log-level",
@@ -367,11 +455,10 @@ class WorkflowOrchestrator:
                 ]
                 if args.creative_brief.strip():
                     command.extend(["--creative-brief", args.creative_brief.strip()])
-                if args.music_folder:
-                    command.extend(["--music-folder", str(args.music_folder)])
+                if provider != "off":
                     command.extend(["--music-analysis", str(music_analysis)])
                 try:
-                    self._run_stage("导演 / Direct", command)
+                    self._run_stage("最终 AI 导演 / Final AI director", command)
                 finally:
                     # Second safety layer: runs even if the director is killed
                     # after loading the model but before its own finally block.
@@ -386,6 +473,25 @@ class WorkflowOrchestrator:
                     timeline_cuts, "导演阶段未生成 timeline_cuts.json"
                 )
                 self._release_barrier("Ollama")
+
+                if provider != "off":
+                    bed_command = [
+                        self.python_executable,
+                        "-m",
+                        "src.music_bed",
+                        "--timeline",
+                        str(timeline_cuts),
+                        "--output",
+                        str(music_bed),
+                        "--log-level",
+                        args.log_level,
+                    ]
+                    self._run_stage(
+                        "音乐床合成与对白 Ducking / Music-bed conform and dialogue ducking",
+                        bed_command,
+                    )
+                    # A valid no-music creative decision intentionally produces no WAV.
+                    self._release_barrier("FFmpeg CPU music-bed conform")
 
             # Programmatic callers created before preview support have no
             # ``skip_preview`` attribute; keep those integrations backward
@@ -774,6 +880,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("sony_pp8_slog3_sgamut3cine", "rec709", "auto"),
     )
     parser.add_argument("--music-folder")
+    parser.add_argument(
+        "--music-provider",
+        choices=("off", "local", "jamendo", "yt_dlp"),
+        default="off",
+        help="配乐来源 / music source provider",
+    )
+    parser.add_argument("--music-candidate-limit", type=int, default=8)
+    parser.add_argument("--jamendo-client-id", default="")
+    parser.add_argument(
+        "--music-rights-confirmed",
+        action="store_true",
+        help="确认任意在线音频的下载、改编和使用权及平台条款 / confirm rights and platform terms",
+    )
+    parser.add_argument("--music-rights-claim", default="")
     parser.add_argument("--ollama-timeout", type=int, default=1800)
     parser.add_argument("--timeline-name", default="CyberEditor Timeline")
     parser.add_argument("--project-name", default="CyberEditor Project")

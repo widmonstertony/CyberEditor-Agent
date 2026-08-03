@@ -544,6 +544,15 @@ class ModernCyberEditorApp:
         self.music_folder_var = tk.StringVar(
             value=str(data.get("music_folder", ""))
         )
+        self.music_provider_key = str(data.get("music_provider", "yt_dlp"))
+        if self.music_provider_key not in {"off", "local", "jamendo", "yt_dlp"}:
+            self.music_provider_key = "yt_dlp"
+        self.music_candidate_limit_var = tk.StringVar(
+            value=str(data.get("music_candidate_limit", 8))
+        )
+        self.jamendo_client_id_var = tk.StringVar(
+            value=str(data.get("jamendo_client_id", ""))
+        )
         self.timeline_var = tk.StringVar(
             value=str(data.get("timeline_name", "CyberEditor Timeline"))
         )
@@ -899,14 +908,60 @@ class ModernCyberEditorApp:
                  if key == current_camera),
             self._on_camera_profile_change, column=1
         )
+        music_provider_values = [
+            self.t("music_provider_online"),
+            self.t("music_provider_local"),
+            self.t("music_provider_jamendo"),
+            self.t("music_provider_off"),
+        ]
+        self._music_provider_display_to_key = dict(zip(
+            music_provider_values,
+            ("yt_dlp", "local", "jamendo", "off"),
+        ))
+        self.music_provider_menu = self._option_field(
+            directing,
+            1,
+            self.t("music_provider"),
+            music_provider_values,
+            next(
+                label for label, key in self._music_provider_display_to_key.items()
+                if key == self.music_provider_key
+            ),
+            self._on_music_provider_change,
+            column=0,
+        )
+        self._entry_field(
+            directing,
+            1,
+            self.t("music_candidate_limit"),
+            self.music_candidate_limit_var,
+            column=1,
+        )
         self._path_field(
             parent, 13, self.t("music_folder"), self.music_folder_var,
             self._choose_music_folder, self.t("select_folder")
         )
+        self._entry_field(
+            parent, 14, self.t("jamendo_client_id"), self.jamendo_client_id_var
+        )
+        self.music_warning_label = ctk.CTkLabel(
+            parent,
+            text=(
+                self.t("music_online_warning")
+                if self.music_provider_key == "yt_dlp"
+                else self.t("music_verified_hint")
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=760,
+            text_color=COLORS["error"],
+            font=ctk.CTkFont(size=10),
+        )
+        self.music_warning_label.grid(row=15, column=0, sticky="ew", pady=(2, 8))
 
-        self._section_title(parent, 14, self.t("resolve_settings"))
+        self._section_title(parent, 16, self.t("resolve_settings"))
         resolve = ctk.CTkFrame(parent, fg_color="transparent")
-        resolve.grid(row=15, column=0, sticky="ew")
+        resolve.grid(row=17, column=0, sticky="ew")
         resolve.grid_columnconfigure((0, 1), weight=1, uniform="resolve")
         self._entry_field(
             resolve, 0, self.t("timeline_name"), self.timeline_var, column=0
@@ -936,7 +991,7 @@ class ModernCyberEditorApp:
             self.macro_profile_var, column=0, columnspan=2
         )
         switches = ctk.CTkFrame(parent, fg_color="transparent")
-        switches.grid(row=16, column=0, sticky="ew", pady=(7, 14))
+        switches.grid(row=18, column=0, sticky="ew", pady=(7, 14))
         switches.grid_columnconfigure((0, 1), weight=1)
         self.run_resolve_switch = ctk.CTkSwitch(
             switches, text=self.t("run_resolve"),
@@ -1234,6 +1289,19 @@ class ModernCyberEditorApp:
         )
         self._save_current_preferences()
 
+    def _on_music_provider_change(self, display_value: str) -> None:
+        """Store the selected rights-aware music source. / 保存带权利审计的配乐来源。"""
+        self.music_provider_key = self._music_provider_display_to_key.get(
+            display_value, "yt_dlp"
+        )
+        if hasattr(self, "music_warning_label"):
+            self.music_warning_label.configure(
+                text=self.t("music_online_warning")
+                if self.music_provider_key == "yt_dlp"
+                else self.t("music_verified_hint")
+            )
+        self._save_current_preferences()
+
     def _start_initial_fps_detection(self) -> None:
         """Detect FPS for a restored media path after first paint. / 首帧显示后检测已恢复素材路径的 FPS。"""
         if self.fps_mode != "auto":
@@ -1523,6 +1591,11 @@ class ModernCyberEditorApp:
             target_duration_sec=float(self.target_duration_var.get() or 0),
             camera_profile=self.camera_profile_var.get().strip(),
             music_folder=self.music_folder_var.get().strip(),
+            music_provider=self.music_provider_key,
+            music_candidate_limit=int(self.music_candidate_limit_var.get()),
+            jamendo_client_id=self.jamendo_client_id_var.get().strip(),
+            music_rights_confirmed=False,
+            music_rights_claim="",
             timeline_name=(
                 self.timeline_var.get().strip() or "CyberEditor Timeline"
             ),
@@ -1727,6 +1800,16 @@ class ModernCyberEditorApp:
             return
         try:
             options = self._collect_options()
+            if options.music_provider == "yt_dlp":
+                confirmed = messagebox.askyesno(
+                    self.t("music_rights_title"),
+                    self.t("music_rights_confirmation"),
+                    parent=self.root,
+                )
+                if not confirmed:
+                    return
+                options.music_rights_confirmed = True
+                options.music_rights_claim = self.t("music_rights_audit_claim")
             command = options.build_command(sys.executable, self.project_root)
             self._save_settings(options)
         except (ValueError, tk.TclError, OSError) as exc:
@@ -1917,8 +2000,17 @@ class ModernCyberEditorApp:
             if "Extract" in line:
                 self._set_progress(0.12)
                 self._set_stage("extracting")
-            elif "Direct" in line:
+            elif "Music director first pass" in line:
                 self._set_progress(0.48)
+                self._set_stage("directing")
+            elif "Music retrieval and CPU analysis" in line:
+                self._set_progress(0.55)
+                self._set_stage("directing")
+            elif "Final AI director" in line:
+                self._set_progress(0.64)
+                self._set_stage("directing")
+            elif "Music-bed conform" in line:
+                self._set_progress(0.75)
                 self._set_stage("directing")
             elif "Preview render" in line:
                 self._set_progress(0.72)
@@ -2126,6 +2218,10 @@ class ModernCyberEditorApp:
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.settings_path.with_suffix(".tmp")
         payload = asdict(options)
+        # Online-audio consent is per run and must never silently persist.
+        # 任意在线音频确认只对本次运行有效，绝不静默持久化。
+        payload["music_rights_confirmed"] = False
+        payload["music_rights_claim"] = ""
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",

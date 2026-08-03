@@ -614,11 +614,14 @@ def build_runtime_environment() -> Dict[str, str]:
             candidates.append(executable.parent)
     existing = environment.get("PATH", "").split(os.pathsep)
     normalized = {item.casefold() for item in existing if item}
-    prefixes = [
-        str(path)
-        for path in candidates
-        if path.is_dir() and str(path).casefold() not in normalized
-    ]
+    prefixes: List[str] = []
+    for path in candidates:
+        try:
+            available = path.is_dir()
+        except OSError:
+            available = False
+        if available and str(path).casefold() not in normalized:
+            prefixes.append(str(path))
     if prefixes:
         environment["PATH"] = os.pathsep.join(prefixes + existing)
     environment["PYTHONUNBUFFERED"] = "1"
@@ -746,6 +749,11 @@ class WorkflowOptions:
     target_duration_sec: float = 0.0
     camera_profile: str = "sony_pp8_slog3_sgamut3cine"
     music_folder: str = ""
+    music_provider: str = "off"
+    music_candidate_limit: int = 8
+    jamendo_client_id: str = ""
+    music_rights_confirmed: bool = False
+    music_rights_claim: str = ""
     timeline_name: str = "CyberEditor Timeline"
     project_name: str = "CyberEditor Project"
     skip_resolve: bool = True
@@ -838,6 +846,23 @@ class WorkflowOptions:
             raise ValueError(
                 f"配乐目录不存在 / Music folder not found:\n{self.music_folder}"
             )
+        if self.music_provider not in {"off", "local", "jamendo", "yt_dlp"}:
+            raise ValueError("未知配乐来源 / Unknown music provider.")
+        if self.music_provider == "local" and not self.music_folder:
+            raise ValueError(
+                "本地配乐模式需要选择曲库文件夹 / Local music mode requires a library folder."
+            )
+        if self.music_provider == "jamendo" and not self.jamendo_client_id.strip():
+            raise ValueError("Jamendo 模式需要 client_id / Jamendo mode requires a client_id.")
+        if self.music_provider == "yt_dlp" and (
+            not self.music_rights_confirmed or not self.music_rights_claim.strip()
+        ):
+            raise ValueError(
+                "任意在线音频模式需要本次运行的版权与平台条款确认。 / "
+                "Arbitrary online audio requires per-run rights and platform-terms confirmation."
+            )
+        if not 1 <= int(self.music_candidate_limit) <= 12:
+            raise ValueError("候选配乐数量必须为 1–12 / Music candidate limit must be 1–12.")
         if self.render_final and self.skip_resolve:
             raise ValueError(
                 "最终渲染需要启用 Resolve / Final rendering requires Resolve."
@@ -901,6 +926,19 @@ class WorkflowOptions:
             command.extend(
                 ["--music-folder", str(_absolute_path(self.music_folder, project_root))]
             )
+        command.extend(
+            [
+                "--music-provider",
+                self.music_provider,
+                "--music-candidate-limit",
+                str(self.music_candidate_limit),
+            ]
+        )
+        if self.jamendo_client_id.strip():
+            command.extend(["--jamendo-client-id", self.jamendo_client_id.strip()])
+        if self.music_rights_confirmed:
+            command.append("--music-rights-confirmed")
+            command.extend(["--music-rights-claim", self.music_rights_claim.strip()])
         explicit_videos = self.videos or ([self.video] if self.video else [])
         for video in explicit_videos:
             command.extend(

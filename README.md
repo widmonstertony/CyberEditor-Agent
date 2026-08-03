@@ -21,7 +21,7 @@ PowerShell 中运行：
 导演阐述，再让视觉模型对每个 10–15 分钟窗口结合画面和台词挑选候选片段。第二遍全局
 导演只保留服务主题的少数镜头；本地校验器强制按真实素材顺序与素材内时间码排列，并限制
 单镜头与总成片时长。它同时规划硬切/叠化/淡黑、音频降噪、创意色彩、音量、防抖、跟踪、
-轻微推镜，以及从用户本地授权曲库中选择的配乐。最终可同时输出 Resolve 可编辑时间线、
+轻微推镜，以及由双导演流程选择并预混的 1–3 段配乐。最终可同时输出 Resolve 可编辑时间线、
 FFmpeg 1080p 审片预览，以及由 Resolve Deliver 页面真正渲染的最终成片。
 
 “性能配置”默认使用 `自动检测 / Auto`：界面以标准库读取 CPU、系统内存和 GPU，
@@ -103,8 +103,17 @@ MP4，并调用 DaVinci Resolve Python API 组装可继续精修的时间线。
 Whisper + OpenCV 子进程
           │ 完全退出，Windows 回收 CUDA 上下文
           ▼
-Ollama Qwen3.6-27B Dense Q8 视觉审片 + 全局导演
-          │ keep_alive=0 + 父进程二次卸载
+Qwen3.6 音乐导演初审（代表帧 + 台词 + 剧情）
+          │ 写出 music_brief.json，keep_alive=0 完全卸载
+          ▼
+CPU 联网/本地找歌 + Librosa/FFmpeg 音乐听诊
+          │ 节拍、强拍、段落、调性、动态范围、LUFS；0 GPU
+          ▼
+Qwen3.6 最终导演（镜头 + 1–3 段 cue + 留白 + 高潮命中点）
+          │ 写出 timeline_cuts.json，keep_alive=0 完全卸载
+          ▼
+FFmpeg CPU 合成 music_bed.wav
+          │ 换歌、淡化、响度统一、对白 ducking
           ▼
 FFmpeg 预览渲染子进程
           │ 生成真实转场、降噪与基础运动效果
@@ -138,25 +147,40 @@ DaVinci Resolve 执行子进程
 # 默认保留 C: 4–8GB，并在 D: 创建 32–48GB；脚本不会自动重启。
 ```
 
-## 四阶段自动成片能力
+## 六阶段双导演自动成片能力
 
 当前实现对应以下严格串行链路：
 
 1. **提取期**：每个视频单独启动 Whisper/OpenCV 子进程，写入台词、真实 JPEG
    关键帧和素材元数据；每个子进程退出后，父调度器再执行显存释放屏障。
-2. **配乐期（CPU）**：只搜索用户提供的本地授权曲库；可选 `library.json` 记录
-   许可证、情绪和标签。Librosa 提取 BPM 与全部鼓点，结果写入 `music_analysis.json`。
-3. **思考期**：Qwen3.6 以 10–15 分钟窗口结合画面与台词审片并落盘检查点，随后以
-   同一模型进行纯文字跨素材全局编排。镜头时长按角色动态限制：B-roll 10 秒、
+2. **音乐导演初审**：Qwen3.6 读取跨素材代表帧、台词和拍摄顺序，先确定主题、情绪
+   弧线、检索词、乐器、BPM 范围、人声策略、1–3 个 cue 和有意留白，分别写入
+   `director_treatment.json` 与 `music_brief.json`，随后完全卸载。
+3. **候选获取与听诊（CPU）**：可选本地授权曲库、带许可证链接的 Jamendo，或显式
+   确认后的 yt-dlp 任意在线模式。Librosa/FFmpeg 提取 BPM、全部节拍、强拍、近似
+   downbeat、能量段落、调性、动态范围和 EBU R128 LUFS，写入 `music_analysis.json`。
+4. **最终导演**：Qwen3.6 再次加载，以 10–15 分钟窗口结合画面与台词审片并落盘
+   检查点，最后跨全部素材和已听诊曲目统一编排。镜头时长按角色动态限制：B-roll 10 秒、
    桥段 12 秒、语境 20 秒、高潮 25 秒、结尾 30 秒、完整采访语义最长 45 秒。
    纯画面出点可在 ±0.25 秒内吸附鼓点，对话与结尾绝不为卡点截断。
-4. **执行期**：Resolve 原生 API 完成素材导入、按源素材 FPS 换帧、拼接、Voice
+5. **音乐床与执行期**：模型卸载后，FFmpeg 在 CPU 上按 cue 表裁切 1–3 首音乐、
+   淡入淡出、响度匹配、对白 ducking 并生成确定性的 `music_bed.wav`。Resolve 只需
+   将这一条音乐床导入 A2，再由原生 API 完成素材导入、按源素材 FPS 换帧、拼接、Voice
    Isolation、基础 CDL、`Stabilize()`、`CreateMagicMask()` 和 `SmartReframe()`；
    用户导出的 DRX 通过节点图 `ApplyGradeFromDRX()` 注入。Resolve 21 已原生公开
    防抖与 Magic Mask 接口，因此默认不使用脆弱的坐标宏。
-5. **导出期**：启用 UI 中“Resolve 导出最终成片”后，执行器创建 Render Job、启动
+6. **导出期**：启用 UI 中“Resolve 导出最终成片”后，执行器创建 Render Job、启动
    渲染、持续报告百分比并校验完成状态；默认沿用当前 Deliver 页面格式/编码设置，
    也可填写一个现有的 Resolve 渲染预设名。
+
+### 任意在线音频模式与版权
+
+UI 默认提供“任意在线音频 · 效果优先”，但**每次运行都必须重新确认**；确认不会保存。
+该模式使用 yt-dlp 搜索和下载候选，不使用 Cookie、DRM 绕过或登录自动化。项目会保存
+来源 URL、用户本次声明、许可证字段和文件 SHA-256 到审计 JSON。可下载或确认弹窗都不
+等于获得版权：用户必须自行拥有下载、改编、与画面同步和发布所需的权利，并遵守来源
+平台条款；商用前必须取得覆盖商用、改编和同步的明确授权。公开项目更稳妥的默认做法是
+改选本地授权曲库或 Jamendo 可验证许可证模式。
 
 ### DRX、Fairlight 与 UI 宏
 
@@ -206,7 +230,9 @@ CyberEditor-Agent/
 │  ├─ media_manifest.py          # 多视频/文件夹发现、去重与代理映射
 │  ├─ ui_i18n.py                 # 不依赖 GUI 包的中英文文案
 │  ├─ extractor.py               # Whisper + OpenCV 数据提取
-│  ├─ director.py                # 多模态分块审片 + 跨素材全局导演
+│  ├─ director.py                # 双导演初审、分块审片、多 cue 全局编排
+│  ├─ music_analyzer.py          # 本地/Jamendo/yt-dlp 获取与 CPU 音乐听诊
+│  ├─ music_bed.py               # 多曲裁切、淡化、ducking 与音乐床合成
 │  ├─ review_renderer.py         # FFmpeg 可观看预览与效果渲染
 │  ├─ resolve_macro.py           # 受保护的可选 PyAutoGUI 后备层
 │  └─ resolve_executor.py        # DaVinci Resolve 自动组装与效果映射
@@ -221,6 +247,8 @@ CyberEditor-Agent/
    ├─ test_director.py
    ├─ test_extractor.py
    ├─ test_gui.py
+   ├─ test_music_analyzer.py
+   ├─ test_music_bed.py
    ├─ test_orchestrator.py
    ├─ test_runtime_services.py
    └─ test_resolve_executor.py
@@ -367,7 +395,12 @@ python main.py `
 data/raw_data.json
 data/assets/<asset_id>/transcript.srt
 data/assets/<asset_id>/keyframes/*.jpg
+data/director_treatment.json
+data/music_brief.json
+data/music_analysis.json
 data/timeline_cuts.json
+data/music/music_bed.wav
+data/music/music_bed.audit.json
 data/review/CyberEditor_preview.mp4
 data/cybereditor.log
 ```
@@ -384,7 +417,15 @@ python main.py --skip-extraction `
   --creative-brief "按拍摄时间讲述团队从准备到完成动作的过程" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
+  --music-provider local `
   --music-folder "D:\Music\Licensed"
+
+# 任意在线候选（更推荐在 UI 中运行，以看到完整、不可跳过的警告）
+python main.py --skip-extraction --skip-resolve `
+  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --music-provider yt_dlp --music-candidate-limit 8 `
+  --music-rights-confirmed `
+  --music-rights-claim "我拥有下载、改编、同步和使用候选音频所需的权利，并会遵守来源平台条款"
 
 # 已有 timeline_cuts.json，只执行 Resolve
 python main.py --skip-extraction --skip-director `
@@ -399,6 +440,8 @@ python main.py --video "D:\source.mov" --skip-resolve
 ```powershell
 python -m src.extractor --help
 python -m src.director --help
+python -m src.music_analyzer --help
+python -m src.music_bed --help
 python -m src.review_renderer --help
 python -m src.resolve_executor --help
 ```
@@ -408,6 +451,8 @@ python -m src.resolve_executor --help
 ```python
 from src.extractor import MediaExtractor
 from src.director import AIDirector
+from src.music_analyzer import LicensedMusicAnalyzer
+from src.music_bed import MusicBedRenderer
 from src.resolve_executor import DaVinciExecutor
 ```
 
@@ -436,9 +481,26 @@ from src.resolve_executor import DaVinciExecutor
     "output_gamma": "Gamma 2.4"
   },
   "music_plan": {
-    "file_name": "D:\\Music\\Licensed\\restrained-build.wav",
-    "target_level_db": -20.0,
-    "duck_dialogue": true
+    "mode": "multi_cue_pre_mix",
+    "bed_file": "D:\\Project\\data\\music\\music_bed.wav",
+    "strategy": "克制开场，发展段渐强，结尾留白",
+    "silence_regions": [
+      {"timeline_in_sec": 36.0, "timeline_out_sec": 39.0, "reason": "保留关键对白"}
+    ],
+    "cues": [
+      {
+        "cue_id": "M1",
+        "track_file": "restrained-build.wav",
+        "timeline_in_sec": 0.0,
+        "timeline_out_sec": 36.0,
+        "track_in_sec": 12.0,
+        "track_out_sec": 48.0,
+        "target_lufs": -24.0,
+        "duck_under_dialogue_db": -9.0,
+        "source_url": "https://example.invalid/source",
+        "license": "用户提供的授权记录"
+      }
+    ]
   },
   "clips": [
     {

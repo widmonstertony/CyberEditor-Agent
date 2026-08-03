@@ -36,8 +36,8 @@ with both images and speech. A second global-director pass keeps only the
 minority of shots that serve that treatment. Local validation enforces actual
 source order and in-file timecode, plus per-shot and total-runtime limits. It
 plans cuts/dissolves/fades, audio cleanup, creative looks, gentle push-ins,
-gain, stabilization, tracking, and music selected only from the user's local
-licensed library. The result can include an editable
+gain, stabilization, tracking, and a one-to-three-cue pre-mixed score chosen by
+the two-director pipeline. The result can include an editable
 Resolve timeline, an immediately watchable FFmpeg 1080p review, and a final
 movie rendered by Resolve's Deliver pipeline.
 
@@ -133,8 +133,17 @@ process exit as a hard VRAM barrier:
 Whisper + OpenCV child process
           │ exits completely; Windows releases the CUDA context
           ▼
-Ollama Qwen3.6-27B dense Q8 vision reviewer + global director
-          │ keep_alive=0 plus a second parent-process unload request
+Qwen3.6 first music-director pass (frames + dialogue + story)
+          │ writes music_brief.json, then keep_alive=0 unload
+          ▼
+CPU local/network retrieval + Librosa/FFmpeg music analysis
+          │ beats, strong beats, sections, key, dynamics, LUFS; zero GPU
+          ▼
+Qwen3.6 final director (shots + 1–3 cues + silence + climax sync)
+          │ writes timeline_cuts.json, then fully unloads
+          ▼
+FFmpeg CPU render of music_bed.wav
+          │ cue changes, fades, loudness matching, dialogue ducking
           ▼
 FFmpeg review-render child process
           │ renders transitions, denoise, looks, and basic motion
@@ -172,30 +181,50 @@ text-only global assembly. Only one model is resident, without loading a second
 `scripts\configure_pagefile_admin.cmd` and run it as Administrator to keep a
 4–8 GB C: page file and add a 32–48 GB D: page file. It never reboots Windows.
 
-## Four-stage automatic finishing pipeline
+## Six-stage two-director finishing pipeline
 
 The implementation now follows this strict serial chain:
 
 1. **Extraction**: each video gets its own Whisper/OpenCV child process, which
    writes dialogue, real JPEG keyframes, and media metadata. The process exits
    before the parent crosses the VRAM-release barrier.
-2. **Licensed music (CPU)**: search only the user-supplied authorized library;
-   an optional `library.json` records license, mood, and tags. Librosa writes BPM
-   and beat timestamps to `music_analysis.json`.
-3. **Direction**: Qwen3.6 reviews 10–15 minute image/speech windows and then
-   performs text-only cross-source story assembly with the same resident model.
+2. **First music-director pass**: Qwen3.6 reads representative frames, dialogue,
+   and shoot order, then defines theme, emotional arc, search terms,
+   instrumentation, BPM range, vocal policy, one to three cues, and intentional
+   silence. It writes `director_treatment.json` and `music_brief.json`, then unloads.
+3. **Retrieval and analysis (CPU)**: choose a local licensed library, Jamendo with
+   verifiable license URLs, or the explicitly confirmed yt-dlp any-online mode.
+   Librosa/FFmpeg extracts BPM, beats, strong beats, approximate downbeats, energy
+   sections, key, dynamic range, and EBU R128 LUFS into `music_analysis.json`.
+4. **Final direction**: Qwen3.6 reloads, reviews 10–15 minute image/speech windows,
+   and performs cross-source story and multi-cue assembly against analyzed tracks.
    Dynamic shot limits range from 10-second B-roll to complete 45-second interview
    thoughts. Visual-only out-points may snap ±0.25 seconds to a beat; dialogue and
    closing thoughts are never truncated for rhythm.
-4. **Resolve execution**: native APIs import media, use each source's native FPS,
+5. **Music-bed conform and Resolve execution**: after Qwen unloads, FFmpeg trims
+   one to three cues, applies fades, loudness matching and dialogue ducking, and
+   writes deterministic `music_bed.wav`. Resolve imports this one file on A2, then
+   native APIs import picture media, use each source's native FPS,
    assemble clips, and apply Voice Isolation, basic CDL, `Stabilize()`,
    `CreateMagicMask()`, and `SmartReframe()`. User-exported DRX grades are applied
    through the node graph's `ApplyGradeFromDRX()`. Resolve 21 exposes stabilization
    and Magic Mask natively, so fragile coordinate macros are not the default.
-5. **Final export**: enable **Export final movie in Resolve** in the UI to create
+6. **Final export**: enable **Export final movie in Resolve** in the UI to create
    a Render Job, start it, log percentage progress, and validate completion. The
    current Deliver format/codec is preserved unless an existing Resolve render
    preset is entered.
+
+### Any-online audio and copyright
+
+The UI offers **Any online audio · quality first**, but it requires a new explicit
+confirmation for every run; consent is never persisted. This mode uses yt-dlp for
+search/download and does not automate cookies, logins, or DRM circumvention. The
+project records source URL, the per-run user statement, license fields, and SHA-256
+in audit JSON. Availability and a confirmation dialog do not grant copyright. The
+user must hold every right required to download, adapt, synchronize, and publish
+the audio and must comply with source-platform terms. Commercial releases need an
+explicit license covering commercial use, adaptation, and synchronization. Local
+licensed libraries or Jamendo's verifiable-license mode remain the safer choices.
 
 ### DRX, Fairlight, and the UI fallback
 
@@ -249,7 +278,9 @@ CyberEditor-Agent/
 │  ├─ media_manifest.py          # Multi-video/folder discovery and proxy mapping
 │  ├─ ui_i18n.py                 # GUI-independent bilingual strings
 │  ├─ extractor.py               # Whisper + OpenCV extraction
-│  ├─ director.py                # Multimodal review + global story director
+│  ├─ director.py                # Two-pass treatment, review, and multi-cue direction
+│  ├─ music_analyzer.py          # Local/Jamendo/yt-dlp retrieval and CPU analysis
+│  ├─ music_bed.py               # Cue conform, fades, ducking, and bed render
 │  ├─ review_renderer.py         # Watchable FFmpeg preview and effects
 │  ├─ resolve_macro.py           # Guarded optional PyAutoGUI fallback
 │  └─ resolve_executor.py        # Resolve assembly and effect mapping
@@ -264,6 +295,8 @@ CyberEditor-Agent/
    ├─ test_director.py
    ├─ test_extractor.py
    ├─ test_gui.py
+   ├─ test_music_analyzer.py
+   ├─ test_music_bed.py
    ├─ test_orchestrator.py
    ├─ test_runtime_services.py
    └─ test_resolve_executor.py
@@ -423,7 +456,12 @@ Default outputs:
 data/raw_data.json
 data/assets/<asset_id>/transcript.srt
 data/assets/<asset_id>/keyframes/*.jpg
+data/director_treatment.json
+data/music_brief.json
+data/music_analysis.json
 data/timeline_cuts.json
+data/music/music_bed.wav
+data/music/music_bed.audit.json
 data/review/CyberEditor_preview.mp4
 data/cybereditor.log
 ```
@@ -441,7 +479,15 @@ python main.py --skip-extraction `
   --creative-brief "Tell the preparation-to-payoff story in shooting order" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
+  --music-provider local `
   --music-folder "D:\Music\Licensed"
+
+# Any-online candidates (the UI is preferred because it shows the full warning)
+python main.py --skip-extraction --skip-resolve `
+  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --music-provider yt_dlp --music-candidate-limit 8 `
+  --music-rights-confirmed `
+  --music-rights-claim "I hold the rights required to download, adapt, synchronize, and use candidate audio and will follow source-platform terms"
 
 # Reuse timeline_cuts.json and run only Resolve
 python main.py --skip-extraction --skip-director `
@@ -456,6 +502,8 @@ python main.py --video "D:\source.mov" --skip-resolve
 ```powershell
 python -m src.extractor --help
 python -m src.director --help
+python -m src.music_analyzer --help
+python -m src.music_bed --help
 python -m src.review_renderer --help
 python -m src.resolve_executor --help
 ```
@@ -465,6 +513,8 @@ The three core classes can also be imported by external Python modules:
 ```python
 from src.extractor import MediaExtractor
 from src.director import AIDirector
+from src.music_analyzer import LicensedMusicAnalyzer
+from src.music_bed import MusicBedRenderer
 from src.resolve_executor import DaVinciExecutor
 ```
 
@@ -493,9 +543,26 @@ The director produces this core structure:
     "output_gamma": "Gamma 2.4"
   },
   "music_plan": {
-    "file_name": "D:\\Music\\Licensed\\restrained-build.wav",
-    "target_level_db": -20.0,
-    "duck_dialogue": true
+    "mode": "multi_cue_pre_mix",
+    "bed_file": "D:\\Project\\data\\music\\music_bed.wav",
+    "strategy": "Restrained opening, rising development, silent ending breath",
+    "silence_regions": [
+      {"timeline_in_sec": 36.0, "timeline_out_sec": 39.0, "reason": "Protect key dialogue"}
+    ],
+    "cues": [
+      {
+        "cue_id": "M1",
+        "track_file": "restrained-build.wav",
+        "timeline_in_sec": 0.0,
+        "timeline_out_sec": 36.0,
+        "track_in_sec": 12.0,
+        "track_out_sec": 48.0,
+        "target_lufs": -24.0,
+        "duck_under_dialogue_db": -9.0,
+        "source_url": "https://example.invalid/source",
+        "license": "user-supplied rights record"
+      }
+    ]
   },
   "clips": [
     {

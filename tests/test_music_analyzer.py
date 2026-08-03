@@ -3,7 +3,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from src.music_analyzer import LicensedMusicAnalyzer
+from src.music_analyzer import (
+    LicensedMusicAnalyzer,
+    MusicAnalysisError,
+    MusicCandidateAcquirer,
+)
 
 
 class LicensedMusicAnalyzerTests(unittest.TestCase):
@@ -36,6 +40,19 @@ class LicensedMusicAnalyzerTests(unittest.TestCase):
             self.assertEqual(ranked[0]["title"], "Licensed Epic")
             self.assertEqual(ranked[0]["license"], "CC BY 4.0")
             self.assertEqual(ranked[1]["license"], "user-supplied")
+
+    def test_arbitrary_online_audio_fails_closed_without_per_run_consent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            acquirer = MusicCandidateAcquirer(temporary)
+
+            with self.assertRaisesRegex(MusicAnalysisError, "确认|confirm"):
+                acquirer.acquire_ytdlp(
+                    {"search_queries": ["cinematic instrumental"]},
+                    "",
+                    3,
+                    rights_confirmed=False,
+                    rights_claim="",
+                )
 
 
 if __name__ == "__main__":

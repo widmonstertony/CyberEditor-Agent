@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 LOGGER_NAME = "cybereditor.director"
 DIRECTOR_CHECKPOINT_VERSION = 1
-DIRECTOR_PROMPT_VERSION = "2026-08-03.1-72b-per-source-color"
+DIRECTOR_PROMPT_VERSION = "2026-08-03.2-two-pass-music-director"
 
 TREATMENT_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -52,6 +52,30 @@ TREATMENT_SCHEMA: Dict[str, Any] = {
         },
         "music_mood": {"type": "string", "minLength": 1},
         "music_energy_arc": {"type": "string", "minLength": 1},
+        "music_search_queries": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 2},
+            "minItems": 2,
+            "maxItems": 6,
+        },
+        "music_instrumentation": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+            "maxItems": 8,
+        },
+        "music_tempo_min_bpm": {"type": "number", "minimum": 40, "maximum": 220},
+        "music_tempo_max_bpm": {"type": "number", "minimum": 40, "maximum": 220},
+        "music_vocal_policy": {
+            "type": "string",
+            "enum": ["instrumental_only", "vocals_allowed", "vocals_preferred"],
+        },
+        "music_cue_count": {"type": "integer", "minimum": 1, "maximum": 3},
+        "music_silence_strategy": {"type": "string", "minLength": 1},
+        "music_license_intent": {
+            "type": "string",
+            "enum": ["commercial_safe", "noncommercial", "user_authorized_any"],
+        },
         "editorial_rules": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
@@ -85,7 +109,11 @@ TREATMENT_SCHEMA: Dict[str, Any] = {
         "title", "logline", "central_theme", "chronology_policy",
         "target_duration_sec", "opening_beat", "development_beat",
         "payoff_beat", "ending_beat", "color_intent", "creative_look",
-        "music_mood", "music_energy_arc", "editorial_rules", "story_anchors",
+        "music_mood", "music_energy_arc", "music_search_queries",
+        "music_instrumentation", "music_tempo_min_bpm",
+        "music_tempo_max_bpm", "music_vocal_policy", "music_cue_count",
+        "music_silence_strategy", "music_license_intent",
+        "editorial_rules", "story_anchors",
     ],
     "additionalProperties": False,
 }
@@ -238,17 +266,74 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
         "music_plan": {
             "type": "object",
             "properties": {
-                "track_file": {"type": "string"},
-                "reason": {"type": "string"},
-                "target_level_db": {"type": "number", "minimum": -36, "maximum": -6},
-                "fade_in_sec": {"type": "number", "minimum": 0, "maximum": 10},
-                "fade_out_sec": {"type": "number", "minimum": 0, "maximum": 10},
-                "duck_dialogue": {"type": "boolean"},
+                "strategy": {"type": "string", "minLength": 1},
+                "silence_regions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "timeline_in_sec": {"type": "number", "minimum": 0},
+                            "timeline_out_sec": {"type": "number", "minimum": 0},
+                            "reason": {"type": "string", "minLength": 1},
+                        },
+                        "required": ["timeline_in_sec", "timeline_out_sec", "reason"],
+                        "additionalProperties": False,
+                    },
+                    "maxItems": 8,
+                },
+                "cues": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "cue_id": {"type": "string", "minLength": 1},
+                            "track_file": {"type": "string", "minLength": 1},
+                            "story_beat": {
+                                "type": "string",
+                                "enum": ["opening", "development", "payoff", "ending"],
+                            },
+                            "timeline_in_sec": {"type": "number", "minimum": 0},
+                            "timeline_out_sec": {"type": "number", "minimum": 0},
+                            "track_in_sec": {"type": "number", "minimum": 0},
+                            "track_out_sec": {"type": "number", "minimum": 0},
+                            "reason": {"type": "string", "minLength": 1},
+                            "target_lufs": {"type": "number", "minimum": -36, "maximum": -14},
+                            "fade_in_sec": {"type": "number", "minimum": 0, "maximum": 12},
+                            "fade_out_sec": {"type": "number", "minimum": 0, "maximum": 12},
+                            "crossfade_sec": {"type": "number", "minimum": 0, "maximum": 8},
+                            "duck_under_dialogue_db": {"type": "number", "minimum": -24, "maximum": 0},
+                            "sync_points": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "timeline_sec": {"type": "number", "minimum": 0},
+                                        "track_sec": {"type": "number", "minimum": 0},
+                                        "type": {
+                                            "type": "string",
+                                            "enum": ["beat", "strong_beat", "downbeat", "section", "energy_peak"],
+                                        },
+                                        "purpose": {"type": "string", "minLength": 1},
+                                    },
+                                    "required": ["timeline_sec", "track_sec", "type", "purpose"],
+                                    "additionalProperties": False,
+                                },
+                                "maxItems": 12,
+                            },
+                        },
+                        "required": [
+                            "cue_id", "track_file", "story_beat",
+                            "timeline_in_sec", "timeline_out_sec", "track_in_sec",
+                            "track_out_sec", "reason", "target_lufs",
+                            "fade_in_sec", "fade_out_sec", "crossfade_sec",
+                            "duck_under_dialogue_db", "sync_points"
+                        ],
+                        "additionalProperties": False,
+                    },
+                    "maxItems": 3,
+                },
             },
-            "required": [
-                "track_file", "reason", "target_level_db", "fade_in_sec",
-                "fade_out_sec", "duck_dialogue",
-            ],
+            "required": ["strategy", "silence_regions", "cues"],
             "additionalProperties": False,
         },
         "sequence": {
@@ -365,6 +450,7 @@ class AIDirector:
         camera_profile: str = "sony_pp8_slog3_sgamut3cine",
         music_folder: Optional[os.PathLike] = None,
         music_analysis: Optional[os.PathLike] = None,
+        treatment_file: Optional[os.PathLike] = None,
         session: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -419,6 +505,13 @@ class AIDirector:
         if self.music_analysis_path is not None and not self.music_analysis_path.is_file():
             raise DirectorError(
                 f"配乐分析文件不存在 / Music analysis not found: {self.music_analysis_path}"
+            )
+        self.treatment_path = (
+            Path(treatment_file).expanduser().resolve() if treatment_file else None
+        )
+        if self.treatment_path is not None and not self.treatment_path.is_file():
+            raise DirectorError(
+                f"导演初审文件不存在 / Director treatment not found: {self.treatment_path}"
             )
         self._music_analysis: Dict[str, Any] = {}
         self._active_treatment: Dict[str, Any] = {}
@@ -540,6 +633,113 @@ class AIDirector:
             destination,
         )
         return output
+
+    def run_treatment_only(
+        self,
+        raw_data_path: os.PathLike,
+        treatment_output_path: os.PathLike,
+        music_brief_output_path: os.PathLike,
+    ) -> Dict[str, Any]:
+        """
+        Run the first multimodal director pass and publish its two handoff files.
+        运行第一次多模态导演初审，并写出两份阶段交接文件。
+
+        Parameters / 参数:
+            raw_data_path: Combined extractor output. / 合并后的提取结果。
+            treatment_output_path: Validated story treatment JSON. / 已校验的导演阐述 JSON。
+            music_brief_output_path: Search and emotion brief for CPU retrieval. / 供 CPU 找歌的情绪与检索简报。
+
+        The model is always unloaded before this method returns, so network and
+        CPU music analysis can start with no Ollama VRAM residency.
+        本方法返回前始终卸载模型，使联网找歌与 CPU 听诊在 Ollama 不占显存时运行。
+        """
+        raw_path = Path(raw_data_path).expanduser().resolve()
+        raw_data = self.load_raw_data(raw_path)
+        assets = raw_data.get("assets")
+        if not isinstance(assets, list) or not assets:
+            raise DirectorError(
+                "双导演音乐流程需要批量素材 schema / Two-pass music directing requires multi-asset raw data."
+            )
+        try:
+            self.check_ollama(require_vision=True)
+            payload = self.request_treatment(assets)
+            treatment = self.validate_treatment(payload, assets)
+            music_brief = self.build_music_brief(treatment, assets)
+            self._atomic_write_json(
+                treatment,
+                Path(treatment_output_path).expanduser().resolve(),
+            )
+            self._atomic_write_json(
+                music_brief,
+                Path(music_brief_output_path).expanduser().resolve(),
+            )
+            self.logger.info(
+                "音乐导演初审完成：%s / Music-director review complete: %s",
+                music_brief_output_path,
+                music_brief_output_path,
+            )
+            return {"director_treatment": treatment, "music_brief": music_brief}
+        finally:
+            self.unload_model(self.model)
+
+    def load_treatment(self, assets: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        """Load and validate the first-pass treatment. / 读取并校验第一次导演初审。"""
+        if self.treatment_path is None:
+            payload = self.request_treatment(assets)
+        else:
+            try:
+                payload = json.loads(
+                    self.treatment_path.read_text(encoding="utf-8-sig")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise DirectorError(
+                    f"无法读取导演初审 / Cannot read director treatment: {exc}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise DirectorError(
+                    "导演初审根节点必须是对象 / Director treatment must be an object."
+                )
+            self._active_target_duration_sec = self._finite_float(
+                payload.get("target_duration_sec", self.target_duration_sec or 90.0),
+                "target_duration_sec",
+            )
+        return self.validate_treatment(payload, assets)
+
+    def build_music_brief(
+        self,
+        treatment: Dict[str, Any],
+        assets: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Convert the first director decision into a stable CPU-search contract.
+        将第一次导演决策转换为稳定的 CPU 音乐检索契约。
+
+        Parameters / 参数:
+            treatment: Validated project treatment. / 已校验的项目导演阐述。
+            assets: Source assets used for provenance. / 用于记录来源的素材列表。
+        """
+        return {
+            "schema_version": "1.0",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "director_model": self.model,
+            "project_title": treatment.get("title", ""),
+            "central_theme": treatment.get("central_theme", ""),
+            "story_summary": treatment.get("logline", ""),
+            "emotion_arc": treatment.get("music_energy_arc", ""),
+            "mood": treatment.get("music_mood", ""),
+            "search_queries": list(treatment.get("music_search_queries") or []),
+            "instrumentation": list(treatment.get("music_instrumentation") or []),
+            "tempo_bpm": {
+                "min": float(treatment.get("music_tempo_min_bpm", 70.0)),
+                "max": float(treatment.get("music_tempo_max_bpm", 130.0)),
+            },
+            "vocal_policy": treatment.get("music_vocal_policy", "instrumental_only"),
+            "preferred_cue_count": int(treatment.get("music_cue_count", 2)),
+            "silence_strategy": treatment.get("music_silence_strategy", ""),
+            "license_intent": treatment.get("music_license_intent", "commercial_safe"),
+            "target_duration_sec": float(treatment.get("target_duration_sec", 0.0)),
+            "source_asset_ids": [str(item.get("asset_id") or "") for item in assets],
+        }
 
     def revalidate_existing_plan(
         self,
@@ -697,8 +897,7 @@ class AIDirector:
                 for item in analyzed_tracks
                 if isinstance(item, dict) and str(item.get("file_name") or "").strip()
             ] or self.discover_music_files()
-            treatment_payload = self.request_treatment(assets)
-            treatment = self.validate_treatment(treatment_payload, assets)
+            treatment = self.load_treatment(assets)
             self._active_treatment = treatment
             candidates.extend(self.candidates_from_treatment(treatment, assets))
             for index, chunk in enumerate(chunks, start=1):
@@ -754,8 +953,8 @@ class AIDirector:
 
             candidates = self.merge_decisions(candidates)
             candidate_limit = max(
-                24,
-                min(160, self._effective_num_ctx(self.text_model) // 128),
+                20,
+                min(96, self._effective_num_ctx(self.text_model) // 256),
             )
             candidates = self._limit_candidates(
                 candidates, limit=candidate_limit
@@ -783,14 +982,48 @@ class AIDirector:
             if self.text_model.casefold() != self.model.casefold():
                 self.unload_model(self.text_model)
 
-        music_plan = self.validate_music_plan(sequence_payload.get("music_plan"))
+        program_duration = sum(
+            max(0.0, float(item.get("cut_out_sec", 0)) - float(item.get("cut_in_sec", 0)))
+            for item in final_clips
+        )
+        music_plan = self.validate_music_plan(
+            sequence_payload.get("music_plan"), program_duration
+        )
         final_clips = self.snap_visual_cuts_to_beats(final_clips, music_plan, assets)
+        music_plan["program_duration_sec"] = round(
+            sum(
+                max(
+                    0.0,
+                    float(item.get("cut_out_sec", 0))
+                    - float(item.get("cut_in_sec", 0)),
+                )
+                for item in final_clips
+            ),
+            4,
+        )
         color_pipeline = self.build_color_pipeline(
             treatment, assets, raw_data.get("color_match_plan")
         )
         color_sources = color_pipeline.get("sources", {})
+        transcript_by_asset = {
+            str(asset.get("asset_id") or ""): [
+                segment for segment in asset.get("transcript", [])
+                if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+            ]
+            for asset in assets
+        }
         for index, clip in enumerate(final_clips, start=1):
             clip["clip_id"] = index
+            clip_start = float(clip.get("cut_in_sec", 0))
+            clip_end = float(clip.get("cut_out_sec", 0))
+            clip["has_dialogue"] = any(
+                min(clip_end, float(segment.get("end_sec", 0)))
+                - max(clip_start, float(segment.get("start_sec", 0)))
+                >= 0.15
+                for segment in transcript_by_asset.get(
+                    str(clip.get("asset_id") or ""), []
+                )
+            )
             source_color = color_sources.get(str(clip.get("asset_id") or ""), {})
             if isinstance(source_color, dict):
                 clip["source_color"] = {
@@ -1409,16 +1642,44 @@ class AIDirector:
         automatic_target = min(180.0, max(45.0, total_duration * 0.12))
         requested_target = self.target_duration_sec or automatic_target
         self._active_target_duration_sec = round(requested_target, 1)
+        representative_frames: List[Dict[str, Any]] = []
+        if len(assets) <= 12:
+            representative_assets = list(assets)
+        else:
+            representative_assets = [
+                assets[round(index * (len(assets) - 1) / 11)]
+                for index in range(12)
+            ]
+        per_asset_limit = max(
+            1, min(3, 12 // max(1, len(representative_assets)))
+        )
+        for asset in representative_assets:
+            for frame in self._select_keyframes(
+                asset.get("keyframes", []), limit=per_asset_limit
+            ):
+                annotated = dict(frame)
+                annotated["asset_id"] = str(asset.get("asset_id") or "")
+                representative_frames.append(annotated)
+        representative_frames, images = self._encode_images(
+            representative_frames[:12]
+        )
+        image_legend = [
+            {
+                "image_index": index,
+                "asset_id": frame.get("asset_id", ""),
+                "timestamp_sec": round(float(frame.get("timestamp_sec", 0)), 3),
+            }
+            for index, frame in enumerate(representative_frames, start=1)
+        ]
         compact_assets: List[Dict[str, Any]] = []
+        transcript_budget = max(
+            2400,
+            min(8000, int(self._effective_num_ctx(self.model) * 0.40)),
+        )
+        per_asset_budget = max(160, transcript_budget // max(1, len(assets)))
         for source_order, asset in enumerate(assets):
-            transcript = " ".join(
-                "[{:.1f}-{:.1f}] {}".format(
-                    float(segment.get("start_sec", 0)),
-                    float(segment.get("end_sec", 0)),
-                    " ".join(str(segment.get("text", "")).split()),
-                )
-                for segment in asset.get("transcript", [])
-                if isinstance(segment, dict)
+            transcript, transcript_count = self._compact_transcript_excerpt(
+                asset.get("transcript", []), per_asset_budget
             )
             compact_assets.append(
                 {
@@ -1426,7 +1687,8 @@ class AIDirector:
                     "asset_id": asset.get("asset_id", ""),
                     "file": Path(str(asset.get("source_video") or "")).name,
                     "duration_sec": round(float(asset.get("duration_sec", 0)), 2),
-                    "transcript": transcript[:5000],
+                    "transcript_excerpt": transcript,
+                    "transcript_segment_count": transcript_count,
                     "keyframe_count": len(asset.get("keyframes", [])),
                 }
             )
@@ -1447,19 +1709,74 @@ class AIDirector:
             "seconds for an uninterrupted complete spoken thought; never cross an "
             "asset duration. Include a complete "
             "ending action rather than a one-word tail. "
-            "Use the exact requested target duration (within one second). The camera "
+            "Design the music before searching: provide 2-6 specific multilingual "
+            "search queries, instrumentation, a useful tempo range, vocal policy, "
+            "one to three cues, and intentional silence. Prefer instrumental music "
+            "under dialogue. Search terms must describe emotion, genre, pacing, and "
+            "instrumentation rather than copyrighted song titles. Use the exact "
+            "requested target duration (within one second). The camera "
             "profile is technical input metadata, not a creative look. Return JSON only.\n"
             f"USER CREATIVE BRIEF: {brief}\n"
             f"REQUESTED TARGET DURATION: {self._active_target_duration_sec:.1f} seconds\n"
             f"CAMERA PROFILE: {self.camera_profile}\n"
-            f"AVAILABLE LOCAL MUSIC: {json.dumps([p.name for p in self._music_files], ensure_ascii=False)}\n"
+            f"REPRESENTATIVE IMAGE ORDER: {json.dumps(image_legend, ensure_ascii=False)}\n"
             f"SCHEMA: {json.dumps(TREATMENT_SCHEMA, ensure_ascii=False)}\n"
             f"SOURCES: {json.dumps(compact_assets, ensure_ascii=False)}"
         )
         self.logger.info(
             "正在生成导演阐述与叙事弧线 / Creating director treatment and story arc"
         )
-        return self._request_json(prompt, TREATMENT_SCHEMA)
+        return self._request_json(prompt, TREATMENT_SCHEMA, images=images)
+
+    @staticmethod
+    def _compact_transcript_excerpt(
+        raw_segments: object, character_budget: int
+    ) -> tuple[str, int]:
+        """
+        Sample dialogue across the full source instead of keeping only its start.
+        在整个素材范围均匀采样台词，而不是只保留开头。
+
+        Parameters / 参数:
+            raw_segments: Extractor transcript records. / 提取层台词记录。
+            character_budget: Maximum prompt characters for this asset. / 本素材最大提示字符数。
+        """
+        if not isinstance(raw_segments, list):
+            return "", 0
+        lines = [
+            "[{:.1f}-{:.1f}] {}".format(
+                float(segment.get("start_sec", 0)),
+                float(segment.get("end_sec", 0)),
+                " ".join(str(segment.get("text", "")).split()),
+            )
+            for segment in raw_segments
+            if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+        ]
+        if not lines:
+            return "", 0
+        budget = max(80, int(character_budget))
+        combined = " ".join(lines)
+        if len(combined) <= budget:
+            return combined, len(lines)
+        sample_count = max(2, min(len(lines), budget // 100))
+        if sample_count == 1:
+            indexes = [0]
+        else:
+            indexes = sorted({
+                round(index * (len(lines) - 1) / (sample_count - 1))
+                for index in range(sample_count)
+            })
+        selected: List[str] = []
+        used = 0
+        for source_index in indexes:
+            line = lines[source_index]
+            remaining = budget - used
+            if remaining <= 0:
+                break
+            if len(line) > remaining:
+                line = line[: max(0, remaining - 1)].rstrip() + "…"
+            selected.append(line)
+            used += len(line) + 1
+        return " ".join(selected), len(lines)
 
     def validate_treatment(
         self, payload: Dict[str, Any], assets: Sequence[Dict[str, Any]]
@@ -1504,6 +1821,48 @@ class AIDirector:
         elif any(token in color_language for token in ("high contrast", "高对比")):
             look = "high_contrast"
         treatment["creative_look"] = look
+        queries = payload.get("music_search_queries")
+        treatment["music_search_queries"] = [
+            " ".join(str(value).split())
+            for value in (queries if isinstance(queries, list) else [])
+            if str(value).strip()
+        ][:6]
+        if len(treatment["music_search_queries"]) < 2:
+            base = f"{treatment['music_mood']} {treatment['music_energy_arc']} instrumental cinematic"
+            treatment["music_search_queries"] = [
+                base,
+                f"{treatment['central_theme']} emotional documentary score no vocals",
+            ]
+        instruments = payload.get("music_instrumentation")
+        treatment["music_instrumentation"] = [
+            " ".join(str(value).split())
+            for value in (instruments if isinstance(instruments, list) else [])
+            if str(value).strip()
+        ][:8] or ["cinematic acoustic ensemble"]
+        tempo_min = min(220.0, max(40.0, float(payload.get("music_tempo_min_bpm", 70))))
+        tempo_max = min(220.0, max(40.0, float(payload.get("music_tempo_max_bpm", 130))))
+        if tempo_max < tempo_min:
+            tempo_min, tempo_max = tempo_max, tempo_min
+        treatment["music_tempo_min_bpm"] = round(tempo_min, 1)
+        treatment["music_tempo_max_bpm"] = round(tempo_max, 1)
+        treatment["music_vocal_policy"] = self._enum_value(
+            payload.get("music_vocal_policy"),
+            {"instrumental_only", "vocals_allowed", "vocals_preferred"},
+            "instrumental_only",
+        )
+        try:
+            cue_count = int(payload.get("music_cue_count", 2))
+        except (TypeError, ValueError):
+            cue_count = 2
+        treatment["music_cue_count"] = min(3, max(1, cue_count))
+        treatment["music_silence_strategy"] = " ".join(
+            str(payload.get("music_silence_strategy") or "Leave key dialogue and the ending breath unscored.").split()
+        )
+        treatment["music_license_intent"] = self._enum_value(
+            payload.get("music_license_intent"),
+            {"commercial_safe", "noncommercial", "user_authorized_any"},
+            "commercial_safe",
+        )
         rules = payload.get("editorial_rules")
         treatment["editorial_rules"] = [
             " ".join(str(value).split()) for value in (rules if isinstance(rules, list) else [])
@@ -1758,44 +2117,178 @@ class AIDirector:
             raise DirectorError("配乐分析格式无效 / Invalid music-analysis schema.")
         return payload
 
-    def validate_music_plan(self, payload: Any) -> Dict[str, Any]:
-        """Resolve a model-selected track only within the supplied library. / 仅在用户配乐库中解析模型选择。"""
+    def validate_music_plan(
+        self, payload: Any, program_duration_sec: float = 0.0
+    ) -> Dict[str, Any]:
+        """
+        Resolve a one-to-three-cue model plan only against analyzed files.
+        仅允许模型在已分析曲目中解析一至三段配乐计划。
+
+        Parameters / 参数:
+            payload: Raw model ``music_plan``. / 模型原始配乐计划。
+            program_duration_sec: Final picture duration. / 最终画面时长。
+        """
         value = payload if isinstance(payload, dict) else {}
-        requested = str(value.get("track_file") or "").strip()
-        selected = next(
-            (path for path in self._music_files
-             if requested.casefold() in {path.name.casefold(), str(path).casefold()}),
-            None,
-        )
-        if requested and selected is None:
-            self.logger.warning(
-                "AI 选择了配乐库之外的文件 %r，已安全忽略 / Ignoring music outside the supplied library",
-                requested,
+        raw_cues = value.get("cues")
+        if not isinstance(raw_cues, list):
+            # Backward-compatible conversion for schema 3.0 single-track plans.
+            requested = str(value.get("track_file") or "").strip()
+            raw_cues = [] if not requested else [{
+                "cue_id": "M1", "track_file": requested,
+                "story_beat": "development", "timeline_in_sec": 0,
+                "timeline_out_sec": program_duration_sec,
+                "track_in_sec": 0, "track_out_sec": program_duration_sec,
+                "reason": value.get("reason", ""),
+                "target_lufs": -24, "fade_in_sec": value.get("fade_in_sec", 2),
+                "fade_out_sec": value.get("fade_out_sec", 3),
+                "crossfade_sec": 0,
+                "duck_under_dialogue_db": -9 if value.get("duck_dialogue", True) else 0,
+                "sync_points": [],
+            }]
+        tracks = [
+            item for item in self._music_analysis.get("tracks", [])
+            if isinstance(item, dict) and str(item.get("file_name") or "").strip()
+        ]
+        by_name: Dict[str, Dict[str, Any]] = {}
+        for item in tracks:
+            path = Path(str(item["file_name"])).expanduser().resolve()
+            by_name[path.name.casefold()] = item
+            by_name[str(path).casefold()] = item
+
+        def number(raw: Any, default: float, minimum: float, maximum: float) -> float:
+            try:
+                result = float(raw)
+            except (TypeError, ValueError):
+                result = default
+            return min(maximum, max(minimum, result))
+
+        program_duration = max(0.0, float(program_duration_sec or 0.0))
+        cues: List[Dict[str, Any]] = []
+        credits: List[Dict[str, Any]] = []
+        for cue_index, raw in enumerate(raw_cues[:3], start=1):
+            if not isinstance(raw, dict):
+                continue
+            requested = str(raw.get("track_file") or "").strip()
+            analyzed = by_name.get(requested.casefold())
+            if analyzed is None:
+                if requested:
+                    self.logger.warning(
+                        "AI 选择了候选库之外的曲目 %r，已忽略 / Ignoring music outside analyzed candidates",
+                        requested,
+                    )
+                continue
+            selected = Path(str(analyzed["file_name"])).expanduser().resolve()
+            track_duration = max(0.0, float(analyzed.get("duration_sec", 0) or 0))
+            timeline_in = number(raw.get("timeline_in_sec"), 0, 0, program_duration)
+            timeline_out = number(
+                raw.get("timeline_out_sec"), program_duration, timeline_in, program_duration
             )
-        analyzed = next(
-            (
-                item for item in self._music_analysis.get("tracks", [])
-                if isinstance(item, dict) and selected is not None
-                and str(item.get("file_name") or "").casefold() == str(selected).casefold()
-            ),
-            {},
-        )
+            if timeline_out - timeline_in < 0.25:
+                continue
+            track_in = number(raw.get("track_in_sec"), 0, 0, track_duration)
+            desired = timeline_out - timeline_in
+            track_out = number(
+                raw.get("track_out_sec"), track_in + desired, track_in, track_duration
+            )
+            usable = min(desired, track_out - track_in)
+            if usable < 0.25:
+                continue
+            timeline_out = timeline_in + usable
+            track_out = track_in + usable
+            sync_points: List[Dict[str, Any]] = []
+            for point in raw.get("sync_points", []) if isinstance(raw.get("sync_points"), list) else []:
+                if not isinstance(point, dict):
+                    continue
+                point_timeline = number(point.get("timeline_sec"), timeline_in, timeline_in, timeline_out)
+                point_track = number(point.get("track_sec"), track_in, track_in, track_out)
+                sync_points.append({
+                    "timeline_sec": round(point_timeline, 4),
+                    "track_sec": round(point_track, 4),
+                    "type": self._enum_value(
+                        point.get("type"),
+                        {"beat", "strong_beat", "downbeat", "section", "energy_peak"},
+                        "strong_beat",
+                    ),
+                    "purpose": " ".join(str(point.get("purpose") or "Musical sync").split()),
+                })
+            def cue_times(field_name: str) -> List[float]:
+                """Keep only analyzed events that occur inside this cue. / 仅保留 cue 内的已分析事件。"""
+                return [
+                    round(float(event), 4)
+                    for event in analyzed.get(field_name, [])
+                    if isinstance(event, (int, float))
+                    and track_in <= float(event) <= track_out
+                ]
+            cue_sections = [
+                dict(section)
+                for section in analyzed.get("sections", [])
+                if isinstance(section, dict)
+                and float(section.get("end_sec", 0) or 0) >= track_in
+                and float(section.get("start_sec", 0) or 0) <= track_out
+            ]
+            cue = {
+                "cue_id": str(raw.get("cue_id") or f"M{cue_index}"),
+                "file_name": str(selected),
+                "track_file": selected.name,
+                "story_beat": self._enum_value(
+                    raw.get("story_beat"),
+                    {"opening", "development", "payoff", "ending"},
+                    "development",
+                ),
+                "timeline_in_sec": round(timeline_in, 4),
+                "timeline_out_sec": round(timeline_out, 4),
+                "track_in_sec": round(track_in, 4),
+                "track_out_sec": round(track_out, 4),
+                "reason": " ".join(str(raw.get("reason") or "").split()),
+                "target_lufs": round(number(raw.get("target_lufs"), -24, -36, -14), 2),
+                "fade_in_sec": round(number(raw.get("fade_in_sec"), 1.5, 0, min(12, usable / 2)), 3),
+                "fade_out_sec": round(number(raw.get("fade_out_sec"), 2.0, 0, min(12, usable / 2)), 3),
+                "crossfade_sec": round(number(raw.get("crossfade_sec"), 1.5, 0, min(8, usable / 2)), 3),
+                "duck_under_dialogue_db": round(number(raw.get("duck_under_dialogue_db"), -9, -24, 0), 2),
+                "sync_points": sync_points,
+                "tempo_bpm": float(analyzed.get("tempo_bpm", 0) or 0),
+                "key": str(analyzed.get("key") or ""),
+                "mode": str(analyzed.get("mode") or ""),
+                "integrated_lufs": analyzed.get("integrated_lufs"),
+                "beats_sec": cue_times("beats_sec"),
+                "strong_beats_sec": cue_times("strong_beats_sec"),
+                "downbeats_sec": cue_times("downbeats_sec"),
+                "sections": cue_sections,
+                "license": str(analyzed.get("license") or "user-supplied"),
+                "license_url": str(analyzed.get("license_url") or ""),
+                "license_provenance": str(analyzed.get("license_provenance") or ""),
+                "source_url": str(analyzed.get("source_url") or ""),
+                "sha256": str(analyzed.get("sha256") or ""),
+            }
+            cues.append(cue)
+            credits.append({
+                "title": str(analyzed.get("title") or selected.stem),
+                "artist": str(analyzed.get("artist") or analyzed.get("uploader") or ""),
+                "source_url": cue["source_url"],
+                "license": cue["license"],
+                "license_url": cue["license_url"],
+            })
+        cues.sort(key=lambda item: (float(item["timeline_in_sec"]), item["cue_id"]))
+        silence_regions: List[Dict[str, Any]] = []
+        for raw in value.get("silence_regions", []) if isinstance(value.get("silence_regions"), list) else []:
+            if not isinstance(raw, dict):
+                continue
+            start = number(raw.get("timeline_in_sec"), 0, 0, program_duration)
+            end = number(raw.get("timeline_out_sec"), start, start, program_duration)
+            if end > start:
+                silence_regions.append({
+                    "timeline_in_sec": round(start, 3),
+                    "timeline_out_sec": round(end, 3),
+                    "reason": " ".join(str(raw.get("reason") or "Intentional silence").split()),
+                })
         return {
-            "file_name": str(selected) if selected else "",
-            "reason": " ".join(str(value.get("reason") or "").split()),
-            "target_level_db": round(min(-6.0, max(-36.0, float(value.get("target_level_db", -20)))), 1),
-            "fade_in_sec": round(min(10.0, max(0.0, float(value.get("fade_in_sec", 2)))), 2),
-            "fade_out_sec": round(min(10.0, max(0.0, float(value.get("fade_out_sec", 3)))), 2),
-            "duck_dialogue": value.get("duck_dialogue", True) is True,
-            "tempo_bpm": float(analyzed.get("tempo_bpm", 0) or 0),
-            "duration_sec": float(analyzed.get("duration_sec", 0) or 0),
-            "beats_sec": [
-                round(float(beat), 4) for beat in analyzed.get("beats_sec", [])
-                if isinstance(beat, (int, float)) and float(beat) >= 0
-            ],
-            "license": str(analyzed.get("license") or ("user-supplied" if selected else "")),
-            "license_url": str(analyzed.get("license_url") or ""),
-            "license_provenance": str(analyzed.get("license_provenance") or ""),
+            "mode": "multi_cue_pre_mix" if cues else "none",
+            "strategy": " ".join(str(value.get("strategy") or "").split()),
+            "program_duration_sec": round(program_duration, 4),
+            "bed_file": "",
+            "silence_regions": silence_regions,
+            "cues": cues,
+            "credits": credits,
         }
 
     def snap_visual_cuts_to_beats(
@@ -1812,19 +2305,38 @@ class AIDirector:
         Dialogue and closing thoughts are never time-warped or truncated for a beat.
         对话与结尾语义绝不会为了卡点被截断或变速。
         """
-        beats = [float(value) for value in music_plan.get("beats_sec", []) if isinstance(value, (int, float))]
-        track_duration = float(music_plan.get("duration_sec", 0) or 0)
-        if not beats or track_duration <= 0:
-            return [dict(item) for item in clips]
-        total_duration = sum(
-            max(0.0, float(item.get("cut_out_sec", 0)) - float(item.get("cut_in_sec", 0)))
-            for item in clips
-        )
         absolute_beats: List[float] = []
-        loop = 0
-        while loop * track_duration <= total_duration + max_shift_sec:
-            absolute_beats.extend(loop * track_duration + beat for beat in beats)
-            loop += 1
+        cues = music_plan.get("cues")
+        if isinstance(cues, list):
+            for cue in cues:
+                if not isinstance(cue, dict):
+                    continue
+                emphasized = list(cue.get("downbeats_sec") or []) + list(
+                    cue.get("strong_beats_sec") or []
+                )
+                source_beats = sorted({
+                    float(value) for value in emphasized
+                    if isinstance(value, (int, float))
+                }) or [
+                    float(value) for index, value in enumerate(cue.get("beats_sec") or [])
+                    if isinstance(value, (int, float)) and index % 2 == 0
+                ]
+                track_in = float(cue.get("track_in_sec", 0) or 0)
+                track_out = float(cue.get("track_out_sec", 0) or 0)
+                timeline_in = float(cue.get("timeline_in_sec", 0) or 0)
+                absolute_beats.extend(
+                    timeline_in + float(beat) - track_in
+                    for beat in source_beats
+                    if isinstance(beat, (int, float)) and track_in <= float(beat) <= track_out
+                )
+        else:
+            # Legacy schema fallback.
+            beats = music_plan.get("beats_sec", [])
+            absolute_beats.extend(
+                float(value) for value in beats if isinstance(value, (int, float))
+            )
+        if not absolute_beats:
+            return [dict(item) for item in clips]
         asset_duration = {
             str(asset.get("asset_id") or ""): float(asset.get("duration_sec", 0) or 0)
             for asset in assets
@@ -1906,7 +2418,16 @@ class AIDirector:
                 "mood": item.get("mood", ""),
                 "tags": item.get("tags", []),
                 "tempo_bpm": item.get("tempo_bpm", 0),
+                "duration_sec": item.get("duration_sec", 0),
+                "key": item.get("key", ""),
+                "mode": item.get("mode", ""),
+                "integrated_lufs": item.get("integrated_lufs"),
+                "dynamic_range_db": item.get("dynamic_range_db"),
+                "strong_beats_sec": (item.get("strong_beats_sec") or [])[:80],
+                "downbeats_sec": (item.get("downbeats_sec") or [])[:60],
+                "sections": (item.get("sections") or [])[:12],
                 "license": item.get("license", ""),
+                "source_url": item.get("source_url", ""),
             }
             for item in self._music_analysis.get("tracks", [])
             if isinstance(item, dict)
@@ -1926,9 +2447,16 @@ class AIDirector:
             "for major chapter endings. Keep the sum of selected clip durations "
             f"between {self._active_target_duration_sec * 0.85:.1f} and "
             f"{self._active_target_duration_sec * 1.10:.1f} seconds. Select only "
-            "the strongest minority of candidates; never include everything. For "
-            "music_plan.track_file choose exactly one AVAILABLE MUSIC filename or "
-            "an empty string when no music is supplied. Return JSON only.\n"
+            "the strongest minority of candidates; never include everything. Build "
+            "a deliberate music cue sheet with zero to three cues from AVAILABLE "
+            "MUSIC. Choose exact filenames only. A cue may begin inside a track at a "
+            "musically useful section and must fit both the track and final program. "
+            "Use sections/downbeats/strong beats for openings, changes, and climax "
+            "hits; do not cut every beat. Protect intelligible dialogue with 6-14 dB "
+            "ducking. Use silence_regions for emotional breathing room and meaningful "
+            "speech. Different tracks must serve distinct story beats, not add random "
+            "variety. The CPU conformer will render your exact cue sheet into one "
+            "music_bed.wav. Return JSON only.\n"
             f"Required JSON schema: {json.dumps(SEQUENCE_SCHEMA, ensure_ascii=False)}\n"
             f"DIRECTOR TREATMENT:\n{json.dumps(treatment, ensure_ascii=False)}\n"
             f"AVAILABLE MUSIC:\n{json.dumps(music_choices, ensure_ascii=False)}\n"
@@ -2701,10 +3229,18 @@ class AIDirector:
             "camera_profile": self.camera_profile,
             "music_folder": str(self.music_folder or ""),
             "music_analysis": str(self.music_analysis_path or ""),
+            "treatment_file": str(self.treatment_path or ""),
         }
         digest.update(
             json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8")
         )
+        if self.treatment_path is not None:
+            try:
+                digest.update(self.treatment_path.read_bytes())
+            except OSError as exc:
+                raise DirectorError(
+                    f"无法读取导演初审以创建检查点 / Cannot fingerprint treatment: {exc}"
+                ) from exc
         return digest.hexdigest()
 
     @staticmethod
@@ -2789,7 +3325,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Generate chunked local-AI edit decisions. / 生成分块本地 AI 剪辑决策。"
     )
     parser.add_argument("--raw-data", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output", default="")
     parser.add_argument("--model", required=True)
     parser.add_argument(
         "--text-model",
@@ -2822,6 +3358,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--music-folder")
     parser.add_argument("--music-analysis")
     parser.add_argument(
+        "--treatment-file",
+        help="第一次导演初审 JSON；提供后最终导演不会重复初审 / first-pass treatment JSON",
+    )
+    parser.add_argument(
+        "--treatment-only",
+        action="store_true",
+        help="仅执行第一次多模态导演初审 / run only the first multimodal director pass",
+    )
+    parser.add_argument("--treatment-output")
+    parser.add_argument("--music-brief-output")
+    parser.add_argument(
         "--revalidate-existing",
         action="store_true",
         help="不调用 Ollama，仅重新应用本地守门 / reapply local gates without Ollama",
@@ -2853,9 +3400,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             camera_profile=args.camera_profile,
             music_folder=args.music_folder,
             music_analysis=args.music_analysis,
+            treatment_file=args.treatment_file,
             logger=logger,
         )
-        if args.revalidate_existing:
+        if args.treatment_only:
+            if not args.treatment_output or not args.music_brief_output:
+                raise DirectorError(
+                    "--treatment-only 需要 --treatment-output 和 --music-brief-output"
+                    " / treatment-only requires both output paths."
+                )
+            director.run_treatment_only(
+                args.raw_data, args.treatment_output, args.music_brief_output
+            )
+        elif not args.output:
+            raise DirectorError("缺少 --output / --output is required for the final director pass.")
+        elif args.revalidate_existing:
             director.revalidate_existing_plan(args.raw_data, args.output)
         else:
             director.run(args.raw_data, args.output, args.proxy_file_name)

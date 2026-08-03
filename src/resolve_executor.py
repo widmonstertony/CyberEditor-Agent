@@ -1008,15 +1008,16 @@ class DaVinciExecutor:
         prepared: Sequence[Tuple[ClipDecision, Dict[str, Any]]],
     ) -> Sequence[Any]:
         """
-        Loop the AI-selected local music file on audio track 2.
-        将 AI 从本地曲库选中的配乐循环追加到音轨 2。
+        Import the pre-conformed music bed, with a legacy single-track fallback.
+        导入已预合成的音乐床，并兼容旧版单曲循环计划。
 
         Parameters / 参数:
             fps: Active Resolve timeline frame rate. / 当前 Resolve 时间线帧率。
             prepared: Validated picture edits used to calculate program length.
                 用于计算成片长度的已校验画面剪辑。
         """
-        music_text = str(self.music_plan.get("file_name") or "").strip()
+        bed_text = str(self.music_plan.get("bed_file") or "").strip()
+        music_text = bed_text or str(self.music_plan.get("file_name") or "").strip()
         if not music_text:
             self.logger.info(
                 "未提供本地授权配乐库；本次不添加音乐 / No local licensed music selected"
@@ -1057,6 +1058,12 @@ class DaVinciExecutor:
             1,
             int((Decimal(str(music_seconds)) * fps).to_integral_value(rounding=ROUND_CEILING)),
         )
+        if bed_text:
+            if music_frames + 1 < program_frames:
+                raise ResolveExecutorError(
+                    "预合成音乐床短于最终时间线 / Pre-conformed music bed is shorter than the program."
+                )
+            music_frames = program_frames
         try:
             audio_tracks = int(self.timeline.GetTrackCount("audio") or 0)
         except Exception:
@@ -1094,27 +1101,33 @@ class DaVinciExecutor:
                 )
             appended.extend(items)
             cursor += segment_frames
-        level = max(
-            Decimal("-36"),
-            min(
-                Decimal("-6"),
-                self._decimal(
-                    self.music_plan.get("target_level_db", -20),
-                    "music_plan.target_level_db",
+        if bed_text:
+            self.logger.info(
+                "已导入预合成音乐床：%s（音轨 2）/ Pre-conformed music bed added on track 2",
+                path.name,
+            )
+        else:
+            level = max(
+                Decimal("-36"),
+                min(
+                    Decimal("-6"),
+                    self._decimal(
+                        self.music_plan.get("target_level_db", -20),
+                        "music_plan.target_level_db",
+                    ),
                 ),
-            ),
-        )
-        for timeline_item in appended:
-            setter = getattr(timeline_item, "SetProperty", None)
-            if callable(setter):
-                try:
-                    setter("Volume", float(level))
-                except Exception:
-                    pass
-        self.logger.info(
-            "已添加配乐：%s（音轨 2，%.1f dB）/ Music added on track 2",
-            path.name, float(level),
-        )
+            )
+            for timeline_item in appended:
+                setter = getattr(timeline_item, "SetProperty", None)
+                if callable(setter):
+                    try:
+                        setter("Volume", float(level))
+                    except Exception:
+                        pass
+            self.logger.info(
+                "已添加旧版循环配乐：%s（音轨 2，%.1f dB）/ Legacy music added on track 2",
+                path.name, float(level),
+            )
         return appended
 
     @staticmethod

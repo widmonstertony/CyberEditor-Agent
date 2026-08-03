@@ -123,6 +123,27 @@ class WorkflowOptionsTests(unittest.TestCase):
             self.assertIn("--camera-profile", command)
             self.assertIn("--music-folder", command)
 
+    def test_online_music_requires_consent_and_forwards_audit_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "source.mp4"
+            video.touch()
+            blocked = WorkflowOptions(video=str(video), music_provider="yt_dlp")
+            with self.assertRaisesRegex(ValueError, "确认|confirmation"):
+                blocked.build_command("python.exe", root)
+
+            allowed = WorkflowOptions(
+                video=str(video),
+                music_provider="yt_dlp",
+                music_rights_confirmed=True,
+                music_rights_claim="I hold the required rights.",
+            )
+            command = allowed.build_command("python.exe", root)
+
+            self.assertIn("--music-provider", command)
+            self.assertIn("--music-rights-confirmed", command)
+            self.assertIn("I hold the required rights.", command)
+
     def test_resolve_only_requires_timeline_and_enables_resolve(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
