@@ -114,6 +114,36 @@ class VisionSession(FakeSession):
         )
 
 
+class EmptyThinkingSession(FakeSession):
+    """Return an exhausted thinking-only response before valid direct JSON."""
+
+    def post(self, url, json=None, timeout=None):
+        self.posts.append(json)
+        if json.get("keep_alive") == 0:
+            return FakeResponse({"done": True, "response": ""})
+        generation_posts = [
+            item for item in self.posts if item.get("keep_alive") != 0
+        ]
+        if len(generation_posts) == 1:
+            return FakeResponse(
+                {
+                    "done": True,
+                    "done_reason": "length",
+                    "prompt_eval_count": 4000,
+                    "eval_count": 2048,
+                    "thinking": "internal reasoning",
+                    "response": "",
+                }
+            )
+        return FakeResponse(
+            {
+                "done": True,
+                "done_reason": "stop",
+                "response": __import__("json").dumps({"decisions": []}),
+            }
+        )
+
+
 class AIDirectorTests(unittest.TestCase):
     """Test deterministic behavior without a live Ollama server."""
 
@@ -183,6 +213,67 @@ class AIDirectorTests(unittest.TestCase):
             '```json\n{"decisions": []}\n```'
         )
         self.assertEqual(parsed, {"decisions": []})
+
+    def test_empty_thinking_response_retries_without_qwen_thinking(self):
+        session = EmptyThinkingSession()
+        director = self.make_director(
+            model="qwen3.5:35b-a3b", session=session
+        )
+
+        result = director._request_json(
+            "Return an empty decisions array.",
+            {
+                "type": "object",
+                "properties": {"decisions": {"type": "array"}},
+                "required": ["decisions"],
+            },
+        )
+
+        self.assertEqual(result, {"decisions": []})
+        generation_posts = [
+            item for item in session.posts if item.get("keep_alive") != 0
+        ]
+        self.assertEqual(len(generation_posts), 2)
+        self.assertIs(generation_posts[0]["think"], True)
+        self.assertIs(generation_posts[1]["think"], False)
+        self.assertEqual(
+            generation_posts[0]["options"]["num_predict"], 2048
+        )
+
+    def test_director_checkpoint_round_trip_and_fingerprint_guard(self):
+        director = self.make_director()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw_path = root / "raw_data.json"
+            checkpoint_path = root / "timeline.director-checkpoint.json"
+            raw_path.write_text('{"assets": []}', encoding="utf-8")
+            fingerprint = director._checkpoint_fingerprint(raw_path)
+            completed = {
+                "asset-1|0.000000|10.000000|source.mp4": [
+                    {
+                        "file_name": "source.mp4",
+                        "cut_in_sec": 1.0,
+                        "cut_out_sec": 2.0,
+                    }
+                ]
+            }
+
+            director._write_director_checkpoint(
+                checkpoint_path, fingerprint, completed
+            )
+
+            self.assertEqual(
+                director._load_director_checkpoint(
+                    checkpoint_path, fingerprint
+                ),
+                completed,
+            )
+            self.assertEqual(
+                director._load_director_checkpoint(
+                    checkpoint_path, "different-input"
+                ),
+                {},
+            )
 
     def test_chunk_minutes_constraint(self):
         with self.assertRaises(DirectorError):

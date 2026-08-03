@@ -16,6 +16,7 @@ import argparse
 import base64
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import logging
 import os
@@ -26,6 +27,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 
 LOGGER_NAME = "cybereditor.director"
+DIRECTOR_CHECKPOINT_VERSION = 1
+DIRECTOR_PROMPT_VERSION = "2026-08-02.1"
 
 DECISION_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -462,6 +465,20 @@ class AIDirector:
                 ).name
                 chunks.append(chunk)
 
+        checkpoint_path = destination.with_name(
+            destination.stem + ".director-checkpoint.json"
+        )
+        checkpoint_fingerprint = self._checkpoint_fingerprint(raw_path)
+        completed_chunks = self._load_director_checkpoint(
+            checkpoint_path, checkpoint_fingerprint
+        )
+        if completed_chunks:
+            self.logger.info(
+                "已恢复 %d 个导演分块检查点；不会重复分析 / Resuming %d completed director chunks",
+                len(completed_chunks),
+                len(completed_chunks),
+            )
+
         self.logger.info(
             "多素材视觉导演：%d 个视频，%d 个分块 / Multi-asset visual director: %d videos, %d chunks",
             len(assets),
@@ -473,6 +490,20 @@ class AIDirector:
         try:
             self.check_ollama(require_vision=True)
             for index, chunk in enumerate(chunks, start=1):
+                chunk_key = self._director_chunk_key(chunk)
+                cached_decisions = completed_chunks.get(chunk_key)
+                if isinstance(cached_decisions, list):
+                    self.logger.info(
+                        "复用视觉分析 %d/%d：%s / Reusing visual analysis %d/%d: %s",
+                        index,
+                        len(chunks),
+                        chunk["asset_label"],
+                        index,
+                        len(chunks),
+                        chunk["asset_label"],
+                    )
+                    candidates.extend(dict(item) for item in cached_decisions)
+                    continue
                 self.logger.info(
                     "视觉分析 %d/%d：%s %.1fs–%.1fs / Visual analysis %d/%d: %s %.1fs–%.1fs",
                     index,
@@ -500,6 +531,12 @@ class AIDirector:
                 for decision in decisions:
                     decision["asset_id"] = str(chunk["asset_id"])
                 candidates.extend(decisions)
+                completed_chunks[chunk_key] = [dict(item) for item in decisions]
+                self._write_director_checkpoint(
+                    checkpoint_path,
+                    checkpoint_fingerprint,
+                    completed_chunks,
+                )
 
             candidates = self.merge_decisions(candidates)
             candidate_limit = max(24, min(160, self.num_ctx // 128))
@@ -536,6 +573,14 @@ class AIDirector:
             "clips": final_clips,
         }
         self._atomic_write_json(output, destination)
+        try:
+            checkpoint_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.logger.warning(
+                "无法删除已完成的导演检查点：%s / Could not remove completed director checkpoint: %s",
+                exc,
+                exc,
+            )
         self.logger.info(
             "全局编排完成：从 %d 个候选中选出 %d 个片段 / Global assembly selected %d of %d candidates",
             len(candidates),
@@ -885,64 +930,99 @@ class AIDirector:
         Send one schema-constrained Ollama request with optional real images.
         发送一次受 Schema 约束、可包含真实图片的 Ollama 请求。
         """
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "system": (
-                "You are a senior documentary editor and visual storyteller. "
-                "Use only supplied transcript, timestamps, and images. Return "
-                "only the requested JSON and never invent content."
-            ),
-            "prompt": prompt,
-            "stream": False,
-            "format": schema,
-            "think": "high",
-            "keep_alive": "10m",
-            "options": {
-                "temperature": 0,
-                "seed": 42,
-                "num_ctx": self.num_ctx,
-            },
-        }
-        if images:
-            payload["images"] = list(images)
+        normalized_model = self.model.casefold()
+        # Ollama accepts low/medium/high only for GPT-OSS. Qwen and other
+        # thinking models use a boolean. Supplying "high" to Qwen can consume
+        # the whole generation budget in the separate `thinking` field and
+        # leave the structured `response` empty.
+        # Ollama 仅允许 GPT-OSS 使用 low/medium/high；Qwen 等模型使用布尔值。
+        # 向 Qwen 发送 "high" 可能让 thinking 耗尽预算，导致 response 为空。
+        quality_think: Any = "high" if "gpt-oss" in normalized_model else True
+        direct_think: Any = "low" if "gpt-oss" in normalized_model else False
+        num_predict = max(1024, min(4096, self.num_ctx // 4))
+        attempts = (
+            ("quality", schema, quality_think),
+            ("direct-json", schema, direct_think),
+            ("compatibility-json", "json", direct_think),
+        )
         url = self.base_url + "/api/generate"
-        try:
-            response = self.session.post(
-                url, json=payload, timeout=(10, self.timeout_sec)
-            )
-            if getattr(response, "status_code", 0) == 400:
-                self.logger.warning(
-                    "Ollama 拒绝高强度思考参数，使用兼容模式重试 / Retrying without high thinking"
-                )
-                payload.pop("think", None)
+        last_issue = "unknown response"
+        for attempt_index, (label, output_format, think_value) in enumerate(
+            attempts, start=1
+        ):
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "system": (
+                    "You are a senior documentary editor and visual storyteller. "
+                    "Use only supplied transcript, timestamps, and images. Return "
+                    "only the requested JSON and never invent content."
+                ),
+                "prompt": prompt,
+                "stream": False,
+                "format": output_format,
+                "think": think_value,
+                "keep_alive": "10m",
+                "options": {
+                    "temperature": 0,
+                    "seed": 42,
+                    "num_ctx": self.num_ctx,
+                    "num_predict": num_predict,
+                },
+            }
+            if images:
+                payload["images"] = list(images)
+            try:
                 response = self.session.post(
                     url, json=payload, timeout=(10, self.timeout_sec)
                 )
-            # Older Ollama builds accept "json" but not a schema object.
-            if getattr(response, "status_code", 0) == 400:
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                if status_code in {400, 422} and attempt_index < len(attempts):
+                    last_issue = f"HTTP {status_code} ({label})"
+                    self.logger.warning(
+                        "Ollama 拒绝 %s 请求（HTTP %d），切换兼容模式 / "
+                        "Ollama rejected %s request (HTTP %d); retrying compatibly",
+                        label,
+                        status_code,
+                        label,
+                        status_code,
+                    )
+                    continue
+                response.raise_for_status()
+                envelope = response.json()
+            except Exception as exc:
+                raise DirectorError(
+                    f"Ollama 分块请求失败 / Ollama chunk request failed: {exc}"
+                ) from exc
+
+            if not isinstance(envelope, dict) or not envelope.get("done", False):
+                last_issue = "incomplete response"
+            else:
+                generated = envelope.get("response")
+                if isinstance(generated, str) and generated.strip():
+                    try:
+                        return self.parse_generated_json(generated)
+                    except DirectorError as exc:
+                        last_issue = str(exc)
+                else:
+                    last_issue = "empty response"
+
+            if attempt_index < len(attempts):
                 self.logger.warning(
-                    "Ollama 拒绝 JSON Schema，回退到 format=json / Falling back to format=json"
+                    "Ollama 未返回可用 JSON（模式=%s, done_reason=%s, prompt_tokens=%s, output_tokens=%s, "
+                    "thinking_chars=%d）；关闭显式思考并重试 / Ollama returned no usable JSON; retrying without explicit thinking",
+                    label,
+                    envelope.get("done_reason") if isinstance(envelope, dict) else None,
+                    envelope.get("prompt_eval_count") if isinstance(envelope, dict) else None,
+                    envelope.get("eval_count") if isinstance(envelope, dict) else None,
+                    len(str(envelope.get("thinking") or "")) if isinstance(envelope, dict) else 0,
                 )
-                payload["format"] = "json"
-                response = self.session.post(
-                    url, json=payload, timeout=(10, self.timeout_sec)
-                )
-            response.raise_for_status()
-            envelope = response.json()
-        except Exception as exc:
-            raise DirectorError(
-                f"Ollama 分块请求失败 / Ollama chunk request failed: {exc}"
-            ) from exc
-        if not isinstance(envelope, dict) or not envelope.get("done", False):
-            raise DirectorError(
-                "Ollama 返回未完成响应 / Ollama returned an incomplete response."
-            )
-        generated = envelope.get("response")
-        if not isinstance(generated, str) or not generated.strip():
-            raise DirectorError(
-                "Ollama response 字段为空 / Ollama response field is empty."
-            )
-        return self.parse_generated_json(generated)
+
+        raise DirectorError(
+            "Ollama 连续三次未返回可解析的结构化 JSON"
+            f"（最后错误：{last_issue}）。请将上下文提高到 16384 后重试。 / "
+            "Ollama failed to return parseable structured JSON after three attempts "
+            f"(last issue: {last_issue}). Retry with num_ctx=16384."
+        )
 
     def build_prompt(
         self,
@@ -1568,6 +1648,89 @@ class AIDirector:
             raise DirectorError(
                 f"无法写入输出 JSON / Cannot write output JSON: {exc}"
             ) from exc
+
+    def _checkpoint_fingerprint(self, raw_path: Path) -> str:
+        """Hash inputs that affect director decisions. / 哈希会影响导演决策的输入。"""
+        digest = hashlib.sha256()
+        try:
+            with raw_path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+        except OSError as exc:
+            raise DirectorError(
+                f"无法读取导演输入以创建检查点 / Cannot fingerprint director input: {exc}"
+            ) from exc
+        settings = {
+            "model": self.model,
+            "chunk_duration_sec": self.chunk_duration_sec,
+            "num_ctx": self.num_ctx,
+            "prompt_version": DIRECTOR_PROMPT_VERSION,
+        }
+        digest.update(
+            json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        )
+        return digest.hexdigest()
+
+    @staticmethod
+    def _director_chunk_key(chunk: Dict[str, Any]) -> str:
+        """Build a deterministic checkpoint key for one chunk. / 为单个分块生成确定性检查点键。"""
+        return "{}|{:.6f}|{:.6f}|{}".format(
+            str(chunk.get("asset_id") or ""),
+            float(chunk.get("start_sec") or 0.0),
+            float(chunk.get("end_sec") or 0.0),
+            str(chunk.get("source_name") or ""),
+        )
+
+    def _load_director_checkpoint(
+        self, path: Path, fingerprint: str
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Load a matching partial director result. / 读取匹配的导演阶段部分结果。"""
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.logger.warning(
+                "忽略损坏的导演检查点：%s / Ignoring corrupt director checkpoint: %s",
+                exc,
+                exc,
+            )
+            return {}
+        if (
+            not isinstance(payload, dict)
+            or payload.get("checkpoint_version") != DIRECTOR_CHECKPOINT_VERSION
+            or payload.get("fingerprint") != fingerprint
+            or not isinstance(payload.get("completed_chunks"), dict)
+        ):
+            self.logger.info(
+                "现有导演检查点与当前素材或设置不匹配，重新分析 / "
+                "Director checkpoint does not match current inputs; starting fresh"
+            )
+            return {}
+        completed: Dict[str, List[Dict[str, Any]]] = {}
+        for key, decisions in payload["completed_chunks"].items():
+            if isinstance(key, str) and isinstance(decisions, list) and all(
+                isinstance(item, dict) for item in decisions
+            ):
+                completed[key] = [dict(item) for item in decisions]
+        return completed
+
+    def _write_director_checkpoint(
+        self,
+        path: Path,
+        fingerprint: str,
+        completed_chunks: Dict[str, List[Dict[str, Any]]],
+    ) -> None:
+        """Atomically save completed visual chunks. / 原子保存已完成的视觉分块。"""
+        self._atomic_write_json(
+            {
+                "checkpoint_version": DIRECTOR_CHECKPOINT_VERSION,
+                "fingerprint": fingerprint,
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "completed_chunks": completed_chunks,
+            },
+            path,
+        )
 
 
 def configure_logging(level: str = "INFO") -> logging.Logger:

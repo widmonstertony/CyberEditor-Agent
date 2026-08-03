@@ -164,6 +164,24 @@ class WorkflowOptionsTests(unittest.TestCase):
         self.assertEqual(recommendation["num_ctx"], 16384)
         self.assertEqual(recommendation["ollama_model"], "qwen:32b")
 
+    def test_nominal_64_gib_windows_machine_gets_16k_context(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {
+                "ram_gb": 63.8,
+                "vram_gb": 16,
+                "cpu_threads": 16,
+                "torch_cuda": True,
+            },
+            [
+                {
+                    "name": "qwen3.5:35b-a3b",
+                    "size": 23 * 1024**3,
+                }
+            ],
+        )
+        self.assertEqual(recommendation["profile"], "performance")
+        self.assertEqual(recommendation["num_ctx"], 16384)
+
     def test_auto_profile_prefers_editing_quality_over_file_size(self) -> None:
         recommendation = recommend_automatic_settings(
             {

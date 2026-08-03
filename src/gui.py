@@ -461,7 +461,11 @@ def recommend_automatic_settings(
     else:
         whisper_model = "base"
 
-    if ram_gb >= 64:
+    # Windows commonly reports a nominal 64 GiB machine as ~63.8 GiB.
+    # Treat 60+ GiB as the 64 GiB class instead of accidentally dropping it
+    # to the 8K balanced profile.
+    # Windows 常把标称 64 GiB 显示为约 63.8 GiB；60 GiB 以上按 64 GiB 档处理。
+    if ram_gb >= 60:
         # Shorter chunks preserve local narrative detail.  More model calls are
         # slower but produce better edit decisions for hour-long footage.
         # 更短的分块能保留局部叙事细节；调用次数更多但长视频剪辑决策更细致。
