@@ -11,9 +11,15 @@ PowerShell 中运行：
 .\.venv\Scripts\python.exe gui.py
 ```
 
-桌面界面提供素材选择、Whisper/Ollama 参数、断点续跑模式、Resolve 开关、实时日志、
-阶段进度、停止任务和打开输出目录等功能。现代界面使用轻量级 CustomTkinter，并通过
+桌面界面可一次多选任意数量的视频，或递归读取一个素材文件夹；还提供 Whisper/Ollama
+参数、断点续跑模式、Resolve 开关、可观看预览、实时日志、阶段进度、停止任务和打开
+输出目录等功能。现代界面使用轻量级 CustomTkinter，并通过
 子进程调用原有 `main.py`；常驻 UI 不导入 PyTorch，不会改变严格串行与显存释放策略。
+
+完整流程不是把所有视频简单首尾相接。每个素材会被依次转写并抽取时间分布均匀的真实
+画面；视觉模型对每个 10–15 分钟窗口结合画面和台词挑选候选片段，第二遍全局导演再从
+全部素材的候选中决定使用哪些、如何跨文件排序，以及硬切/叠化/淡黑、音频降噪、基础
+色彩风格和轻微推镜。最终同时输出 Resolve 可编辑时间线与 FFmpeg 1080p 可观看预览。
 
 “性能配置”默认使用 `自动检测 / Auto`：界面以标准库读取 CPU、系统内存和 GPU，
 通过 `nvidia-smi`（可用时）读取准确显存，并在一次性子进程中确认当前 PyTorch 是否
@@ -25,7 +31,7 @@ GB 的模型，也不会让硬件性能档修改素材属性。16GB VRAM + 64GB 
 
 UI 启动时会检测本机 Ollama；若已安装但服务未运行，会自动启动后台 API，但不会
 加载模型或占用模型显存。Resolve 支持 C/D/其他盘的自定义安装位置，只在严格串行
-流程进入第 3 阶段后自动启动并等待脚本 API，因此不会提前与 Whisper/Ollama 抢显存。
+流程进入最后的 Resolve 阶段后自动启动并等待脚本 API，因此不会提前与 Whisper/Ollama 抢显存。
 
 “工程 FPS”默认是**自动读取源素材**，不是固定 25。选择原片后，界面使用短生命周期
 `ffprobe` 进程读取 `avg_frame_rate` / `r_frame_rate`，并支持 23.976、29.97、59.94
@@ -61,9 +67,9 @@ UI 启动时会检测本机 Ollama；若已安装但服务未运行，会自动�
 
 完全本地、隐私优先、面向 Windows 的 AI 长视频自动剪辑 MVP。
 
-CyberEditor-Agent 使用 Whisper 提取带时间戳台词，以 OpenCV 生成轻量场景打点，
-让本地 Ollama 模型分块做导演决策，最后调用 DaVinci Resolve Python API 将
-1080p 代理素材自动组装到时间线。
+CyberEditor-Agent 使用 Whisper 提取带时间戳台词，以 OpenCV 抽取真实视觉帧，
+让支持视觉的本地 Ollama 模型先分块审片、再跨素材全局编排，最后生成可直接观看的
+MP4，并调用 DaVinci Resolve Python API 组装可继续精修的时间线。
 
 > 项目状态：可运行 MVP。首次用于正式工程前，请用素材副本验证时间码、代理链接
 > 和 Resolve 版本兼容性。本项目与 OpenAI、Ollama、Blackmagic Design 无隶属关系。
@@ -79,6 +85,9 @@ Whisper + OpenCV 子进程
           ▼
 Ollama 分块导演子进程
           │ keep_alive=0 + 父进程二次卸载
+          ▼
+FFmpeg 预览渲染子进程
+          │ 生成真实转场、降噪与基础运动效果
           ▼
 DaVinci Resolve 执行子进程
 ```
@@ -114,10 +123,12 @@ CyberEditor-Agent/
 │  ├─ gui.py                     # 无额外 UI 依赖的后备控制器与公共检测逻辑
 │  ├─ modern_gui.py              # Windows 11 / 4K / 中英文现代界面
 │  ├─ runtime_services.py        # 跨盘软件发现与 Ollama/Resolve 自动启动
+│  ├─ media_manifest.py          # 多视频/文件夹发现、去重与代理映射
 │  ├─ ui_i18n.py                 # 不依赖 GUI 包的中英文文案
 │  ├─ extractor.py               # Whisper + OpenCV 数据提取
-│  ├─ director.py                # Ollama 分块导演
-│  └─ resolve_executor.py        # DaVinci Resolve 自动组装
+│  ├─ director.py                # 多模态分块审片 + 跨素材全局导演
+│  ├─ review_renderer.py         # FFmpeg 可观看预览与效果渲染
+│  └─ resolve_executor.py        # DaVinci Resolve 自动组装与效果映射
 ├─ data/
 │  ├─ .gitkeep
 │  └─ keyframes/.gitkeep
@@ -240,10 +251,12 @@ setx OLLAMA_MAX_LOADED_MODELS 1
 setx OLLAMA_NUM_PARALLEL 1
 ```
 
-### 4. 准备代理
+### 4. 代理（可选）
 
-在 Resolve 中为长视频生成 1080p 代理，或自行用 FFmpeg 生成。确保代理与源素材
-起始时间和持续时间一致。导演 JSON 使用秒，执行层按 Resolve 当前工程 FPS 转为帧。
+不准备代理也可以直接使用原片。长视频或 4K 10-bit 素材建议在 Resolve 或 FFmpeg 中
+生成 1080p 代理，并确保代理与源素材起始时间和持续时间一致。导演 JSON 使用秒；
+Resolve 执行层会优先读取每个媒体池片段自己的原生 FPS 进行源帧换算，而不是假设所有
+素材都等于工程 FPS。
 
 ## 一键运行
 
@@ -253,20 +266,30 @@ Studio 的 External Scripting 仍需预先设置一次为 `Local`。
 
 ```powershell
 python main.py `
-  --video "D:\Documentary\source.mov" `
-  --proxy "D:\Documentary\proxy\source_1080p.mp4" `
+  --input-folder "D:\Documentary\Camera originals" `
   --ollama-model "qwen3.5:35b-a3b" `
-  --project-fps 25 `
+  --project-fps 23.976 `
   --chunk-minutes 10
+```
+
+也可以按选择顺序重复传入 `--video`；文件夹与显式文件可以同时使用，重复项会去除：
+
+```powershell
+python main.py `
+  --video "D:\Shoot\A001.mp4" `
+  --video "D:\Shoot\B001.mp4" `
+  --input-folder "D:\Shoot\B-roll" `
+  --ollama-model "qwen3.5:35b-a3b"
 ```
 
 默认输出：
 
 ```text
 data/raw_data.json
-data/transcript.srt
-data/keyframes/*.jpg
+data/assets/<asset_id>/transcript.srt
+data/assets/<asset_id>/keyframes/*.jpg
 data/timeline_cuts.json
+data/review/CyberEditor_preview.mp4
 data/cybereditor.log
 ```
 
@@ -293,6 +316,7 @@ python main.py --video "D:\source.mov" --skip-resolve
 ```powershell
 python -m src.extractor --help
 python -m src.director --help
+python -m src.review_renderer --help
 python -m src.resolve_executor --help
 ```
 
@@ -318,25 +342,34 @@ from src.resolve_executor import DaVinciExecutor
       "cut_in_sec": 12.5,
       "cut_out_sec": 18.2,
       "reason_for_cut": "完整表达主题观点",
-      "confidence": 0.9
+      "confidence": 0.9,
+      "story_role": "interview",
+      "transition_to_next": "cross_dissolve",
+      "transition_duration_sec": 0.5,
+      "audio_cleanup": "strong",
+      "color_look": "warm",
+      "motion": "gentle_push_in"
     }
   ]
 }
 ```
 
-`cut_in_sec` 为包含式入点，`cut_out_sec` 为不包含式出点。Resolve 执行层将入点
-向下取整，将出点向上取整后减一，以适配包含式 `endFrame`。
+`cut_in_sec` 为包含式入点，`cut_out_sec` 为不包含式出点。Resolve 执行层按每个源片段
+的原生 FPS 将入点向下取整、出点向上取整后减一，以适配包含式 `endFrame`。
 
 ## 鲁棒性边界
 
-- 代理素材帧率最好与工程帧率一致。当前 MVP 按需求使用 Resolve 工程 FPS 换算
-  JSON 秒数；混合原生帧率素材应先统一代理。
+- 视觉模型不会解码每一帧 4K 像素；提取层遍历所有视频并保存时间分布与场景变化兼顾
+  的代表帧，再由模型逐窗口审阅。这样才能在长片规模和本地内存限制之间取得平衡。
+- Resolve 公共脚本 API 没有稳定的通用转场插入方法。FFmpeg 预览会真正执行 AI 选择
+  的转场/降噪/运动效果；Resolve 时间线应用 Voice Isolation、CDL、缩放等受支持效果，
+  并用片段标记保留完整效果计划，供后续人工精修。
 - 脚本会复用当前 Resolve 时间线；如果没有当前时间线，才创建
   `CyberEditor Timeline`。
 - 如果中途某个 Resolve 片段追加失败，API 没有可靠事务回滚；日志会指出已追加
   数量，用户需要检查时间线并撤销。
-- 场景打点是轻量灰度帧差，不是语义视觉理解。后续可在 extractor 子进程中替换
-  为视觉模型，但必须继续遵守进程退出屏障。
+- 视觉理解由支持图片输入的 Ollama 模型完成。普通 `qwen2.5:3b` 是纯文本烟雾测试
+  模型，不能用于此多模态流程；推荐 Qwen 3.5 或其他 Ollama 报告 `vision` 能力的模型。
 
 ## 测试
 

@@ -25,7 +25,7 @@ import shutil
 import subprocess
 import sys
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
@@ -40,6 +40,7 @@ from .runtime_services import (
     find_ollama_executables,
     find_resolve_executable,
 )
+from .media_manifest import MediaManifestError, discover_video_files
 
 try:
     import winreg
@@ -677,6 +678,9 @@ class WorkflowOptions:
 
     video: str = ""
     proxy: str = ""
+    videos: List[str] = field(default_factory=list)
+    input_folder: str = ""
+    proxy_folder: str = ""
     data_dir: str = "data/ui-run"
     flow: str = "full"
     hardware_profile: str = "auto"
@@ -695,6 +699,7 @@ class WorkflowOptions:
     project_name: str = "CyberEditor Project"
     skip_resolve: bool = True
     strict_fps: bool = False
+    render_preview: bool = True
 
     def validate(self, project_root: Path) -> None:
         """
@@ -710,10 +715,22 @@ class WorkflowOptions:
             raise ValueError("未知工作流模式 / Unknown workflow mode.")
         data_path = _absolute_path(self.data_dir, project_root)
         if self.flow == "full":
-            if not self.video:
+            if not (self.videos or self.video or self.input_folder):
                 raise ValueError("请选择源视频 / Please select a source video.")
-            if not _absolute_path(self.video, project_root).is_file():
+            if self.video and not _absolute_path(self.video, project_root).is_file():
                 raise ValueError(f"源视频不存在 / Source video not found:\n{self.video}")
+            explicit = self.videos or ([self.video] if self.video else [])
+            try:
+                discover_video_files(
+                    [_absolute_path(value, project_root) for value in explicit],
+                    (
+                        _absolute_path(self.input_folder, project_root)
+                        if self.input_folder
+                        else None
+                    ),
+                )
+            except MediaManifestError as exc:
+                raise ValueError(str(exc)) from exc
         elif self.flow == "director":
             raw_data = data_path / "raw_data.json"
             if not raw_data.is_file():
@@ -736,6 +753,13 @@ class WorkflowOptions:
 
         if self.proxy and not _absolute_path(self.proxy, project_root).is_file():
             raise ValueError(f"代理素材不存在 / Proxy not found:\n{self.proxy}")
+        if self.proxy_folder and not _absolute_path(
+            self.proxy_folder, project_root
+        ).is_dir():
+            raise ValueError(
+                "代理素材文件夹不存在 / Proxy folder not found:\n"
+                f"{self.proxy_folder}"
+            )
         if self.flow != "resolve" and not self.ollama_model.strip():
             raise ValueError("请选择 Ollama 模型 / Please select an Ollama model.")
         if not 10.0 <= float(self.chunk_minutes) <= 15.0:
@@ -787,13 +811,28 @@ class WorkflowOptions:
             "--log-level",
             "INFO",
         ]
-        if self.video:
+        explicit_videos = self.videos or ([self.video] if self.video else [])
+        for video in explicit_videos:
             command.extend(
-                ["--video", str(_absolute_path(self.video, project_root))]
+                ["--video", str(_absolute_path(video, project_root))]
+            )
+        if self.input_folder:
+            command.extend(
+                [
+                    "--input-folder",
+                    str(_absolute_path(self.input_folder, project_root)),
+                ]
             )
         if self.proxy:
             command.extend(
                 ["--proxy", str(_absolute_path(self.proxy, project_root))]
+            )
+        if self.proxy_folder:
+            command.extend(
+                [
+                    "--proxy-folder",
+                    str(_absolute_path(self.proxy_folder, project_root)),
+                ]
             )
         if self.language.strip():
             command.extend(["--language", self.language.strip()])
@@ -803,6 +842,8 @@ class WorkflowOptions:
             command.append("--skip-director")
         if self.skip_resolve:
             command.append("--skip-resolve")
+        if not self.render_preview:
+            command.append("--skip-preview")
         if self.strict_fps:
             command.append("--strict-fps")
         return command
@@ -989,7 +1030,9 @@ class CyberEditorApp:
 
     def _create_variables(self) -> None:
         """Create Tk variables with practical defaults. / 创建带有实用默认值的 Tk 变量。"""
+        self.selected_videos: List[str] = []
         self.video_var = tk.StringVar()
+        self.input_folder_var = tk.StringVar()
         self.proxy_var = tk.StringVar()
         self.data_var = tk.StringVar(value="data/ui-run")
         self.flow_var = tk.StringVar(value=FLOW_NAMES["full"])
@@ -1005,7 +1048,7 @@ class CyberEditorApp:
         self.ctx_var = tk.IntVar(value=8192)
         self.timeline_var = tk.StringVar(value="CyberEditor Timeline")
         self.project_var = tk.StringVar(value="CyberEditor Project")
-        self.skip_resolve_var = tk.BooleanVar(value=True)
+        self.skip_resolve_var = tk.BooleanVar(value=False)
         self.strict_fps_var = tk.BooleanVar(value=False)
         self.stage_var = tk.StringVar(value="准备就绪 / Ready")
         self.hardware_summary_var = tk.StringVar(
@@ -1134,10 +1177,12 @@ class CyberEditorApp:
         paths.grid(row=2, column=0, sticky="ew")
         paths.columnconfigure(1, weight=1)
         self._path_row(
-            paths, 0, "源视频 / Source", self.video_var, self._choose_video, "选择"
+            paths, 0, "视频素材（可多选）/ Sources", self.video_var,
+            self._choose_video, "选择"
         )
         self._path_row(
-            paths, 1, "代理素材 / Proxy", self.proxy_var, self._choose_proxy, "选择"
+            paths, 1, "或选择素材文件夹 / Folder", self.input_folder_var,
+            self._choose_input_folder, "目录"
         )
         self._path_row(
             paths, 2, "运行数据 / Data", self.data_var, self._choose_data_dir, "目录"
@@ -1438,17 +1483,29 @@ class CyberEditorApp:
 
     def _choose_video(self) -> None:
         """Select a source media file. / 选择源媒体文件。"""
-        path = filedialog.askopenfilename(
+        paths = filedialog.askopenfilenames(
             title="选择源视频 / Select source video",
             filetypes=[
                 ("Video", "*.mp4 *.mov *.mkv *.avi *.mxf *.mts *.m2ts"),
                 ("All files", "*.*"),
             ],
         )
+        if paths:
+            self.selected_videos = list(paths)
+            self.input_folder_var.set("")
+            self.video_var.set(
+                paths[0] if len(paths) == 1 else f"已选择 {len(paths)} 个视频"
+            )
+
+    def _choose_input_folder(self) -> None:
+        """Select a folder containing source videos. / 选择源视频文件夹。"""
+        path = filedialog.askdirectory(
+            title="选择素材文件夹 / Select media folder"
+        )
         if path:
-            self.video_var.set(path)
-            if not self.proxy_var.get().strip():
-                self.proxy_var.set(path)
+            self.selected_videos = []
+            self.video_var.set("")
+            self.input_folder_var.set(path)
 
     def _choose_proxy(self) -> None:
         """Select a proxy media file. / 选择代理媒体文件。"""
@@ -1475,8 +1532,10 @@ class CyberEditorApp:
         """Read and normalize current UI values. / 读取并规范化当前界面值。"""
         project_fps = parse_frame_rate(self.fps_var.get())
         return WorkflowOptions(
-            video=self.video_var.get().strip(),
+            video=(self.selected_videos[0] if self.selected_videos else ""),
             proxy=self.proxy_var.get().strip(),
+            videos=list(self.selected_videos),
+            input_folder=self.input_folder_var.get().strip(),
             data_dir=self.data_var.get().strip() or "data/ui-run",
             flow=FLOW_LABELS.get(self.flow_var.get(), "full"),
             hardware_profile=PROFILE_LABELS.get(
@@ -1897,13 +1956,16 @@ class CyberEditorApp:
         if "Starting stage:" in line:
             if "Extract" in line:
                 self.progress_var.set(12)
-                self.stage_var.set("1/3 数据提取 / Extracting")
+                self.stage_var.set("1/4 数据提取 / Extracting")
             elif "Direct" in line:
                 self.progress_var.set(48)
-                self.stage_var.set("2/3 AI 导演 / Directing")
+                self.stage_var.set("2/4 AI 导演 / Directing")
+            elif "Preview render" in line:
+                self.progress_var.set(72)
+                self.stage_var.set("3/4 预览成片 / Preview")
             elif "Resolve" in line:
-                self.progress_var.set(82)
-                self.stage_var.set("3/3 Resolve 组装 / Assembling")
+                self.progress_var.set(90)
+                self.stage_var.set("4/4 Resolve 组装 / Assembling")
         elif "VRAM barrier passed: Whisper/OpenCV" in line:
             self.progress_var.set(42)
             self.stage_var.set("Whisper 已释放 / Whisper released")
@@ -2090,6 +2152,7 @@ class CyberEditorApp:
             return
         mapping = {
             "video": self.video_var,
+            "input_folder": self.input_folder_var,
             "proxy": self.proxy_var,
             "data_dir": self.data_var,
             "whisper_model": self.whisper_var,
@@ -2111,6 +2174,19 @@ class CyberEditorApp:
                     variable.set(data[key])
                 except tk.TclError:
                     pass
+        saved_videos = data.get("videos", [])
+        if isinstance(saved_videos, list):
+            self.selected_videos = [
+                str(value) for value in saved_videos if str(value).strip()
+            ]
+        if not self.selected_videos and str(data.get("video", "")).strip():
+            self.selected_videos = [str(data["video"])]
+        if self.selected_videos:
+            self.video_var.set(
+                self.selected_videos[0]
+                if len(self.selected_videos) == 1
+                else f"已选择 {len(self.selected_videos)} 个视频"
+            )
         flow = str(data.get("flow", "full"))
         self.flow_var.set(FLOW_NAMES.get(flow, FLOW_NAMES["full"]))
         profile = str(data.get("hardware_profile", "auto"))

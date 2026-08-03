@@ -53,6 +53,7 @@ from .ui_i18n import (
     resolve_language,
     translate,
 )
+from .media_manifest import MediaManifestError, discover_video_files
 
 
 APP_TITLE = "CyberEditor Agent"
@@ -465,8 +466,25 @@ class ModernCyberEditorApp:
     def _create_variables(self) -> None:
         """Create canonical Tk variables from saved settings. / 根据已保存设置创建规范 Tk 变量。"""
         data = self.saved_settings
-        self.video_var = tk.StringVar(value=str(data.get("video", "")))
-        self.proxy_var = tk.StringVar(value=str(data.get("proxy", "")))
+        saved_videos = data.get("videos", [])
+        if isinstance(saved_videos, list):
+            self.selected_videos = [
+                str(value) for value in saved_videos if str(value).strip()
+            ]
+        else:
+            self.selected_videos = []
+        legacy_video = str(data.get("video", "")).strip()
+        if not self.selected_videos and legacy_video:
+            self.selected_videos = [legacy_video]
+        self.video_var = tk.StringVar(value=self._video_selection_summary())
+        self.input_folder_var = tk.StringVar(
+            value=str(data.get("input_folder", ""))
+        )
+        # Proxy mapping remains available in the CLI. The streamlined modern
+        # UI edits originals unless a future dedicated proxy-library panel is
+        # shown; do not retain a hidden stale single-file proxy setting.
+        self.proxy_var = tk.StringVar(value="")
+        self.proxy_folder_var = tk.StringVar(value="")
         self.data_var = tk.StringVar(value=str(data.get("data_dir", "data/ui-run")))
         self.flow_key = str(data.get("flow", "full"))
         if self.flow_key not in {"full", "director", "resolve"}:
@@ -518,10 +536,13 @@ class ModernCyberEditorApp:
             value=str(data.get("project_name", "CyberEditor Project"))
         )
         self.skip_resolve_var = tk.BooleanVar(
-            value=bool(data.get("skip_resolve", True))
+            value=bool(data.get("skip_resolve", False))
         )
         self.strict_fps_var = tk.BooleanVar(
             value=bool(data.get("strict_fps", False))
+        )
+        self.render_preview_var = tk.BooleanVar(
+            value=bool(data.get("render_preview", True))
         )
 
     def _configure_window(self) -> None:
@@ -718,12 +739,12 @@ class ModernCyberEditorApp:
             self._on_flow_change
         )
         self._path_field(
-            parent, 2, self.t("source_video"), self.video_var,
-            self._choose_video, self.t("browse")
+            parent, 2, self.t("source_videos"), self.video_var,
+            self._choose_video, self.t("browse"), readonly=True
         )
         self._path_field(
-            parent, 3, self.t("proxy_media"), self.proxy_var,
-            self._choose_proxy, self.t("browse")
+            parent, 3, self.t("input_folder"), self.input_folder_var,
+            self._choose_input_folder, self.t("select_folder")
         )
         self._path_field(
             parent, 4, self.t("runtime_data"), self.data_var,
@@ -821,7 +842,7 @@ class ModernCyberEditorApp:
         )
         switches = ctk.CTkFrame(parent, fg_color="transparent")
         switches.grid(row=12, column=0, sticky="ew", pady=(7, 14))
-        switches.grid_columnconfigure((0, 1), weight=1)
+        switches.grid_columnconfigure((0, 1, 2), weight=1)
         self.skip_resolve_switch = ctk.CTkSwitch(
             switches, text=self.t("skip_resolve"),
             variable=self.skip_resolve_var, progress_color=COLORS["accent"],
@@ -835,6 +856,12 @@ class ModernCyberEditorApp:
             button_hover_color=COLORS["accent_hover"],
             text_color=COLORS["text"]
         ).grid(row=0, column=1, sticky="w")
+        ctk.CTkSwitch(
+            switches, text=self.t("render_preview"),
+            variable=self.render_preview_var, progress_color=COLORS["accent"],
+            button_hover_color=COLORS["accent_hover"],
+            text_color=COLORS["text"]
+        ).grid(row=0, column=2, sticky="w")
         if self.available_ollama_models:
             self.ollama_menu.set_values([
                 str(item["name"]) for item in self.available_ollama_models
@@ -922,8 +949,9 @@ class ModernCyberEditorApp:
 
         utilities = ctk.CTkFrame(parent, fg_color="transparent")
         utilities.grid(row=6, column=0, sticky="ew", padx=20, pady=(0, 18))
-        utilities.grid_columnconfigure((0, 1), weight=1, uniform="utility")
+        utilities.grid_columnconfigure((0, 1, 2), weight=1, uniform="utility")
         for column, (text, command) in enumerate((
+            (self.t("open_preview"), self._open_preview),
             (self.t("view_timeline"), self._open_timeline),
             (self.t("recheck"), self._start_environment_check),
         )):
@@ -934,7 +962,7 @@ class ModernCyberEditorApp:
                 border_color=COLORS["border"], text_color=COLORS["text"]
             ).grid(
                 row=0, column=column, sticky="ew",
-                padx=(0, 5) if column == 0 else (5, 0)
+                padx=(0, 5) if column == 0 else (5, 5) if column == 1 else (5, 0)
             )
 
     def _section_title(
@@ -948,7 +976,8 @@ class ModernCyberEditorApp:
 
     def _path_field(
         self, parent: ctk.CTkBaseClass, row: int, label: str,
-        variable: tk.StringVar, command: object, button_text: str
+        variable: tk.StringVar, command: object, button_text: str,
+        readonly: bool = False,
     ) -> None:
         """Create a path entry with browse action. / 创建带浏览操作的路径输入框。"""
         frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -961,7 +990,7 @@ class ModernCyberEditorApp:
         ctk.CTkEntry(
             frame, textvariable=variable, height=36, corner_radius=10,
             fg_color=COLORS["field"], border_color=COLORS["border"],
-            text_color=COLORS["text"]
+            text_color=COLORS["text"], state="readonly" if readonly else "normal"
         ).grid(row=1, column=0, sticky="ew", padx=(0, 7))
         ctk.CTkButton(
             frame, text=button_text, command=command, width=72, height=36,
@@ -1066,10 +1095,8 @@ class ModernCyberEditorApp:
             display_value, display_value
         )
         if self.fps_mode == "auto":
-            candidate = (
-                self.video_var.get().strip()
-                or self.proxy_var.get().strip()
-            )
+            sources = self._source_candidates()
+            candidate = sources[0] if sources else self.proxy_var.get().strip()
             if candidate:
                 self._start_fps_detection(candidate)
         self._save_current_preferences()
@@ -1078,9 +1105,8 @@ class ModernCyberEditorApp:
         """Detect FPS for a restored media path after first paint. / 首帧显示后检测已恢复素材路径的 FPS。"""
         if self.fps_mode != "auto":
             return
-        candidate = (
-            self.video_var.get().strip() or self.proxy_var.get().strip()
-        )
+        sources = self._source_candidates()
+        candidate = sources[0] if sources else self.proxy_var.get().strip()
         if candidate and self._absolute_path(candidate).is_file():
             self._start_fps_detection(candidate)
 
@@ -1104,10 +1130,7 @@ class ModernCyberEditorApp:
         """Accept a non-stale source FPS result and refresh the selector. / 接受未过期的源 FPS 结果并刷新选择器。"""
         current_candidates = {
             str(self._absolute_path(value))
-            for value in (
-                self.video_var.get().strip(),
-                self.proxy_var.get().strip(),
-            )
+            for value in self._source_candidates() + [self.proxy_var.get().strip()]
             if value
         }
         if str(self._absolute_path(source)) not in current_candidates:
@@ -1148,10 +1171,7 @@ class ModernCyberEditorApp:
         if not required:
             return self.detected_project_fps or 25.0
 
-        for value in (
-            self.video_var.get().strip(),
-            self.proxy_var.get().strip(),
-        ):
+        for value in self._source_candidates() + [self.proxy_var.get().strip()]:
             if not value:
                 continue
             path = self._absolute_path(value)
@@ -1341,8 +1361,11 @@ class ModernCyberEditorApp:
         """Normalize current UI values into workflow options. / 将当前界面值规范化为工作流选项。"""
         project_fps = self._resolve_project_fps(required=require_fps)
         return WorkflowOptions(
-            video=self.video_var.get().strip(),
+            video=(self.selected_videos[0] if self.selected_videos else ""),
             proxy=self.proxy_var.get().strip(),
+            videos=list(self.selected_videos),
+            input_folder=self.input_folder_var.get().strip(),
+            proxy_folder=self.proxy_folder_var.get().strip(),
             data_dir=self.data_var.get().strip() or "data/ui-run",
             flow=self.flow_key,
             hardware_profile=self.profile_key,
@@ -1365,6 +1388,7 @@ class ModernCyberEditorApp:
             ),
             skip_resolve=bool(self.skip_resolve_var.get()),
             strict_fps=bool(self.strict_fps_var.get()),
+            render_preview=bool(self.render_preview_var.get()),
         )
 
     def _start_environment_check(self) -> None:
@@ -1375,11 +1399,14 @@ class ModernCyberEditorApp:
                 text_color=COLORS["muted"],
             )
         url = self.ollama_url_var.get().strip()
+        selected_model = self.ollama_model_var.get().strip()
         threading.Thread(
-            target=self._check_environment, args=(url,), daemon=True
+            target=self._check_environment,
+            args=(url, selected_model),
+            daemon=True,
         ).start()
 
-    def _check_environment(self, ollama_url: str) -> None:
+    def _check_environment(self, ollama_url: str, selected_model: str) -> None:
         """
         Detect services, software, hardware, and real PyTorch CUDA.
         检测服务、软件、硬件与真实 PyTorch CUDA。
@@ -1416,6 +1443,17 @@ class ModernCyberEditorApp:
                     else self.t("online")
                 ),
             )
+            installed_names = {
+                str(item.get("name") or item.get("model") or "")
+                for item in models
+                if isinstance(item, dict)
+            }
+            if selected_model and selected_model in installed_names:
+                capabilities = self._ollama_capabilities(
+                    ollama_url, selected_model
+                )
+                if capabilities is not None and "vision" not in capabilities:
+                    results["Ollama"] = (False, self.t("text_only_model"))
         except (
             OSError,
             ValueError,
@@ -1452,6 +1490,28 @@ class ModernCyberEditorApp:
         self.messages.put(
             ("environment", (results, models, hardware, recommendation))
         )
+
+    @staticmethod
+    def _ollama_capabilities(
+        base_url: str, model: str
+    ) -> Optional[set[str]]:
+        """Read model capabilities without loading weights. / 读取能力但不加载权重。"""
+        body = json.dumps({"model": model}).encode("utf-8")
+        request = urllib_request.Request(
+            base_url.rstrip("/") + "/api/show",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError, urllib_error.URLError):
+            return None
+        values = payload.get("capabilities") if isinstance(payload, dict) else None
+        if not isinstance(values, list):
+            return None
+        return {str(value).casefold() for value in values}
 
     def _apply_environment_result(self, payload: object) -> None:
         """Render environment checks and apply automatic settings. / 显示环境检测并应用自动设置。"""
@@ -1670,6 +1730,7 @@ class ModernCyberEditorApp:
 
     def _finish_workflow(self, return_code: int) -> None:
         """Restore controls and report the final state. / 恢复控件并报告最终状态。"""
+        finished_options = self.active_options
         self.process = None
         self.active_options = None
         self.start_button.configure(state="normal")
@@ -1678,6 +1739,8 @@ class ModernCyberEditorApp:
             self._set_progress(1.0)
             self._set_stage("completed")
             self._append_log(self.t("workflow_success"))
+            if finished_options is not None and finished_options.render_preview:
+                self.root.after(300, lambda: self._open_preview(silent=True))
         elif self.stop_requested:
             self._set_progress(0.0)
             self._set_stage("stopped")
@@ -1696,8 +1759,11 @@ class ModernCyberEditorApp:
             elif "Direct" in line:
                 self._set_progress(0.48)
                 self._set_stage("directing")
+            elif "Preview render" in line:
+                self._set_progress(0.72)
+                self._set_stage("previewing")
             elif "Resolve" in line:
-                self._set_progress(0.82)
+                self._set_progress(0.90)
                 self._set_stage("assembling")
         elif "VRAM barrier passed: Whisper/OpenCV" in line:
             self._set_progress(0.42)
@@ -1740,18 +1806,65 @@ class ModernCyberEditorApp:
 
     def _choose_video(self) -> None:
         """Select source media and use it as the default proxy. / 选择源素材并默认将其作为代理素材。"""
-        path = filedialog.askopenfilename(
+        paths = filedialog.askopenfilenames(
             title=self.t("select_video"),
             filetypes=[
                 ("Video", "*.mp4 *.mov *.mkv *.avi *.mxf *.mts *.m2ts"),
                 ("All files", "*.*"),
             ],
         )
-        if path:
-            self.video_var.set(path)
-            if not self.proxy_var.get().strip():
-                self.proxy_var.set(path)
-            self._start_fps_detection(path)
+        if paths:
+            self.selected_videos = list(paths)
+            self.input_folder_var.set("")
+            self.video_var.set(self._video_selection_summary())
+            self._start_fps_detection(self.selected_videos[0])
+            self._save_current_preferences()
+
+    def _choose_input_folder(self) -> None:
+        """Select a folder of source videos. / 选择源视频文件夹。"""
+        path = filedialog.askdirectory(title=self.t("select_input_folder"))
+        if not path:
+            return
+        try:
+            videos = discover_video_files(input_folder=path)
+        except MediaManifestError as exc:
+            messagebox.showerror(
+                self.t("cannot_start"), str(exc), parent=self.root
+            )
+            return
+        self.selected_videos = []
+        self.video_var.set("")
+        self.input_folder_var.set(path)
+        self._start_fps_detection(str(videos[0]))
+        self._append_log(
+            self.t("folder_videos_found", count=len(videos)) + "\n"
+        )
+        self._save_current_preferences()
+
+    def _video_selection_summary(self) -> str:
+        """Return a compact label for explicit selections. / 返回多选素材摘要。"""
+        if not self.selected_videos:
+            return ""
+        if len(self.selected_videos) == 1:
+            return self.selected_videos[0]
+        return self.t("videos_selected", count=len(self.selected_videos))
+
+    def _source_candidates(self) -> List[str]:
+        """Resolve explicit or folder-based inputs. / 解析文件或文件夹输入。"""
+        if self.selected_videos:
+            return list(self.selected_videos)
+        folder = self.input_folder_var.get().strip()
+        if not folder:
+            return []
+        try:
+            return [
+                str(path)
+                for path in discover_video_files(
+                    input_folder=self._absolute_path(folder)
+                )
+            ]
+        except MediaManifestError:
+            return []
 
     def _choose_proxy(self) -> None:
         """Select an optional proxy media file. / 选择可选代理素材。"""
@@ -1781,6 +1894,21 @@ class ModernCyberEditorApp:
         path = self._absolute_path(self.data_var.get() or "data/ui-run")
         path.mkdir(parents=True, exist_ok=True)
         self._open_path(path)
+
+    def _open_preview(self, silent: bool = False) -> None:
+        """Play the rendered review MP4 with the default player. / 播放预览成片。"""
+        path = self._absolute_path(
+            self.data_var.get() or "data/ui-run"
+        ) / "review" / "CyberEditor_preview.mp4"
+        if path.is_file():
+            self._open_path(path)
+            return
+        if not silent:
+            messagebox.showinfo(
+                self.t("no_output"),
+                self.t("no_preview_detail", path=path),
+                parent=self.root,
+            )
 
     def _open_timeline(self) -> None:
         """Open ``timeline_cuts.json`` with the default app. / 使用默认应用打开 ``timeline_cuts.json``。"""

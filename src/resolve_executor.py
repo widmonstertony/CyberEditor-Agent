@@ -46,6 +46,11 @@ class ClipDecision(NamedTuple):
     cut_in_sec: Decimal
     cut_out_sec: Decimal
     reason_for_cut: str
+    transition_to_next: str = "cut"
+    transition_duration_sec: Decimal = Decimal("0")
+    audio_cleanup: str = "light"
+    color_look: str = "neutral"
+    motion: str = "static"
 
 
 class MediaRecord(NamedTuple):
@@ -219,6 +224,16 @@ class DaVinciExecutor:
                 raise ResolveExecutorError(
                     f"{prefix}.reason_for_cut 必须是字符串 / must be a string."
                 )
+            transition = self._enum_text(
+                item.get("transition_to_next"),
+                {"cut", "cross_dissolve", "fade_black"},
+                "cut",
+            )
+            transition_duration = self._non_negative_decimal(
+                item.get("transition_duration_sec", 0),
+                f"{prefix}.transition_duration_sec",
+            )
+            transition_duration = min(transition_duration, Decimal("2"))
             decisions.append(
                 ClipDecision(
                     clip_id=clip_id,
@@ -226,6 +241,23 @@ class DaVinciExecutor:
                     cut_in_sec=cut_in,
                     cut_out_sec=cut_out,
                     reason_for_cut=reason.strip(),
+                    transition_to_next=transition,
+                    transition_duration_sec=transition_duration,
+                    audio_cleanup=self._enum_text(
+                        item.get("audio_cleanup"),
+                        {"none", "light", "strong"},
+                        "light",
+                    ),
+                    color_look=self._enum_text(
+                        item.get("color_look"),
+                        {"source", "neutral", "warm", "cool", "contrast"},
+                        "neutral",
+                    ),
+                    motion=self._enum_text(
+                        item.get("motion"),
+                        {"static", "gentle_push_in"},
+                        "static",
+                    ),
                 )
             )
         self.logger.info(
@@ -498,8 +530,9 @@ class DaVinciExecutor:
         prepared: List[Tuple[ClipDecision, Dict[str, Any]]] = []
         for decision in clips:
             item, index = self._resolve_media(decision, index)
+            source_fps = self._media_fps(item) or fps
             start_frame, end_frame = self.seconds_to_frames(
-                decision.cut_in_sec, decision.cut_out_sec, fps
+                decision.cut_in_sec, decision.cut_out_sec, source_fps
             )
             prepared.append(
                 (
@@ -523,6 +556,39 @@ class DaVinciExecutor:
                 end_frame,
             )
         return prepared
+
+    def _media_fps(self, media_item: Any) -> Optional[Decimal]:
+        """
+        Read a source clip's native FPS, falling back to project FPS if absent.
+        读取源片段原生 FPS；API 未提供时由调用方回退到工程 FPS。
+
+        Parameters / 参数:
+            media_item:
+                Resolve MediaPoolItem selected for the decision.
+                剪辑决策对应的 Resolve MediaPoolItem。
+        """
+        getter = getattr(media_item, "GetClipProperty", None)
+        if not callable(getter):
+            return None
+        candidates: List[Any] = []
+        for key in ("FPS", "Frame Rate"):
+            try:
+                candidates.append(getter(key))
+            except Exception:
+                pass
+        try:
+            properties = getter()
+        except Exception:
+            properties = None
+        if isinstance(properties, dict):
+            candidates.extend(
+                properties.get(key) for key in ("FPS", "Frame Rate")
+            )
+        for value in candidates:
+            parsed = self._parse_fps(value)
+            if parsed is not None:
+                return parsed
+        return None
 
     @staticmethod
     def seconds_to_frames(
@@ -570,6 +636,8 @@ class DaVinciExecutor:
                     )
                 )
             result_items.extend(items)
+            for timeline_item in items:
+                self.apply_clip_effects(timeline_item, decision)
             completed += 1
             self.logger.info(
                 "已追加 %d/%d：clip_id=%r / Appended %d/%d: clip_id=%r",
@@ -581,6 +649,122 @@ class DaVinciExecutor:
                 decision.clip_id,
             )
         return result_items
+
+    def apply_clip_effects(self, timeline_item: Any, decision: ClipDecision) -> None:
+        """
+        Apply Resolve-supported parts of the AI effect plan without breaking assembly.
+        应用 Resolve 公共 API 支持的 AI 效果；单个效果失败时仍保留已组装时间线。
+
+        Parameters / 参数:
+            timeline_item:
+                Timeline item returned by ``AppendToTimeline``.
+                ``AppendToTimeline`` 返回的时间线片段。
+            decision:
+                Validated editorial and effect decision for this clip.
+                已校验的片段剪辑与效果决策。
+
+        Resolve's public scripting API does not expose a stable generic
+        transition-insertion method. Transition intent is stored in a marker
+        and rendered exactly by ``review_renderer``.
+        Resolve 公共脚本 API 没有稳定的通用转场插入方法；转场意图会写入标记，
+        并由 ``review_renderer`` 精确生成到可观看预览中。
+        """
+        voice_isolation = getattr(timeline_item, "SetVoiceIsolationState", None)
+        if decision.audio_cleanup != "none" and callable(voice_isolation):
+            amount = 75.0 if decision.audio_cleanup == "strong" else 45.0
+            try:
+                applied = voice_isolation({"isEnabled": True, "amount": amount})
+                if applied is False:
+                    self.logger.warning(
+                        "Voice Isolation unavailable for clip_id=%r; "
+                        "the FFmpeg preview still applies denoise.",
+                        decision.clip_id,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Voice Isolation failed for clip_id=%r: %s",
+                    decision.clip_id,
+                    exc,
+                )
+
+        set_property = getattr(timeline_item, "SetProperty", None)
+        if decision.motion == "gentle_push_in" and callable(set_property):
+            try:
+                applied = set_property(
+                    {"ZoomX": 1.04, "ZoomY": 1.04, "ZoomGang": True}
+                )
+                if applied is False:
+                    self.logger.warning(
+                        "Resolve could not apply push-in to clip_id=%r",
+                        decision.clip_id,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Resolve motion effect failed for clip_id=%r: %s",
+                    decision.clip_id,
+                    exc,
+                )
+
+        color_values = {
+            "neutral": {
+                "Slope": "1.02 1.02 1.02", "Offset": "0 0 0",
+                "Power": "1 1 1", "Saturation": "1.02",
+            },
+            "warm": {
+                "Slope": "1.05 1.02 0.98", "Offset": "0 0 0",
+                "Power": "1 1 1.01", "Saturation": "1.04",
+            },
+            "cool": {
+                "Slope": "0.98 1.01 1.05", "Offset": "0 0 0",
+                "Power": "1.01 1 1", "Saturation": "1.02",
+            },
+            "contrast": {
+                "Slope": "1.06 1.06 1.06", "Offset": "-0.01 -0.01 -0.01",
+                "Power": "0.98 0.98 0.98", "Saturation": "1.05",
+            },
+        }
+        set_cdl = getattr(timeline_item, "SetCDL", None)
+        if decision.color_look in color_values and callable(set_cdl):
+            cdl = {"NodeIndex": "1", **color_values[decision.color_look]}
+            try:
+                if set_cdl(cdl) is False:
+                    self.logger.warning(
+                        "Resolve could not apply CDL look to clip_id=%r",
+                        decision.clip_id,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Resolve color look failed for clip_id=%r: %s",
+                    decision.clip_id,
+                    exc,
+                )
+
+        add_marker = getattr(timeline_item, "AddMarker", None)
+        if callable(add_marker):
+            effect_plan = {
+                "transition_to_next": decision.transition_to_next,
+                "transition_duration_sec": self._decimal_text(
+                    decision.transition_duration_sec
+                ),
+                "audio_cleanup": decision.audio_cleanup,
+                "color_look": decision.color_look,
+                "motion": decision.motion,
+            }
+            try:
+                add_marker(
+                    0,
+                    "Cyan",
+                    "CyberEditor AI",
+                    decision.reason_for_cut or "AI-selected clip",
+                    1,
+                    json.dumps(effect_plan, ensure_ascii=False),
+                )
+            except Exception as exc:
+                self.logger.debug(
+                    "Could not add AI marker for clip_id=%r: %s",
+                    decision.clip_id,
+                    exc,
+                )
 
     def save_project(self) -> None:
         """Persist the completed Resolve project if possible. / 尽可能保存已完成的 Resolve 工程。"""
@@ -1029,6 +1213,12 @@ class DaVinciExecutor:
                 f"{field_name} 不能为负数 / cannot be negative."
             )
         return converted
+
+    @staticmethod
+    def _enum_text(value: Any, allowed: set, default: str) -> str:
+        """Normalize an optional JSON enum. / 规范化可选 JSON 枚举值。"""
+        normalized = str(value or default).strip().lower()
+        return normalized if normalized in allowed else default
 
     @staticmethod
     def _decimal_text(value: Decimal) -> str:

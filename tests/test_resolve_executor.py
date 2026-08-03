@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from src.resolve_executor import DaVinciExecutor, Decimal
+from src.resolve_executor import ClipDecision, DaVinciExecutor, Decimal
 
 
 class FakeItem:
@@ -138,6 +138,61 @@ class ResolveExecutorTests(unittest.TestCase):
             ),
             (312, 454),
         )
+
+    def test_native_source_fps_is_used_when_available(self):
+        class NativeFpsItem:
+            def GetClipProperty(self, name=None):
+                properties = {"FPS": "50", "Frame Rate": "50"}
+                return properties if name is None else properties.get(name, "")
+
+        executor = DaVinciExecutor("timeline_cuts.json")
+        self.assertEqual(executor._media_fps(NativeFpsItem()), Decimal("50"))
+
+    def test_ai_effect_plan_calls_supported_resolve_apis(self):
+        class TimelineItem:
+            def __init__(self):
+                self.voice = None
+                self.properties = None
+                self.cdl = None
+                self.marker = None
+
+            def SetVoiceIsolationState(self, value):
+                self.voice = value
+                return True
+
+            def SetProperty(self, value):
+                self.properties = value
+                return True
+
+            def SetCDL(self, value):
+                self.cdl = value
+                return True
+
+            def AddMarker(self, *value):
+                self.marker = value
+                return True
+
+        executor = DaVinciExecutor("timeline_cuts.json")
+        item = TimelineItem()
+        decision = ClipDecision(
+            1,
+            "source.mp4",
+            Decimal("1"),
+            Decimal("3"),
+            "Strong opening",
+            "cross_dissolve",
+            Decimal("0.5"),
+            "strong",
+            "warm",
+            "gentle_push_in",
+        )
+
+        executor.apply_clip_effects(item, decision)
+
+        self.assertEqual(item.voice["amount"], 75.0)
+        self.assertEqual(item.properties["ZoomX"], 1.04)
+        self.assertEqual(item.cdl["NodeIndex"], "1")
+        self.assertIn("cross_dissolve", item.marker[-1])
 
     def test_mocked_run(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -59,6 +59,61 @@ class FakeSession:
         )
 
 
+class VisionSession(FakeSession):
+    """Two-pass multimodal Ollama double."""
+
+    def get(self, url, timeout=None):
+        if url.endswith("/api/tags"):
+            return FakeResponse({"models": [{"name": "qwen3.5:test"}]})
+        if url.endswith("/api/ps"):
+            return FakeResponse({"models": []})
+        raise AssertionError(url)
+
+    def post(self, url, json=None, timeout=None):
+        self.posts.append(json)
+        if url.endswith("/api/show"):
+            return FakeResponse({"capabilities": ["completion", "vision"]})
+        if json.get("keep_alive") == 0:
+            return FakeResponse({"done": True, "response": ""})
+        if "Build one coherent documentary edit" in json.get("prompt", ""):
+            generated = {
+                "project_summary": "A coherent multi-camera story",
+                "sequence": [
+                    {
+                        "candidate_id": "C0001",
+                        "reason_for_position": "Strong opening",
+                        "transition_to_next": "cross_dissolve",
+                        "transition_duration_sec": 0.5,
+                        "audio_cleanup": "strong",
+                        "color_look": "warm",
+                        "motion": "gentle_push_in",
+                    }
+                ],
+            }
+        else:
+            generated = {
+                "decisions": [
+                    {
+                        "cut_in_sec": 1.0,
+                        "cut_out_sec": 4.0,
+                        "reason_for_cut": "Clear visual opening",
+                        "visual_summary": "Person enters the landscape",
+                        "story_role": "opening",
+                        "confidence": 0.9,
+                        "quality_score": 0.95,
+                        "transition_to_next": "cut",
+                        "transition_duration_sec": 0,
+                        "audio_cleanup": "light",
+                        "color_look": "neutral",
+                        "motion": "static",
+                    }
+                ]
+            }
+        return FakeResponse(
+            {"done": True, "response": __import__("json").dumps(generated)}
+        )
+
+
 class AIDirectorTests(unittest.TestCase):
     """Test deterministic behavior without a live Ollama server."""
 
@@ -154,6 +209,58 @@ class AIDirectorTests(unittest.TestCase):
             self.assertTrue(
                 any(item.get("keep_alive") == 0 for item in session.posts)
             )
+
+    def test_multi_asset_run_sends_images_then_globally_sequences(self):
+        session = VisionSession()
+        director = self.make_director(
+            model="qwen3.5:test", session=session
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            frame = root / "frame.jpg"
+            frame.write_bytes(b"fake-jpeg")
+            source = root / "source.mp4"
+            raw = {
+                "schema_version": "2.0",
+                "assets": [
+                    {
+                        "asset_id": "asset-1",
+                        "duration_sec": 10.0,
+                        "source_video": str(source),
+                        "proxy_file_name": str(source),
+                        "transcript": [
+                            {
+                                "start_sec": 0.0,
+                                "end_sec": 5.0,
+                                "text": "opening narration",
+                            }
+                        ],
+                        "keyframes": [
+                            {
+                                "timestamp_sec": 2.0,
+                                "file_name": "frame.jpg",
+                                "image_path": str(frame),
+                                "scene_score": 0.8,
+                            }
+                        ],
+                    }
+                ],
+            }
+            raw_path = root / "raw_data.json"
+            output_path = root / "timeline_cuts.json"
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            output = director.run(raw_path, output_path)
+
+            image_requests = [item for item in session.posts if item.get("images")]
+            self.assertEqual(len(image_requests), 1)
+            self.assertEqual(output["schema_version"], "2.0")
+            self.assertEqual(output["clips"][0]["file_name"], str(source))
+            self.assertEqual(
+                output["clips"][0]["transition_to_next"], "cross_dissolve"
+            )
+            self.assertEqual(output["clips"][0]["audio_cleanup"], "strong")
+            self.assertTrue(output_path.is_file())
 
 
 if __name__ == "__main__":

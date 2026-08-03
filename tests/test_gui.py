@@ -39,6 +39,29 @@ class WorkflowOptionsTests(unittest.TestCase):
             self.assertIn("--skip-resolve", command)
             self.assertNotIn("--skip-extraction", command)
 
+    def test_multi_video_and_folder_inputs_build_batch_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "folder"
+            folder.mkdir()
+            first = root / "first.mp4"
+            second = root / "second.mov"
+            folder_video = folder / "third.mkv"
+            for path in (first, second, folder_video):
+                path.touch()
+            options = WorkflowOptions(
+                videos=[str(first), str(second)],
+                input_folder=str(folder),
+                ollama_model="qwen3.5:test",
+                render_preview=True,
+            )
+
+            command = options.build_command("python.exe", root)
+
+            self.assertEqual(command.count("--video"), 2)
+            self.assertIn("--input-folder", command)
+            self.assertNotIn("--skip-preview", command)
+
     def test_resolve_only_requires_timeline_and_enables_resolve(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
