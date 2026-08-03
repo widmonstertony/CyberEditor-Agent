@@ -700,6 +700,13 @@ class WorkflowOptions:
     skip_resolve: bool = True
     strict_fps: bool = False
     render_preview: bool = True
+    drx_root: str = "config/drx"
+    fairlight_preset: str = ""
+    macro_profile: str = ""
+    render_final: bool = False
+    render_dir: str = "data/ui-run/final"
+    render_name: str = "CyberEditor_final"
+    render_preset: str = ""
 
     def validate(self, project_root: Path) -> None:
         """
@@ -768,6 +775,14 @@ class WorkflowOptions:
             raise ValueError("项目 FPS 必须大于 0 / Project FPS must be positive.")
         if int(self.num_ctx) < 2048:
             raise ValueError("Ollama 上下文至少为 2048 / Ollama context must be >= 2048.")
+        if self.render_final and self.skip_resolve:
+            raise ValueError(
+                "最终渲染需要启用 Resolve / Final rendering requires Resolve."
+            )
+        if self.render_final and not self.render_name.strip():
+            raise ValueError(
+                "最终成片文件名不能为空 / Final render name cannot be empty."
+            )
 
     def build_command(
         self, python_executable: str, project_root: Path
@@ -846,6 +861,33 @@ class WorkflowOptions:
             command.append("--skip-preview")
         if self.strict_fps:
             command.append("--strict-fps")
+        if self.drx_root.strip():
+            command.extend(
+                ["--drx-root", str(_absolute_path(self.drx_root, project_root))]
+            )
+        if self.fairlight_preset.strip():
+            command.extend(["--fairlight-preset", self.fairlight_preset.strip()])
+        if self.macro_profile.strip():
+            command.extend(
+                [
+                    "--macro-profile",
+                    str(_absolute_path(self.macro_profile, project_root)),
+                    "--macro-action",
+                    "post_assembly",
+                ]
+            )
+        if self.render_final:
+            command.extend(
+                [
+                    "--render-final",
+                    "--render-dir",
+                    str(_absolute_path(self.render_dir, project_root)),
+                    "--render-name",
+                    self.render_name.strip(),
+                ]
+            )
+            if self.render_preset.strip():
+                command.extend(["--render-preset", self.render_preset.strip()])
         return command
 
 

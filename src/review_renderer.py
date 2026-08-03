@@ -48,6 +48,7 @@ class RenderClip(NamedTuple):
     audio_cleanup: str = "light"
     color_look: str = "neutral"
     motion: str = "static"
+    volume_db: float = 0.0
 
 
 class ReviewRenderer:
@@ -210,6 +211,16 @@ class ReviewRenderer:
                         {"static", "gentle_push_in"},
                         "static",
                     ),
+                    volume_db=max(
+                        -24.0,
+                        min(
+                            12.0,
+                            self._finite(
+                                item.get("volume_db", 0.0),
+                                f"clips[{index}].volume_db",
+                            ),
+                        ),
+                    ),
                 )
             )
         if not result:
@@ -274,7 +285,8 @@ class ReviewRenderer:
             audio_chain = (
                 f"[{audio_input}:a:0]atrim=0:{self._number(duration)},"
                 "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo"
-                f"{self._audio_filter(clip.audio_cleanup)}[a{index}]"
+                f"{self._audio_filter(clip.audio_cleanup)}"
+                f",volume={self._number(clip.volume_db)}dB[a{index}]"
             )
             filters.extend((video_chain, audio_chain))
             video_labels.append(f"v{index}")

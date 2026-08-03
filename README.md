@@ -19,7 +19,8 @@ PowerShell 中运行：
 完整流程不是把所有视频简单首尾相接。每个素材会被依次转写并抽取时间分布均匀的真实
 画面；视觉模型对每个 10–15 分钟窗口结合画面和台词挑选候选片段，第二遍全局导演再从
 全部素材的候选中决定使用哪些、如何跨文件排序，以及硬切/叠化/淡黑、音频降噪、基础
-色彩风格和轻微推镜。最终同时输出 Resolve 可编辑时间线与 FFmpeg 1080p 可观看预览。
+色彩风格、音量、防抖、跟踪和轻微推镜。最终可同时输出 Resolve 可编辑时间线、
+FFmpeg 1080p 审片预览，以及由 Resolve Deliver 页面真正渲染的最终成片。
 
 “性能配置”默认使用 `自动检测 / Auto`：界面以标准库读取 CPU、系统内存和 GPU，
 通过 `nvidia-smi`（可用时）读取准确显存，并在一次性子进程中确认当前 PyTorch 是否
@@ -90,6 +91,7 @@ FFmpeg 预览渲染子进程
           │ 生成真实转场、降噪与基础运动效果
           ▼
 DaVinci Resolve 执行子进程
+          │ 原生效果 / DRX / 可选受保护 UI 宏 / 最终渲染
 ```
 
 - 父调度器不导入 PyTorch、Whisper、OpenCV、requests 或 Resolve API。
@@ -97,6 +99,41 @@ DaVinci Resolve 执行子进程
 - Ollama `/api/ps` 若发现其他模型驻留，会拒绝加载导演模型。
 - 导演每次只处理 10–15 分钟数据，默认 12 分钟。
 - `timeline_cuts.json` 只在所有分块成功、校验和合并后原子写入。
+
+## 四阶段自动成片能力
+
+当前实现对应以下严格串行链路：
+
+1. **提取期**：每个视频单独启动 Whisper/OpenCV 子进程，写入台词、真实 JPEG
+   关键帧和素材元数据；每个子进程退出后，父调度器再执行显存释放屏障。
+2. **思考期**：视觉 Ollama 模型以 10–15 分钟窗口审片，再进行一次跨全部素材的
+   全局编排，原子生成 `timeline_cuts.json`；随后发送 `keep_alive: 0` 并由父进程
+   二次确认卸载。UI 会自动列出本机已安装模型；当前推荐的
+   `qwen3.5:35b-a3b` 是 36B Q4 MoE 视觉推理模型，不会被错误标成 70B。
+3. **执行期**：Resolve 原生 API 完成素材导入、按源素材 FPS 换帧、拼接、Voice
+   Isolation、基础 CDL、`Stabilize()`、`CreateMagicMask()` 和 `SmartReframe()`；
+   用户导出的 DRX 通过节点图 `ApplyGradeFromDRX()` 注入。Resolve 21 已原生公开
+   防抖与 Magic Mask 接口，因此默认不使用脆弱的坐标宏。
+4. **导出期**：启用 UI 中“Resolve 导出最终成片”后，执行器创建 Render Job、启动
+   渲染、持续报告百分比并校验完成状态；默认沿用当前 Deliver 页面格式/编码设置，
+   也可填写一个现有的 Resolve 渲染预设名。
+
+### DRX、Fairlight 与 UI 宏
+
+- 将 Resolve 中导出的调色预设放入 `config/drx/`，文件名只能是
+  `interview_clean.drx`、`cinematic.drx` 或 `low_light_cleanup.drx`。模型只能选择
+  这些逻辑名，不能构造任意磁盘路径。
+- UI 可填写一个已经存在于 Resolve 中的 Fairlight 预设名；找不到时任务明确失败，
+  避免无声漏掉高级音频处理。
+- `src/resolve_macro.py` 是 API 未覆盖操作的**可选** PyAutoGUI 后备层。默认完全关闭；
+  只有填写宏配置才会执行。它会校验 4K 分辨率、强制 Resolve 位于前台、开启鼠标
+  移到屏幕角落急停，并且只接受等待、快捷键、按键和归一化点击四种动作。复制
+  `config/resolve_macro_profile.example.json` 后按自己的 Resolve 工作区校准；不要在
+  未校准的电脑上复用坐标。
+
+Resolve 21 官方文档没有保证通用“逐片段音量”属性。执行器会先动态探测当前版本；
+若存在则写入，否则把 dB 决策保存在 AI 标记中并告警。FFmpeg 审片预览会始终真实
+应用该音量。正式输出需要逐片段增益时，应使用已校准宏或 Fairlight 预设复核。
 
 Ollama 官方 API 支持以 JSON Schema 约束输出，并以 `keep_alive: 0` 立即卸载模型：
 [Generate API](https://docs.ollama.com/api/generate)、
@@ -113,6 +150,9 @@ CyberEditor-Agent/
 ├─ scripts/
 │  └─ install_windows.ps1        # 自动选择 CPU/CUDA 的 Windows 安装器
 ├─ requirements.txt
+├─ config/
+│  ├─ drx/                      # 用户导出的受限 DRX 预设
+│  └─ resolve_macro_profile.example.json
 ├─ README.md
 ├─ README_EN.md
 ├─ LICENSE
@@ -128,6 +168,7 @@ CyberEditor-Agent/
 │  ├─ extractor.py               # Whisper + OpenCV 数据提取
 │  ├─ director.py                # 多模态分块审片 + 跨素材全局导演
 │  ├─ review_renderer.py         # FFmpeg 可观看预览与效果渲染
+│  ├─ resolve_macro.py           # 受保护的可选 PyAutoGUI 后备层
 │  └─ resolve_executor.py        # DaVinci Resolve 自动组装与效果映射
 ├─ data/
 │  ├─ .gitkeep

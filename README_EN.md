@@ -33,8 +33,9 @@ transcribed and sampled into time-distributed real frames. A vision model
 reviews each 10–15 minute window with both images and speech, and a second
 global-director pass chooses candidates from every source, orders them across
 files, and plans cuts/dissolves/fades, audio cleanup, basic looks, and gentle
-push-ins. The result is both an editable Resolve timeline and an FFmpeg-rendered
-1080p MP4 that can be watched immediately.
+push-ins, gain, stabilization, and tracking. The result can include an editable
+Resolve timeline, an immediately watchable FFmpeg 1080p review, and a final
+movie rendered by Resolve's Deliver pipeline.
 
 The modern UI uses lightweight CustomTkinter and launches the existing
 `main.py` orchestrator as a child process. The resident UI never imports
@@ -117,6 +118,7 @@ FFmpeg review-render child process
           │ renders transitions, denoise, looks, and basic motion
           ▼
 DaVinci Resolve executor child process
+          │ native effects / DRX / optional guarded UI macro / final render
 ```
 
 - The parent orchestrator does not import PyTorch, Whisper, OpenCV, requests,
@@ -128,6 +130,49 @@ DaVinci Resolve executor child process
   12 minutes.
 - `timeline_cuts.json` is written atomically only after every chunk succeeds
   and all decisions are validated and merged.
+
+## Four-stage automatic finishing pipeline
+
+The implementation now follows this strict serial chain:
+
+1. **Extraction**: each video gets its own Whisper/OpenCV child process, which
+   writes dialogue, real JPEG keyframes, and media metadata. The process exits
+   before the parent crosses the VRAM-release barrier.
+2. **Direction**: a vision-capable Ollama model reviews 10–15 minute windows,
+   then performs one cross-source story pass and atomically publishes
+   `timeline_cuts.json`. The child sends `keep_alive: 0`, and the parent performs
+   a second unload request. The UI lists installed models automatically. The
+   recommended `qwen3.5:35b-a3b` is a 36B Q4 vision/reasoning MoE, not a 70B
+   model mislabeled by the application.
+3. **Resolve execution**: native APIs import media, use each source's native FPS,
+   assemble clips, and apply Voice Isolation, basic CDL, `Stabilize()`,
+   `CreateMagicMask()`, and `SmartReframe()`. User-exported DRX grades are applied
+   through the node graph's `ApplyGradeFromDRX()`. Resolve 21 exposes stabilization
+   and Magic Mask natively, so fragile coordinate macros are not the default.
+4. **Final export**: enable **Export final movie in Resolve** in the UI to create
+   a Render Job, start it, log percentage progress, and validate completion. The
+   current Deliver format/codec is preserved unless an existing Resolve render
+   preset is entered.
+
+### DRX, Fairlight, and the UI fallback
+
+- Export grades from Resolve into `config/drx/` using exactly
+  `interview_clean.drx`, `cinematic.drx`, or `low_light_cleanup.drx`. The model
+  selects logical names only and cannot construct arbitrary filesystem paths.
+- The UI accepts an existing Resolve Fairlight preset name. A missing preset is
+  a clear error rather than silently dropping requested audio processing.
+- `src/resolve_macro.py` is an **optional**, disabled-by-default PyAutoGUI fallback
+  for operations still absent from the API. When configured, it verifies the
+  expected display resolution, requires Resolve to be foreground, enables the
+  screen-corner fail-safe, and accepts only waits, hotkeys, key presses, and
+  normalized clicks. Copy and calibrate
+  `config/resolve_macro_profile.example.json` for your own Resolve workspace.
+
+Resolve 21 does not document a universal per-clip volume property. The executor
+probes the current build and writes gain when a supported property is exposed;
+otherwise it logs a warning and preserves the dB decision in the AI marker. The
+FFmpeg review always applies that gain. Use a calibrated fallback or verified
+Fairlight workflow when exact per-clip gain is required in the final Resolve job.
 
 The Ollama API supports JSON Schema constrained output and immediate model
 unloading with `keep_alive: 0`:
@@ -145,6 +190,9 @@ CyberEditor-Agent/
 ├─ scripts/
 │  └─ install_windows.ps1        # Windows CPU/CUDA auto-installer
 ├─ requirements.txt
+├─ config/
+│  ├─ drx/                      # Constrained user-exported DRX grades
+│  └─ resolve_macro_profile.example.json
 ├─ README.md                     # Simplified Chinese documentation
 ├─ README_EN.md                  # English documentation
 ├─ LICENSE
@@ -160,6 +208,7 @@ CyberEditor-Agent/
 │  ├─ extractor.py               # Whisper + OpenCV extraction
 │  ├─ director.py                # Multimodal review + global story director
 │  ├─ review_renderer.py         # Watchable FFmpeg preview and effects
+│  ├─ resolve_macro.py           # Guarded optional PyAutoGUI fallback
 │  └─ resolve_executor.py        # Resolve assembly and effect mapping
 ├─ data/
 │  ├─ .gitkeep

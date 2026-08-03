@@ -341,6 +341,56 @@ class WorkflowOrchestrator:
                 ]
                 if args.strict_fps:
                     command.append("--strict-fps")
+                drx_root = str(getattr(args, "drx_root", "") or "").strip()
+                if drx_root:
+                    command.extend(["--drx-root", drx_root])
+                fairlight_preset = str(
+                    getattr(args, "fairlight_preset", "") or ""
+                ).strip()
+                if fairlight_preset:
+                    command.extend(["--fairlight-preset", fairlight_preset])
+                macro_profile = str(
+                    getattr(args, "macro_profile", "") or ""
+                ).strip()
+                if macro_profile:
+                    command.extend(
+                        [
+                            "--macro-profile",
+                            macro_profile,
+                            "--macro-action",
+                            str(
+                                getattr(args, "macro_action", "post_assembly")
+                            ),
+                        ]
+                    )
+                if bool(getattr(args, "render_final", False)):
+                    command.append("--render")
+                    render_dir = str(
+                        getattr(args, "render_dir", "") or ""
+                    ).strip()
+                    if render_dir:
+                        command.extend(["--render-dir", render_dir])
+                    command.extend(
+                        [
+                            "--render-name",
+                            str(
+                                getattr(
+                                    args, "render_name", "CyberEditor_final"
+                                )
+                            ),
+                        ]
+                    )
+                    render_preset = str(
+                        getattr(args, "render_preset", "") or ""
+                    ).strip()
+                    if render_preset:
+                        command.extend(["--render-preset", render_preset])
+                    command.extend(
+                        [
+                            "--render-timeout",
+                            str(getattr(args, "render_timeout", 86400.0)),
+                        ]
+                    )
                 self._run_stage("执行 / Resolve", command)
 
             self.logger.info(
@@ -621,6 +671,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeline-name", default="CyberEditor Timeline")
     parser.add_argument("--project-name", default="CyberEditor Project")
     parser.add_argument("--strict-fps", action="store_true")
+    parser.add_argument("--drx-root")
+    parser.add_argument("--fairlight-preset", default="")
+    parser.add_argument("--macro-profile")
+    parser.add_argument("--macro-action", default="post_assembly")
+    parser.add_argument(
+        "--render-final",
+        action="store_true",
+        help="由 Resolve 渲染最终成片 / render the final movie in Resolve",
+    )
+    parser.add_argument("--render-dir")
+    parser.add_argument("--render-name", default="CyberEditor_final")
+    parser.add_argument("--render-preset", default="")
+    parser.add_argument("--render-timeout", type=float, default=86400.0)
     parser.add_argument("--skip-extraction", action="store_true")
     parser.add_argument("--skip-director", action="store_true")
     parser.add_argument("--skip-resolve", action="store_true")

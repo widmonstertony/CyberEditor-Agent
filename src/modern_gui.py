@@ -544,6 +544,27 @@ class ModernCyberEditorApp:
         self.render_preview_var = tk.BooleanVar(
             value=bool(data.get("render_preview", True))
         )
+        self.drx_root_var = tk.StringVar(
+            value=str(data.get("drx_root", "config/drx"))
+        )
+        self.fairlight_preset_var = tk.StringVar(
+            value=str(data.get("fairlight_preset", ""))
+        )
+        self.macro_profile_var = tk.StringVar(
+            value=str(data.get("macro_profile", ""))
+        )
+        self.render_final_var = tk.BooleanVar(
+            value=bool(data.get("render_final", True))
+        )
+        self.render_dir_var = tk.StringVar(
+            value=str(data.get("render_dir", "data/ui-run/final"))
+        )
+        self.render_name_var = tk.StringVar(
+            value=str(data.get("render_name", "CyberEditor_final"))
+        )
+        self.render_preset_var = tk.StringVar(
+            value=str(data.get("render_preset", ""))
+        )
 
     def _configure_window(self) -> None:
         """Configure a crisp and taskbar-safe main window. / 配置清晰且避开任务栏的主窗口。"""
@@ -840,9 +861,30 @@ class ModernCyberEditorApp:
         self._entry_field(
             resolve, 0, self.t("project_name"), self.project_var, column=1
         )
+        self._entry_field(
+            resolve, 1, self.t("drx_root"), self.drx_root_var, column=0
+        )
+        self._entry_field(
+            resolve, 1, self.t("fairlight_preset"),
+            self.fairlight_preset_var, column=1
+        )
+        self._entry_field(
+            resolve, 2, self.t("render_dir"), self.render_dir_var, column=0
+        )
+        self._entry_field(
+            resolve, 2, self.t("render_name"), self.render_name_var, column=1
+        )
+        self._entry_field(
+            resolve, 3, self.t("render_preset"),
+            self.render_preset_var, column=0, columnspan=2
+        )
+        self._entry_field(
+            resolve, 4, self.t("macro_profile"),
+            self.macro_profile_var, column=0, columnspan=2
+        )
         switches = ctk.CTkFrame(parent, fg_color="transparent")
         switches.grid(row=12, column=0, sticky="ew", pady=(7, 14))
-        switches.grid_columnconfigure((0, 1, 2), weight=1)
+        switches.grid_columnconfigure((0, 1), weight=1)
         self.skip_resolve_switch = ctk.CTkSwitch(
             switches, text=self.t("skip_resolve"),
             variable=self.skip_resolve_var, progress_color=COLORS["accent"],
@@ -861,7 +903,14 @@ class ModernCyberEditorApp:
             variable=self.render_preview_var, progress_color=COLORS["accent"],
             button_hover_color=COLORS["accent_hover"],
             text_color=COLORS["text"]
-        ).grid(row=0, column=2, sticky="w")
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.render_final_switch = ctk.CTkSwitch(
+            switches, text=self.t("render_final"),
+            variable=self.render_final_var, progress_color=COLORS["accent"],
+            button_hover_color=COLORS["accent_hover"],
+            text_color=COLORS["text"]
+        )
+        self.render_final_switch.grid(row=1, column=1, sticky="w", pady=(10, 0))
         if self.available_ollama_models:
             self.ollama_menu.set_values([
                 str(item["name"]) for item in self.available_ollama_models
@@ -1389,6 +1438,17 @@ class ModernCyberEditorApp:
             skip_resolve=bool(self.skip_resolve_var.get()),
             strict_fps=bool(self.strict_fps_var.get()),
             render_preview=bool(self.render_preview_var.get()),
+            drx_root=self.drx_root_var.get().strip() or "config/drx",
+            fairlight_preset=self.fairlight_preset_var.get().strip(),
+            macro_profile=self.macro_profile_var.get().strip(),
+            render_final=bool(self.render_final_var.get()),
+            render_dir=(
+                self.render_dir_var.get().strip() or "data/ui-run/final"
+            ),
+            render_name=(
+                self.render_name_var.get().strip() or "CyberEditor_final"
+            ),
+            render_preset=self.render_preset_var.get().strip(),
         )
 
     def _start_environment_check(self) -> None:

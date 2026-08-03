@@ -10,7 +10,17 @@
       "cut_in_sec": 12.5,
       "cut_out_sec": 18.2,
       "reason_for_cut": "完整表达主题观点",
-      "confidence": 0.9
+      "confidence": 0.9,
+      "transition_to_next": "cut",
+      "transition_duration_sec": 0.0,
+      "audio_cleanup": "strong",
+      "volume_db": -2.0,
+      "color_look": "neutral",
+      "motion": "static",
+      "drx_preset": "interview_clean",
+      "stabilization": "auto",
+      "tracking": "none",
+      "smart_reframe": false
     }
   ]
 }

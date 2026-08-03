@@ -43,6 +43,30 @@ DECISION_SCHEMA: Dict[str, Any] = {
                         "minimum": 0,
                         "maximum": 1,
                     },
+                    "volume_db": {"type": "number", "minimum": -24, "maximum": 12},
+                    "drx_preset": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "interview_clean",
+                            "cinematic",
+                            "low_light_cleanup",
+                        ],
+                    },
+                    "stabilization": {
+                        "type": "string",
+                        "enum": ["none", "auto"],
+                    },
+                    "tracking": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "magic_mask_forward",
+                            "magic_mask_backward",
+                            "magic_mask_bidirectional",
+                        ],
+                    },
+                    "smart_reframe": {"type": "boolean"},
                 },
                 "required": [
                     "cut_in_sec",
@@ -104,6 +128,30 @@ CANDIDATE_SCHEMA: Dict[str, Any] = {
                         "type": "string",
                         "enum": ["static", "gentle_push_in"],
                     },
+                    "volume_db": {"type": "number", "minimum": -24, "maximum": 12},
+                    "drx_preset": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "interview_clean",
+                            "cinematic",
+                            "low_light_cleanup",
+                        ],
+                    },
+                    "stabilization": {
+                        "type": "string",
+                        "enum": ["none", "auto"],
+                    },
+                    "tracking": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "magic_mask_forward",
+                            "magic_mask_backward",
+                            "magic_mask_bidirectional",
+                        ],
+                    },
+                    "smart_reframe": {"type": "boolean"},
                 },
                 "required": [
                     "cut_in_sec",
@@ -152,6 +200,30 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
                         "type": "string",
                         "enum": ["static", "gentle_push_in"],
                     },
+                    "volume_db": {"type": "number", "minimum": -24, "maximum": 12},
+                    "drx_preset": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "interview_clean",
+                            "cinematic",
+                            "low_light_cleanup",
+                        ],
+                    },
+                    "stabilization": {
+                        "type": "string",
+                        "enum": ["none", "auto"],
+                    },
+                    "tracking": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "magic_mask_forward",
+                            "magic_mask_backward",
+                            "magic_mask_bidirectional",
+                        ],
+                    },
+                    "smart_reframe": {"type": "boolean"},
                 },
                 "required": ["candidate_id"],
                 "additionalProperties": False,
@@ -909,7 +981,10 @@ class AIDirector:
             "sentences, expressive visuals, stable/focused shots, meaningful B-roll, "
             "and authentic moments; reject dead air, repetition, camera setup, severe "
             "shake, accidental frames, and unusable audio. Suggest restrained effects "
-            "only from the schema enums. Strong audio cleanup is for visibly/noisily "
+            "only from the schema enums. Stabilize only genuinely shaky shots; request "
+            "Magic Mask tracking only when a clear subject benefits from it. DRX names "
+            "refer to optional user-exported Resolve presets and should be 'none' unless "
+            "the look is clearly justified. Strong audio cleanup is for visibly/noisily "
             "problematic speech; transitions should serve the story, not decorate it. "
             "Every range must remain inside this window and cut_out_sec must be "
             "greater than cut_in_sec. An empty decisions array is allowed.\n"
@@ -952,6 +1027,11 @@ class AIDirector:
                     "suggested_audio": item.get("audio_cleanup", "light"),
                     "suggested_look": item.get("color_look", "neutral"),
                     "suggested_motion": item.get("motion", "static"),
+                    "suggested_volume_db": item.get("volume_db", 0.0),
+                    "suggested_drx": item.get("drx_preset", "none"),
+                    "suggested_stabilization": item.get("stabilization", "none"),
+                    "suggested_tracking": item.get("tracking", "none"),
+                    "suggested_smart_reframe": item.get("smart_reframe", False),
                 }
             )
         asset_names = [
@@ -1040,6 +1120,26 @@ class AIDirector:
                     {"static", "gentle_push_in"},
                     str(clip.get("motion") or "static"),
                 ),
+                (
+                    "drx_preset",
+                    {"none", "interview_clean", "cinematic", "low_light_cleanup"},
+                    str(clip.get("drx_preset") or "none"),
+                ),
+                (
+                    "stabilization",
+                    {"none", "auto"},
+                    str(clip.get("stabilization") or "none"),
+                ),
+                (
+                    "tracking",
+                    {
+                        "none",
+                        "magic_mask_forward",
+                        "magic_mask_backward",
+                        "magic_mask_bidirectional",
+                    },
+                    str(clip.get("tracking") or "none"),
+                ),
             ):
                 value = str(sequence_item.get(key) or default).strip().casefold()
                 clip[key] = value if value in allowed else default
@@ -1054,6 +1154,17 @@ class AIDirector:
                 0.0
                 if clip["transition_to_next"] == "cut"
                 else round(min(2.0, max(0.1, transition_duration)), 3)
+            )
+            volume_db = self._finite_float(
+                sequence_item.get("volume_db", clip.get("volume_db", 0.0)),
+                f"sequence[{index}].volume_db",
+            )
+            clip["volume_db"] = round(min(12.0, max(-24.0, volume_db)), 2)
+            smart_reframe = sequence_item.get(
+                "smart_reframe", clip.get("smart_reframe", False)
+            )
+            clip["smart_reframe"] = (
+                smart_reframe if isinstance(smart_reframe, bool) else False
             )
             final.append(clip)
         return final
@@ -1263,6 +1374,44 @@ class AIDirector:
                         decision.get("motion"),
                         {"static", "gentle_push_in"},
                         "static",
+                    ),
+                    "volume_db": round(
+                        min(
+                            12.0,
+                            max(
+                                -24.0,
+                                self._finite_float(
+                                    decision.get("volume_db", 0.0),
+                                    f"decisions[{index}].volume_db",
+                                ),
+                            ),
+                        ),
+                        2,
+                    ),
+                    "drx_preset": self._enum_value(
+                        decision.get("drx_preset"),
+                        {"none", "interview_clean", "cinematic", "low_light_cleanup"},
+                        "none",
+                    ),
+                    "stabilization": self._enum_value(
+                        decision.get("stabilization"),
+                        {"none", "auto"},
+                        "none",
+                    ),
+                    "tracking": self._enum_value(
+                        decision.get("tracking"),
+                        {
+                            "none",
+                            "magic_mask_forward",
+                            "magic_mask_backward",
+                            "magic_mask_bidirectional",
+                        },
+                        "none",
+                    ),
+                    "smart_reframe": (
+                        decision.get("smart_reframe", False)
+                        if isinstance(decision.get("smart_reframe", False), bool)
+                        else False
                     ),
                 }
             )

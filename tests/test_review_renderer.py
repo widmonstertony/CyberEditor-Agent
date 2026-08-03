@@ -28,7 +28,10 @@ class ReviewRendererTests(unittest.TestCase):
                 RenderClip(
                     str(media[1]), 1, 6, "cross_dissolve", 0.5, "strong"
                 ),
-                RenderClip(str(media[2]), 0, 3, "cut", 0, "none"),
+                RenderClip(
+                    str(media[2]), 0, 3, "cut", 0, "none",
+                    volume_db=-4.5,
+                ),
             ]
 
             with mock.patch.object(renderer, "_has_audio", return_value=True):
@@ -39,6 +42,7 @@ class ReviewRendererTests(unittest.TestCase):
             self.assertIn("concat=n=2:v=1:a=0", graph)
             self.assertIn("xfade=transition=fade:duration=0.5", graph)
             self.assertIn("afftdn=nr=18:nf=-30", graph)
+            self.assertIn("volume=-4.5dB", graph)
             self.assertIn("__FILTER_SCRIPT__", command)
             self.assertAlmostEqual(duration, 11.5)
 
