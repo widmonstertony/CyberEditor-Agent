@@ -543,6 +543,29 @@ def _absolute_path(value: str, project_root: Path) -> Path:
     return path.resolve()
 
 
+def console_python_executable(python_executable: str) -> str:
+    """
+    Return ``python.exe`` when a Windows GUI was launched with ``pythonw.exe``.
+    Windows 图形界面由 ``pythonw.exe`` 启动时返回同一环境的 ``python.exe``。
+
+    ``pythonw.exe`` deliberately detaches standard streams. Reusing it for the
+    orchestrator and heavy child stages can hide Whisper/Ollama diagnostics and
+    has caused model-download failures to surface only as exit code 2. The
+    console executable remains hidden by ``CREATE_NO_WINDOW`` while preserving
+    the stdout pipe consumed by the modern UI.
+
+    ``pythonw.exe`` 会主动脱离标准流；继续用它启动调度器与重型子阶段会隐藏
+    Whisper/Ollama 诊断，模型下载失败时只剩退出码 2。改用同一虚拟环境中的
+    ``python.exe``，并由 ``CREATE_NO_WINDOW`` 隐藏窗口，既不弹黑框又保留 UI 日志。
+    """
+    candidate = Path(python_executable).expanduser()
+    if os.name == "nt" and candidate.name.casefold() == "pythonw.exe":
+        console = candidate.with_name("python.exe")
+        if console.is_file():
+            return str(console.resolve())
+    return str(candidate)
+
+
 def build_runtime_environment() -> Dict[str, str]:
     """
     Build a Windows-friendly child-process environment.
@@ -801,7 +824,7 @@ class WorkflowOptions:
         """
         self.validate(project_root)
         command = [
-            python_executable,
+            console_python_executable(python_executable),
             str(project_root / "main.py"),
             "--data-dir",
             str(_absolute_path(self.data_dir, project_root)),
@@ -1090,7 +1113,7 @@ class CyberEditorApp:
         self.ctx_var = tk.IntVar(value=8192)
         self.timeline_var = tk.StringVar(value="CyberEditor Timeline")
         self.project_var = tk.StringVar(value="CyberEditor Project")
-        self.skip_resolve_var = tk.BooleanVar(value=False)
+        self.run_resolve_var = tk.BooleanVar(value=True)
         self.strict_fps_var = tk.BooleanVar(value=False)
         self.stage_var = tk.StringVar(value="准备就绪 / Ready")
         self.hardware_summary_var = tk.StringVar(
@@ -1361,12 +1384,12 @@ class CyberEditorApp:
 
         checks = ttk.Frame(parent, style="Card.TFrame")
         checks.grid(row=6, column=0, sticky="ew", pady=(10, 0))
-        self.skip_resolve_check = ttk.Checkbutton(
+        self.run_resolve_check = ttk.Checkbutton(
             checks,
-            text="只生成 JSON（未装 Studio 时保持勾选）/ JSON only",
-            variable=self.skip_resolve_var,
+            text="完成后发送到 Resolve / Send finished edit to Resolve",
+            variable=self.run_resolve_var,
         )
-        self.skip_resolve_check.pack(side=tk.LEFT)
+        self.run_resolve_check.pack(side=tk.LEFT)
         ttk.Checkbutton(
             checks,
             text="严格 FPS / Strict FPS",
@@ -1599,7 +1622,7 @@ class CyberEditorApp:
             num_ctx=int(self.ctx_var.get()),
             timeline_name=self.timeline_var.get().strip() or "CyberEditor Timeline",
             project_name=self.project_var.get().strip() or "CyberEditor Project",
-            skip_resolve=bool(self.skip_resolve_var.get()),
+            skip_resolve=not bool(self.run_resolve_var.get()),
             strict_fps=bool(self.strict_fps_var.get()),
         )
 
@@ -1612,10 +1635,10 @@ class CyberEditorApp:
         """Keep mode-dependent controls internally consistent. / 保持模式相关控件的一致性。"""
         flow = FLOW_LABELS.get(self.flow_var.get(), "full")
         if flow == "resolve":
-            self.skip_resolve_var.set(False)
-            self.skip_resolve_check.configure(state=tk.DISABLED)
+            self.run_resolve_var.set(True)
+            self.run_resolve_check.configure(state=tk.DISABLED)
         else:
-            self.skip_resolve_check.configure(state=tk.NORMAL)
+            self.run_resolve_check.configure(state=tk.NORMAL)
 
     def _on_profile_change(self, _event: object = None) -> None:
         """Apply a selected hardware preset and persist it. / 应用所选硬件预设并保存。"""
@@ -2207,7 +2230,6 @@ class CyberEditorApp:
             "num_ctx": self.ctx_var,
             "timeline_name": self.timeline_var,
             "project_name": self.project_var,
-            "skip_resolve": self.skip_resolve_var,
             "strict_fps": self.strict_fps_var,
         }
         for key, variable in mapping.items():
@@ -2216,6 +2238,8 @@ class CyberEditorApp:
                     variable.set(data[key])
                 except tk.TclError:
                     pass
+        if "skip_resolve" in data:
+            self.run_resolve_var.set(not bool(data["skip_resolve"]))
         saved_videos = data.get("videos", [])
         if isinstance(saved_videos, list):
             self.selected_videos = [

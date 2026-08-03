@@ -118,7 +118,12 @@ class WorkflowOrchestrator:
         """Initialize paths and active-process guard. / 初始化路径及活动进程保护。"""
         self.project_root = project_root.resolve()
         self.data_dir = data_dir.resolve()
-        self.python_executable = python_executable
+        executable = Path(python_executable).expanduser()
+        if os.name == "nt" and executable.name.casefold() == "pythonw.exe":
+            console = executable.with_name("python.exe")
+            if console.is_file():
+                executable = console
+        self.python_executable = str(executable)
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         self.active_process: Optional[subprocess.Popen] = None
 

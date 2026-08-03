@@ -535,8 +535,8 @@ class ModernCyberEditorApp:
         self.project_var = tk.StringVar(
             value=str(data.get("project_name", "CyberEditor Project"))
         )
-        self.skip_resolve_var = tk.BooleanVar(
-            value=bool(data.get("skip_resolve", False))
+        self.run_resolve_var = tk.BooleanVar(
+            value=not bool(data.get("skip_resolve", False))
         )
         self.strict_fps_var = tk.BooleanVar(
             value=bool(data.get("strict_fps", False))
@@ -885,13 +885,13 @@ class ModernCyberEditorApp:
         switches = ctk.CTkFrame(parent, fg_color="transparent")
         switches.grid(row=12, column=0, sticky="ew", pady=(7, 14))
         switches.grid_columnconfigure((0, 1), weight=1)
-        self.skip_resolve_switch = ctk.CTkSwitch(
-            switches, text=self.t("skip_resolve"),
-            variable=self.skip_resolve_var, progress_color=COLORS["accent"],
+        self.run_resolve_switch = ctk.CTkSwitch(
+            switches, text=self.t("run_resolve"),
+            variable=self.run_resolve_var, progress_color=COLORS["accent"],
             button_hover_color=COLORS["accent_hover"],
-            text_color=COLORS["text"]
+            text_color=COLORS["text"], command=self._on_run_resolve_change
         )
-        self.skip_resolve_switch.grid(row=0, column=0, sticky="w")
+        self.run_resolve_switch.grid(row=0, column=0, sticky="w")
         ctk.CTkSwitch(
             switches, text=self.t("strict_fps"),
             variable=self.strict_fps_var, progress_color=COLORS["accent"],
@@ -908,7 +908,7 @@ class ModernCyberEditorApp:
             switches, text=self.t("render_final"),
             variable=self.render_final_var, progress_color=COLORS["accent"],
             button_hover_color=COLORS["accent_hover"],
-            text_color=COLORS["text"]
+            text_color=COLORS["text"], command=self._on_render_final_change
         )
         self.render_final_switch.grid(row=1, column=1, sticky="w", pady=(10, 0))
         if self.available_ollama_models:
@@ -1110,11 +1110,33 @@ class ModernCyberEditorApp:
     def _apply_flow_rules(self) -> None:
         """Keep Resolve-only mode internally consistent. / 保持仅 Resolve 模式的内部状态一致。"""
         if self.flow_key == "resolve":
-            self.skip_resolve_var.set(False)
-            if hasattr(self, "skip_resolve_switch"):
-                self.skip_resolve_switch.configure(state="disabled")
-        elif hasattr(self, "skip_resolve_switch"):
-            self.skip_resolve_switch.configure(state="normal")
+            self.run_resolve_var.set(True)
+            if hasattr(self, "run_resolve_switch"):
+                self.run_resolve_switch.configure(state="disabled")
+        elif hasattr(self, "run_resolve_switch"):
+            self.run_resolve_switch.configure(state="normal")
+        self._sync_resolve_switches()
+
+    def _on_run_resolve_change(self) -> None:
+        """Keep final export disabled when Resolve execution is off. / 关闭 Resolve 时同步关闭最终导出。"""
+        if not self.run_resolve_var.get():
+            self.render_final_var.set(False)
+        self._sync_resolve_switches()
+        self._save_current_preferences()
+
+    def _on_render_final_change(self) -> None:
+        """Enabling final export also enables the required Resolve stage. / 开启最终导出时同时启用所需的 Resolve 阶段。"""
+        if self.render_final_var.get():
+            self.run_resolve_var.set(True)
+        self._sync_resolve_switches()
+        self._save_current_preferences()
+
+    def _sync_resolve_switches(self) -> None:
+        """Render consistent positive Resolve/export controls. / 使正向 Resolve/导出开关保持一致。"""
+        if hasattr(self, "render_final_switch"):
+            self.render_final_switch.configure(
+                state="normal" if self.run_resolve_var.get() else "disabled"
+            )
 
     def _fps_auto_display(self) -> str:
         """Format the automatic FPS choice with its detected value. / 格式化带检测值的自动 FPS 选项。"""
@@ -1435,7 +1457,7 @@ class ModernCyberEditorApp:
             project_name=(
                 self.project_var.get().strip() or "CyberEditor Project"
             ),
-            skip_resolve=bool(self.skip_resolve_var.get()),
+            skip_resolve=not bool(self.run_resolve_var.get()),
             strict_fps=bool(self.strict_fps_var.get()),
             render_preview=bool(self.render_preview_var.get()),
             drx_root=self.drx_root_var.get().strip() or "config/drx",

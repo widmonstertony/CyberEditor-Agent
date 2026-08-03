@@ -8,6 +8,7 @@ import unittest
 from src.gui import (
     WorkflowOptions,
     build_runtime_environment,
+    console_python_executable,
     detect_system_theme,
     enable_windows_high_dpi,
     get_primary_work_area,
@@ -18,6 +19,18 @@ from src.ui_i18n import resolve_language, translate
 
 
 class WorkflowOptionsTests(unittest.TestCase):
+    def test_pythonw_is_replaced_by_console_python_for_child_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pythonw = root / "pythonw.exe"
+            python = root / "python.exe"
+            pythonw.touch()
+            python.touch()
+
+            self.assertEqual(
+                console_python_executable(str(pythonw)), str(python.resolve())
+            )
+
     def test_full_workflow_builds_expected_flags(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
