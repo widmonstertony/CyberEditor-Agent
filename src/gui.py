@@ -528,6 +528,14 @@ def recommend_automatic_settings(
         if selected_pool
         else ""
     )
+    text_director_candidates = [
+        item for item in all_models
+        if any(marker in item[0].casefold() for marker in ("qwen2.5:72b", "qwen2.5:70b"))
+    ]
+    director_model = (
+        max(text_director_candidates, key=lambda item: item[1])[0]
+        if text_director_candidates else selected_model
+    )
     return {
         "profile": profile,
         "whisper_model": whisper_model,
@@ -535,6 +543,7 @@ def recommend_automatic_settings(
         "chunk_minutes": chunk_minutes,
         "num_ctx": num_ctx,
         "ollama_model": selected_model,
+        "director_model": director_model,
         "model_budget_gb": round(model_budget_gb, 1),
     }
 
@@ -718,6 +727,7 @@ class WorkflowOptions:
     whisper_device: str = "auto"
     language: str = ""
     ollama_model: str = "qwen2.5:3b"
+    director_model: str = ""
     ollama_url: str = "http://localhost:11434"
     chunk_minutes: float = 12.0
     project_fps: float = 25.0
@@ -854,6 +864,8 @@ class WorkflowOptions:
             self.whisper_device,
             "--ollama-model",
             self.ollama_model,
+            "--director-model",
+            self.director_model or self.ollama_model,
             "--ollama-url",
             self.ollama_url,
             "--chunk-minutes",

@@ -249,6 +249,25 @@ class WorkflowOrchestrator:
                     len(assets),
                 )
 
+            music_analysis = self.data_dir / "music_analysis.json"
+            if not args.skip_director and args.music_folder:
+                music_command = [
+                    self.python_executable,
+                    "-m",
+                    "src.music_analyzer",
+                    "--library",
+                    str(args.music_folder),
+                    "--output",
+                    str(music_analysis),
+                    "--query",
+                    str(args.creative_brief or "documentary cinematic"),
+                    "--log-level",
+                    args.log_level,
+                ]
+                self._run_stage("授权配乐搜索与鼓点分析 / Licensed music and beats", music_command)
+                self._require_file(music_analysis, "配乐分析未生成 music_analysis.json")
+                self._release_barrier("Librosa CPU music analysis")
+
             if not args.skip_director:
                 try:
                     _, ollama_started = ensure_ollama_service(
@@ -272,6 +291,8 @@ class WorkflowOrchestrator:
                     str(timeline_cuts),
                     "--model",
                     args.ollama_model,
+                    "--text-model",
+                    args.director_model or args.ollama_model,
                     "--ollama-url",
                     args.ollama_url,
                     "--chunk-minutes",
@@ -293,6 +314,7 @@ class WorkflowOrchestrator:
                     command.extend(["--creative-brief", args.creative_brief.strip()])
                 if args.music_folder:
                     command.extend(["--music-folder", str(args.music_folder)])
+                    command.extend(["--music-analysis", str(music_analysis)])
                 try:
                     self._run_stage("导演 / Direct", command)
                 finally:
@@ -301,6 +323,10 @@ class WorkflowOrchestrator:
                     self._force_ollama_unload(
                         args.ollama_model, args.ollama_url
                     )
+                    if args.director_model and args.director_model != args.ollama_model:
+                        self._force_ollama_unload(
+                            args.director_model, args.ollama_url
+                        )
                 self._require_file(
                     timeline_cuts, "导演阶段未生成 timeline_cuts.json"
                 )
@@ -676,6 +702,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-interval", type=float, default=2.0)
     parser.add_argument("--max-keyframes", type=int, default=240)
     parser.add_argument("--ollama-model", default="qwen2.5:32b")
+    parser.add_argument(
+        "--director-model",
+        default="",
+        help="视觉阶段卸载后加载的全局文字导演；空值沿用视觉模型 / global text director",
+    )
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--chunk-minutes", type=float, default=12.0)
     parser.add_argument("--project-fps", type=float, default=25.0)

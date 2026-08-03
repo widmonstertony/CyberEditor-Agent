@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 LOGGER_NAME = "cybereditor.director"
 DIRECTOR_CHECKPOINT_VERSION = 1
-DIRECTOR_PROMPT_VERSION = "2026-08-03.0-director-treatment"
+DIRECTOR_PROMPT_VERSION = "2026-08-03.1-72b-per-source-color"
 
 TREATMENT_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -353,6 +353,7 @@ class AIDirector:
     def __init__(
         self,
         model: str,
+        text_model: Optional[str] = None,
         base_url: str = "http://localhost:11434",
         chunk_minutes: float = 12.0,
         project_fps: float = 25.0,
@@ -363,6 +364,7 @@ class AIDirector:
         target_duration_sec: float = 0.0,
         camera_profile: str = "sony_pp8_slog3_sgamut3cine",
         music_folder: Optional[os.PathLike] = None,
+        music_analysis: Optional[os.PathLike] = None,
         session: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -387,6 +389,7 @@ class AIDirector:
             )
 
         self.model = model.strip()
+        self.text_model = str(text_model or model).strip()
         self.base_url = base_url.rstrip("/")
         self.chunk_duration_sec = chunk_minutes * 60.0
         self.project_fps = float(project_fps)
@@ -410,6 +413,14 @@ class AIDirector:
             raise DirectorError(
                 f"配乐目录不存在 / Music folder not found: {self.music_folder}"
             )
+        self.music_analysis_path = (
+            Path(music_analysis).expanduser().resolve() if music_analysis else None
+        )
+        if self.music_analysis_path is not None and not self.music_analysis_path.is_file():
+            raise DirectorError(
+                f"配乐分析文件不存在 / Music analysis not found: {self.music_analysis_path}"
+            )
+        self._music_analysis: Dict[str, Any] = {}
         self._active_treatment: Dict[str, Any] = {}
         self._active_target_duration_sec = 0.0
         self._music_files: List[Path] = []
@@ -599,7 +610,9 @@ class AIDirector:
             {
                 "director_treatment": treatment,
                 "target_duration_sec": self._active_target_duration_sec,
-                "color_pipeline": self.build_color_pipeline(treatment),
+                "color_pipeline": self.build_color_pipeline(
+                    treatment, assets, raw_data.get("color_match_plan")
+                ),
                 "candidate_count": len(candidates),
                 "candidate_audit": candidates,
                 "clips": final_clips,
@@ -677,7 +690,13 @@ class AIDirector:
         candidates: List[Dict[str, Any]] = []
         try:
             self.check_ollama(require_vision=True)
-            self._music_files = self.discover_music_files()
+            self._music_analysis = self.load_music_analysis()
+            analyzed_tracks = self._music_analysis.get("tracks", [])
+            self._music_files = [
+                Path(str(item.get("file_name"))).expanduser().resolve()
+                for item in analyzed_tracks
+                if isinstance(item, dict) and str(item.get("file_name") or "").strip()
+            ] or self.discover_music_files()
             treatment_payload = self.request_treatment(assets)
             treatment = self.validate_treatment(treatment_payload, assets)
             self._active_treatment = treatment
@@ -744,21 +763,45 @@ class AIDirector:
                 raise DirectorError(
                     "视觉导演未找到任何可用片段 / Visual director found no usable clips."
                 )
+            if self.text_model.casefold() != self.model.casefold():
+                self.logger.info(
+                    "视觉候选完成，卸载 %s 后加载 72B 文字导演 %s / Switching from vision to text director",
+                    self.model,
+                    self.text_model,
+                )
+                self.unload_model(self.model)
+                self.check_ollama(model=self.text_model)
             sequence_payload = self.request_sequence(candidates, assets, treatment)
             final_clips = self.validate_sequence(
                 sequence_payload, candidates, treatment
             )
         finally:
-            self.unload_model()
+            self.unload_model(self.model)
+            if self.text_model.casefold() != self.model.casefold():
+                self.unload_model(self.text_model)
 
+        music_plan = self.validate_music_plan(sequence_payload.get("music_plan"))
+        final_clips = self.snap_visual_cuts_to_beats(final_clips, music_plan, assets)
+        color_pipeline = self.build_color_pipeline(
+            treatment, assets, raw_data.get("color_match_plan")
+        )
+        color_sources = color_pipeline.get("sources", {})
         for index, clip in enumerate(final_clips, start=1):
             clip["clip_id"] = index
+            source_color = color_sources.get(str(clip.get("asset_id") or ""), {})
+            if isinstance(source_color, dict):
+                clip["source_color"] = {
+                    key: value for key, value in source_color.items()
+                    if key != "color_match"
+                }
+                clip["color_match"] = dict(source_color.get("color_match") or {})
         output: Dict[str, Any] = {
             "schema_version": "3.0",
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "project_fps": self.project_fps,
             "source_raw_data": str(raw_path),
-            "director_model": self.model,
+            "vision_model": self.model,
+            "director_model": self.text_model,
             "chunk_duration_sec": self.chunk_duration_sec,
             "asset_count": len(assets),
             "candidate_count": len(candidates),
@@ -766,10 +809,8 @@ class AIDirector:
             "project_summary": str(sequence_payload.get("project_summary") or "").strip(),
             "director_treatment": treatment,
             "target_duration_sec": self._active_target_duration_sec,
-            "color_pipeline": self.build_color_pipeline(treatment),
-            "music_plan": self.validate_music_plan(
-                sequence_payload.get("music_plan")
-            ),
+            "color_pipeline": color_pipeline,
+            "music_plan": music_plan,
             "effects_engine": {
                 "review": "ffmpeg",
                 "editable_timeline": "davinci_resolve",
@@ -988,7 +1029,9 @@ class AIDirector:
             )
         return chunks
 
-    def check_ollama(self, require_vision: bool = False) -> None:
+    def check_ollama(
+        self, require_vision: bool = False, model: Optional[str] = None
+    ) -> None:
         """
         Verify Ollama is reachable and the configured model is installed.
         验证 Ollama 可访问且已安装配置的模型。
@@ -1010,13 +1053,18 @@ class AIDirector:
             for item in models
             if isinstance(item, dict)
         }
-        requested_base = self.model.split(":", 1)[0]
-        if self.model not in names and not any(
-            name.split(":", 1)[0] == requested_base for name in names
-        ):
+        selected_model = str(model or self.model).strip()
+        requested_base = selected_model.split(":", 1)[0]
+        normalized_names = {name.casefold() for name in names}
+        installed = (
+            selected_model.casefold() in normalized_names
+            if ":" in selected_model
+            else any(name.split(":", 1)[0].casefold() == requested_base.casefold() for name in names)
+        )
+        if not installed:
             available = ", ".join(sorted(name for name in names if name)) or "(none)"
             raise DirectorError(
-                f"Ollama 中未找到模型 {self.model!r}。请先执行：ollama pull {self.model}\n"
+                f"Ollama 中未找到模型 {selected_model!r}。请先执行：ollama pull {selected_model}\n"
                 f"Model not installed. Available: {available}"
             )
 
@@ -1048,7 +1096,7 @@ class AIDirector:
             name
             for name in loaded
             if name
-            and name != self.model
+            and name != selected_model
             and name.split(":", 1)[0] != requested_base
         }
         if unrelated:
@@ -1132,12 +1180,14 @@ class AIDirector:
         prompt: str,
         schema: Dict[str, Any],
         images: Sequence[str] = (),
+        model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Send one schema-constrained Ollama request with optional real images.
         发送一次受 Schema 约束、可包含真实图片的 Ollama 请求。
         """
-        normalized_model = self.model.casefold()
+        selected_model = str(model or self.model).strip()
+        normalized_model = selected_model.casefold()
         # Ollama accepts low/medium/high only for GPT-OSS. Qwen and other
         # thinking models use a boolean. Supplying "high" to Qwen can consume
         # the whole generation budget in the separate `thinking` field and
@@ -1158,7 +1208,7 @@ class AIDirector:
             attempts, start=1
         ):
             payload: Dict[str, Any] = {
-                "model": self.model,
+                "model": selected_model,
                 "system": (
                     "You are a senior documentary editor and visual storyteller. "
                     "Use only supplied transcript, timestamps, and images. Return "
@@ -1280,7 +1330,9 @@ class AIDirector:
             "problematic speech; transitions should serve the story, not decorate it. "
             "Every range must remain inside this window, cut_out_sec must be "
             "greater than cut_in_sec, and each candidate must be no longer than "
-            "15 seconds. Do not keep an entire setup conversation. An empty "
+            "dynamic duration limits: B-roll 10s, bridges 12s, context/opening 20s, "
+            "climax 25s, closing 30s, and complete interview thoughts up to 45s. "
+            "Do not keep an entire setup conversation. An empty "
             "decisions array is preferred when this source adds no new story value.\n"
             "Source order in the shoot: {source_order}. Preserve production chronology.\n"
             "Source/proxy media: {source}\n"
@@ -1346,8 +1398,10 @@ class AIDirector:
             "chatter that does not serve it, and design a complete emotional arc. "
             "Choose 4-8 story_anchors from the supplied exact asset_id and absolute "
             "timestamps. Anchors must cover at least three beats and at least three "
-            "different sources when the footage supports it; each anchor must be "
-            "1.5-15 seconds and cannot cross an asset duration. Include a complete "
+            "different sources when the footage supports it. Use dynamic duration: "
+            "1.5-10 seconds for B-roll, up to 20 seconds for context, and up to 45 "
+            "seconds for an uninterrupted complete spoken thought; never cross an "
+            "asset duration. Include a complete "
             "ending action rather than a one-word tail. "
             "Use the exact requested target duration (within one second). The camera "
             "profile is technical input metadata, not a creative look. Return JSON only.\n"
@@ -1432,8 +1486,12 @@ class AIDirector:
                 continue
             duration = float(asset.get("duration_sec", 0))
             cut_in = max(0.0, min(duration, cut_in))
-            cut_out = max(cut_in, min(duration, cut_out, cut_in + 15.0))
             beat = str(raw_anchor.get("beat") or "").casefold()
+            anchor_role = "closing" if beat == "ending" else "interview"
+            cut_out = max(
+                cut_in,
+                min(duration, cut_out, cut_in + self._max_candidate_duration(anchor_role, True)),
+            )
             reason = " ".join(str(raw_anchor.get("reason") or "").split())
             if cut_out - cut_in < 1.5 or beat not in {
                 "opening", "development", "payoff", "ending"
@@ -1567,26 +1625,94 @@ class AIDirector:
             key=lambda path: str(path).casefold(),
         )[:200]
 
-    def build_color_pipeline(self, treatment: Dict[str, Any]) -> Dict[str, Any]:
-        """Build technical input transform plus creative intent. / 构建技术输入变换与创意色彩意图。"""
-        if self.camera_profile == "rec709":
-            return {
-                "camera_profile": "rec709",
-                "enabled": False,
-                "creative_look": treatment.get("creative_look", "clean_neutral"),
+    def build_color_pipeline(
+        self,
+        treatment: Dict[str, Any],
+        assets: Sequence[Dict[str, Any]] = (),
+        color_match_plan: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build per-source technical transforms plus bounded matching corrections.
+        构建逐素材技术变换与受限的曝光/白平衡匹配。
+
+        Sony XML always wins. The legacy camera-profile option is used only as
+        an explicit fallback when sidecar metadata is missing.
+        Sony XML 始终优先；仅在伴随元数据缺失时才采用显式旧版相机配置作为回退。
+        """
+        matches = color_match_plan if isinstance(color_match_plan, dict) else {}
+        corrections = matches.get("assets") if isinstance(matches.get("assets"), dict) else {}
+        source_map: Dict[str, Any] = {}
+        for asset in assets:
+            asset_id = str(asset.get("asset_id") or "").strip()
+            if not asset_id:
+                continue
+            detected = asset.get("source_color")
+            source = dict(detected) if isinstance(detected, dict) else {}
+            if not bool(source.get("transform_supported")):
+                if self.camera_profile == "sony_pp8_slog3_sgamut3cine":
+                    source.update(
+                        {
+                            "camera_profile": "sony_slog3_sgamut3cine",
+                            "resolve_input_color_space": "Sony S-Gamut3.Cine",
+                            "resolve_input_gamma": "S-Log3",
+                            "transform_supported": True,
+                            "is_log": True,
+                            "source": "explicit_fallback",
+                        }
+                    )
+                elif self.camera_profile == "rec709":
+                    source.update(
+                        {
+                            "camera_profile": "rec709",
+                            "resolve_input_color_space": "Rec.709",
+                            "resolve_input_gamma": "Gamma 2.4",
+                            "transform_supported": True,
+                            "is_log": False,
+                            "source": "explicit_fallback",
+                        }
+                    )
+            source_map[asset_id] = {
+                "asset_id": asset_id,
+                "file_name": str(asset.get("proxy_file_name") or asset.get("source_video") or ""),
+                "camera_profile": str(source.get("camera_profile") or "unknown"),
+                "capture_gamma": str(source.get("capture_gamma") or ""),
+                "capture_primaries": str(source.get("capture_primaries") or ""),
+                "resolve_input_color_space": str(source.get("resolve_input_color_space") or ""),
+                "resolve_input_gamma": str(source.get("resolve_input_gamma") or ""),
+                "transform_supported": bool(source.get("transform_supported")),
+                "is_log": bool(source.get("is_log")),
+                "metadata_source": str(source.get("source") or "missing"),
+                "sidecar_path": str(source.get("sidecar_path") or ""),
+                "color_match": dict(corrections.get(asset_id, {}))
+                if isinstance(corrections.get(asset_id), dict) else {},
             }
         return {
-            "camera_profile": "sony_pp8_slog3_sgamut3cine",
-            "enabled": True,
-            "input_color_space": "Sony S-Gamut3.Cine",
-            "input_gamma": "S-Log3",
+            "mode": "per_source",
+            "camera_profile": "mixed_or_detected",
+            "enabled": any(bool(item.get("is_log")) for item in source_map.values()),
+            "default_input_color_space": "Rec.709",
+            "default_input_gamma": "Gamma 2.4",
             "timeline_color_space": "DaVinci WG",
             "timeline_gamma": "DaVinci Intermediate",
             "output_color_space": "Rec.709",
             "output_gamma": "Gamma 2.4",
             "creative_look": treatment.get("creative_look", "clean_neutral"),
             "color_intent": treatment.get("color_intent", ""),
+            "matching": matches,
+            "sources": source_map,
         }
+
+    def load_music_analysis(self) -> Dict[str, Any]:
+        """Load CPU beat-analysis output without importing librosa here. / 读取 CPU 鼓点分析结果。"""
+        if self.music_analysis_path is None:
+            return {}
+        try:
+            payload = json.loads(self.music_analysis_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DirectorError(f"无法读取配乐分析 / Cannot read music analysis: {exc}") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("tracks"), list):
+            raise DirectorError("配乐分析格式无效 / Invalid music-analysis schema.")
+        return payload
 
     def validate_music_plan(self, payload: Any) -> Dict[str, Any]:
         """Resolve a model-selected track only within the supplied library. / 仅在用户配乐库中解析模型选择。"""
@@ -1602,6 +1728,14 @@ class AIDirector:
                 "AI 选择了配乐库之外的文件 %r，已安全忽略 / Ignoring music outside the supplied library",
                 requested,
             )
+        analyzed = next(
+            (
+                item for item in self._music_analysis.get("tracks", [])
+                if isinstance(item, dict) and selected is not None
+                and str(item.get("file_name") or "").casefold() == str(selected).casefold()
+            ),
+            {},
+        )
         return {
             "file_name": str(selected) if selected else "",
             "reason": " ".join(str(value.get("reason") or "").split()),
@@ -1609,7 +1743,71 @@ class AIDirector:
             "fade_in_sec": round(min(10.0, max(0.0, float(value.get("fade_in_sec", 2)))), 2),
             "fade_out_sec": round(min(10.0, max(0.0, float(value.get("fade_out_sec", 3)))), 2),
             "duck_dialogue": value.get("duck_dialogue", True) is True,
+            "tempo_bpm": float(analyzed.get("tempo_bpm", 0) or 0),
+            "duration_sec": float(analyzed.get("duration_sec", 0) or 0),
+            "beats_sec": [
+                round(float(beat), 4) for beat in analyzed.get("beats_sec", [])
+                if isinstance(beat, (int, float)) and float(beat) >= 0
+            ],
+            "license": str(analyzed.get("license") or ("user-supplied" if selected else "")),
+            "license_url": str(analyzed.get("license_url") or ""),
+            "license_provenance": str(analyzed.get("license_provenance") or ""),
         }
+
+    def snap_visual_cuts_to_beats(
+        self,
+        clips: Sequence[Dict[str, Any]],
+        music_plan: Dict[str, Any],
+        assets: Sequence[Dict[str, Any]],
+        max_shift_sec: float = 0.25,
+    ) -> List[Dict[str, Any]]:
+        """
+        Nudge visual-only out-points to nearby beats while preserving source bounds.
+        在不越过素材边界的前提下，把纯画面出点轻微吸附到邻近鼓点。
+
+        Dialogue and closing thoughts are never time-warped or truncated for a beat.
+        对话与结尾语义绝不会为了卡点被截断或变速。
+        """
+        beats = [float(value) for value in music_plan.get("beats_sec", []) if isinstance(value, (int, float))]
+        track_duration = float(music_plan.get("duration_sec", 0) or 0)
+        if not beats or track_duration <= 0:
+            return [dict(item) for item in clips]
+        total_duration = sum(
+            max(0.0, float(item.get("cut_out_sec", 0)) - float(item.get("cut_in_sec", 0)))
+            for item in clips
+        )
+        absolute_beats: List[float] = []
+        loop = 0
+        while loop * track_duration <= total_duration + max_shift_sec:
+            absolute_beats.extend(loop * track_duration + beat for beat in beats)
+            loop += 1
+        asset_duration = {
+            str(asset.get("asset_id") or ""): float(asset.get("duration_sec", 0) or 0)
+            for asset in assets
+        }
+        result: List[Dict[str, Any]] = []
+        timeline_cursor = 0.0
+        snap_roles = {"opening", "broll", "bridge", "climax"}
+        for original in clips:
+            item = dict(original)
+            duration = float(item.get("cut_out_sec", 0)) - float(item.get("cut_in_sec", 0))
+            proposed_end = timeline_cursor + duration
+            if str(item.get("story_role") or "").casefold() in snap_roles and absolute_beats:
+                nearest = min(absolute_beats, key=lambda beat: abs(beat - proposed_end))
+                shift = nearest - proposed_end
+                source_end = float(item.get("cut_out_sec", 0)) + shift
+                maximum = asset_duration.get(str(item.get("asset_id") or ""), source_end)
+                new_duration = duration + shift
+                if abs(shift) <= max_shift_sec and new_duration >= 0.4 and source_end <= maximum + 1e-6:
+                    item["cut_out_sec"] = round(source_end, 3)
+                    item["beat_snap"] = {
+                        "timeline_beat_sec": round(nearest, 4),
+                        "shift_sec": round(shift, 4),
+                    }
+                    duration = new_duration
+            result.append(item)
+            timeline_cursor += max(0.0, duration)
+        return result
 
     def request_sequence(
         self,
@@ -1657,7 +1855,18 @@ class AIDirector:
             for source_order, asset in enumerate(assets)
         ]
         treatment = treatment or self._active_treatment
-        music_choices = [path.name for path in self._music_files]
+        music_choices = [
+            {
+                "track_file": Path(str(item.get("file_name") or "")).name,
+                "title": item.get("title", ""),
+                "mood": item.get("mood", ""),
+                "tags": item.get("tags", []),
+                "tempo_bpm": item.get("tempo_bpm", 0),
+                "license": item.get("license", ""),
+            }
+            for item in self._music_analysis.get("tracks", [])
+            if isinstance(item, dict)
+        ] or [{"track_file": path.name} for path in self._music_files]
         prompt = (
             "You have already inspected representative frames and transcripts "
             "from every source video. Build one coherent documentary edit from "
@@ -1687,7 +1896,7 @@ class AIDirector:
             len(candidates),
             len(candidates),
         )
-        return self._request_json(prompt, SEQUENCE_SCHEMA)
+        return self._request_json(prompt, SEQUENCE_SCHEMA, model=self.text_model)
 
     def validate_sequence(
         self,
@@ -2101,6 +2310,11 @@ class AIDirector:
                 raise DirectorError(
                     f"decisions[{index}] 必须是对象 / must be an object."
                 )
+            story_role = self._enum_value(
+                decision.get("story_role"),
+                {"opening", "context", "interview", "broll", "bridge", "climax", "closing"},
+                "context",
+            )
             cut_in = self._finite_float(
                 decision.get("cut_in_sec"), f"decisions[{index}].cut_in_sec"
             )
@@ -2114,12 +2328,13 @@ class AIDirector:
                 )
             cut_in = max(chunk_start, cut_in)
             cut_out = min(chunk_end, cut_out)
-            if cut_out - cut_in > 15.0:
+            maximum_duration = self._max_candidate_duration(story_role)
+            if cut_out - cut_in > maximum_duration:
                 self.logger.warning(
-                    "候选片段超过 15 秒，已截短：%.3f-%.3f / Candidate exceeded 15s and was shortened",
-                    cut_in, cut_out,
+                    "候选片段超过 %s 角色上限 %.1f 秒，已截短：%.3f-%.3f / Candidate exceeded role limit and was shortened",
+                    story_role, maximum_duration, cut_in, cut_out,
                 )
-                cut_out = cut_in + 15.0
+                cut_out = cut_in + maximum_duration
             if cut_in < 0 or cut_out - cut_in < 0.2:
                 raise DirectorError(
                     f"decisions[{index}] 时间范围过短或无效 / range is invalid."
@@ -2141,19 +2356,6 @@ class AIDirector:
                 f"decisions[{index}].quality_score",
             )
             quality_value = min(1.0, max(0.0, quality_value))
-            story_role = self._enum_value(
-                decision.get("story_role"),
-                {
-                    "opening",
-                    "context",
-                    "interview",
-                    "broll",
-                    "bridge",
-                    "climax",
-                    "closing",
-                },
-                "context",
-            )
             transition = self._enum_value(
                 decision.get("transition_to_next"),
                 {"cut", "cross_dissolve", "fade_black"},
@@ -2238,6 +2440,27 @@ class AIDirector:
             )
         return validated
 
+    @staticmethod
+    def _max_candidate_duration(story_role: object, protected: bool = False) -> float:
+        """
+        Return a narrative-role-specific shot ceiling in seconds.
+        按叙事角色返回动态镜头时长上限（秒）。
+
+        Dialogue and conclusions need complete thoughts; visual bridges stay concise.
+        对话与结尾需要完整语义，纯画面桥段则保持简洁。
+        """
+        role = str(story_role or "context").casefold()
+        limits = {
+            "interview": 45.0,
+            "closing": 30.0,
+            "climax": 25.0,
+            "opening": 20.0,
+            "context": 20.0,
+            "bridge": 12.0,
+            "broll": 10.0,
+        }
+        return max(limits.get(role, 20.0), 45.0 if protected else 0.0)
+
     def merge_decisions(
         self, decisions: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -2264,6 +2487,13 @@ class AIDirector:
                 str(previous["file_name"]).casefold()
                 == str(current["file_name"]).casefold()
             )
+            merged_role = str(
+                previous.get("story_role") or current.get("story_role") or "context"
+            )
+            protected = bool(
+                previous.get("protected_story_anchor")
+                or current.get("protected_story_anchor")
+            )
             touches = (
                 float(current["cut_in_sec"])
                 <= float(previous["cut_out_sec"]) + self.merge_gap_sec
@@ -2273,7 +2503,7 @@ class AIDirector:
                 ) - min(
                     float(previous["cut_in_sec"]),
                     float(current["cut_in_sec"]),
-                ) <= 15.0
+                ) <= self._max_candidate_duration(merged_role, protected)
             )
             if same_media and touches:
                 previous["cut_out_sec"] = round(
@@ -2307,7 +2537,7 @@ class AIDirector:
                 merged.append(current)
         return merged
 
-    def unload_model(self) -> None:
+    def unload_model(self, model: Optional[str] = None) -> None:
         """
         Ask Ollama to immediately unload the configured model.
         请求 Ollama 立即卸载配置的模型。
@@ -2321,11 +2551,12 @@ class AIDirector:
         """
         if self._session is None:
             return
+        selected_model = str(model or self.model).strip()
         try:
             response = self.session.post(
                 self.base_url + "/api/generate",
                 json={
-                    "model": self.model,
+                    "model": selected_model,
                     "prompt": "",
                     "stream": False,
                     "keep_alive": 0,
@@ -2335,8 +2566,8 @@ class AIDirector:
             response.raise_for_status()
             self.logger.info(
                 "已请求 Ollama 卸载模型 %s / Requested Ollama unload for %s",
-                self.model,
-                self.model,
+                selected_model,
+                selected_model,
             )
         except Exception as exc:
             self.logger.warning(
@@ -2417,6 +2648,7 @@ class AIDirector:
             ) from exc
         settings = {
             "model": self.model,
+            "text_model": self.text_model,
             "chunk_duration_sec": self.chunk_duration_sec,
             "num_ctx": self.num_ctx,
             "prompt_version": DIRECTOR_PROMPT_VERSION,
@@ -2424,6 +2656,7 @@ class AIDirector:
             "target_duration_sec": self.target_duration_sec,
             "camera_profile": self.camera_profile,
             "music_folder": str(self.music_folder or ""),
+            "music_analysis": str(self.music_analysis_path or ""),
         }
         digest.update(
             json.dumps(settings, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -2514,6 +2747,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-data", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--text-model",
+        default="",
+        help="卸载视觉模型后使用的全局文字导演 / global text director loaded after vision unload",
+    )
     parser.add_argument("--proxy-file-name")
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--chunk-minutes", type=float, default=12.0)
@@ -2538,6 +2776,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("sony_pp8_slog3_sgamut3cine", "rec709", "auto"),
     )
     parser.add_argument("--music-folder")
+    parser.add_argument("--music-analysis")
     parser.add_argument(
         "--revalidate-existing",
         action="store_true",
@@ -2558,6 +2797,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         director = AIDirector(
             model=args.model,
+            text_model=args.text_model or args.model,
             base_url=args.ollama_url,
             chunk_minutes=args.chunk_minutes,
             project_fps=args.project_fps,
@@ -2568,6 +2808,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             target_duration_sec=args.target_duration_sec,
             camera_profile=args.camera_profile,
             music_folder=args.music_folder,
+            music_analysis=args.music_analysis,
             logger=logger,
         )
         if args.revalidate_existing:

@@ -51,6 +51,8 @@ class RenderClip(NamedTuple):
     color_look: str = "neutral"
     motion: str = "static"
     volume_db: float = 0.0
+    source_color: Optional[Dict[str, Any]] = None
+    color_match: Optional[Dict[str, Any]] = None
 
 
 class ReviewRenderer:
@@ -104,9 +106,14 @@ class ReviewRenderer:
             )
         fps, clips = self.load_plan()
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        if bool(self.color_pipeline.get("enabled")) and str(
-            self.color_pipeline.get("camera_profile", "")
-        ).casefold() == "sony_pp8_slog3_sgamut3cine":
+        sources = self.color_pipeline.get("sources", {})
+        has_slog3 = any(
+            str(item.get("resolve_input_gamma") or "").casefold() == "s-log3"
+            for item in (sources.values() if isinstance(sources, dict) else [])
+            if isinstance(item, dict)
+        )
+        legacy_slog3 = str(self.color_pipeline.get("camera_profile", "")).casefold() == "sony_pp8_slog3_sgamut3cine"
+        if bool(self.color_pipeline.get("enabled")) and (has_slog3 or legacy_slog3):
             self.technical_lut_path = ensure_sony_pp8_display_lut(
                 self.output_path.parent / "technical_luts" / "sony_pp8_to_rec709.cube"
             )
@@ -239,6 +246,14 @@ class ReviewRenderer:
                             ),
                         ),
                     ),
+                    source_color=(
+                        dict(item["source_color"])
+                        if isinstance(item.get("source_color"), dict) else None
+                    ),
+                    color_match=(
+                        dict(item["color_match"])
+                        if isinstance(item.get("color_match"), dict) else None
+                    ),
                 )
             )
         if not result:
@@ -297,7 +312,8 @@ class ReviewRenderer:
                 f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
                 f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2,"
                 f"fps={self._number(fps)},format=yuv420p"
-                f"{self._technical_color_filter()}"
+                f"{self._technical_color_filter(clip)}"
+                f"{self._color_match_filter(clip)}"
                 f"{self._color_filter(clip.color_look)}"
                 f"{self._motion_filter(clip.motion, fps)}[v{index}]"
             )
@@ -509,13 +525,36 @@ class ReviewRenderer:
             "contrast": ",eq=contrast=1.10:brightness=-.01:saturation=1.06",
         }[look]
 
-    def _technical_color_filter(self) -> str:
-        """Return the generated PP8 input transform for FFmpeg. / 返回 FFmpeg 的 PP8 技术输入变换。"""
+    def _technical_color_filter(self, clip: Optional[RenderClip] = None) -> str:
+        """Return a source-specific S-Log3 preview transform. / 返回逐素材 S-Log3 预览变换。"""
         if self.technical_lut_path is None:
             return ""
+        if clip is not None and isinstance(clip.source_color, dict):
+            gamma = str(clip.source_color.get("resolve_input_gamma") or "").casefold()
+            if gamma and gamma != "s-log3":
+                # S-Log2 is intentionally left to Resolve's verified native RCM;
+                # applying an S-Log3 LUT would be visibly wrong.
+                return ""
         escaped = self.technical_lut_path.as_posix().replace("\\", "/")
         escaped = escaped.replace(":", "\\:").replace("'", "\\'")
         return f",lut3d=file='{escaped}':interp=tetrahedral"
+
+    def _color_match_filter(self, clip: RenderClip) -> str:
+        """Return bounded per-source exposure/WB matching for FFmpeg preview. / 返回预览用受限曝光/白平衡匹配。"""
+        value = clip.color_match or {}
+        if not isinstance(value, dict) or not value:
+            return ""
+        try:
+            exposure = max(-1.5, min(1.5, float(value.get("exposure_ev", 0))))
+            raw = value.get("rgb_gain", [1.0, 1.0, 1.0])
+            gains = [max(0.667, min(1.5, float(raw[index]))) for index in range(3)]
+        except (IndexError, TypeError, ValueError):
+            return ""
+        return (
+            ",colorchannelmixer="
+            f"rr={self._number(gains[0])}:gg={self._number(gains[1])}:bb={self._number(gains[2])}"
+            f",exposure=exposure={self._number(exposure)}"
+        )
 
     def _motion_filter(self, motion: str, fps: float) -> str:
         if motion != "gentle_push_in":

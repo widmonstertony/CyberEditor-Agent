@@ -506,6 +506,9 @@ class ModernCyberEditorApp:
         self.ollama_model_var = tk.StringVar(
             value=str(data.get("ollama_model", "qwen2.5:3b"))
         )
+        self.director_model_var = tk.StringVar(
+            value=str(data.get("director_model", ""))
+        )
         self.ollama_url_var = tk.StringVar(
             value=str(data.get("ollama_url", "http://localhost:11434"))
         )
@@ -852,15 +855,20 @@ class ModernCyberEditorApp:
             ai, 1, self.t("ollama_model"), [self.ollama_model_var.get()],
             self.ollama_model_var.get(), self.ollama_model_var.set, column=1
         )
-        self._entry_field(
-            ai, 2, self.t("ollama_context"), self.ctx_var, column=0
+        self.director_model_menu = self._option_field(
+            ai, 2, self.t("director_model"),
+            [self.director_model_var.get() or self.ollama_model_var.get()],
+            self.director_model_var.get() or self.ollama_model_var.get(),
+            self.director_model_var.set, column=0
         )
         self._entry_field(
-            ai, 2, self.t("chunk_minutes"), self.chunk_var, column=1
+            ai, 2, self.t("ollama_context"), self.ctx_var, column=1
         )
         self._entry_field(
-            ai, 3, self.t("ollama_url"), self.ollama_url_var,
-            column=0, columnspan=2
+            ai, 3, self.t("chunk_minutes"), self.chunk_var, column=0
+        )
+        self._entry_field(
+            ai, 3, self.t("ollama_url"), self.ollama_url_var, column=1
         )
 
         self._section_title(parent, 10, self.t("director_settings"))
@@ -1386,12 +1394,17 @@ class ModernCyberEditorApp:
         model = str(settings.get("ollama_model", "")).strip()
         if model:
             self.ollama_model_var.set(model)
+        director_model = str(settings.get("director_model", "")).strip()
+        if director_model:
+            self.director_model_var.set(director_model)
         if hasattr(self, "whisper_menu"):
             self.whisper_menu.set(self.whisper_var.get())
         if hasattr(self, "device_menu"):
             self.device_menu.set(self.device_var.get())
         if model and hasattr(self, "ollama_menu"):
             self.ollama_menu.set(model)
+        if director_model and hasattr(self, "director_model_menu"):
+            self.director_model_menu.set(director_model)
         details = (
             f"{label}: Whisper {self.whisper_var.get()}  ·  "
             f"Context {self.ctx_var.get()}  ·  Chunk {self.chunk_var.get()}m"
@@ -1501,6 +1514,7 @@ class ModernCyberEditorApp:
             whisper_device=self.device_var.get().strip(),
             language=self.speech_language_var.get().strip(),
             ollama_model=self.ollama_model_var.get().strip(),
+            director_model=self.director_model_var.get().strip(),
             ollama_url=self.ollama_url_var.get().strip(),
             chunk_minutes=float(self.chunk_var.get()),
             project_fps=project_fps,
@@ -1667,6 +1681,13 @@ class ModernCyberEditorApp:
             if self.ollama_model_var.get() not in model_names:
                 self.ollama_model_var.set(model_names[0])
                 self.ollama_menu.set(model_names[0])
+        if model_names and hasattr(self, "director_model_menu"):
+            self.director_model_menu.set_values(model_names)
+            if self.director_model_var.get() not in model_names:
+                recommended_text = str(recommendation.get("director_model") or "")
+                selected_text = recommended_text if recommended_text in model_names else self.ollama_model_var.get()
+                self.director_model_var.set(selected_text)
+                self.director_model_menu.set(selected_text)
         self._apply_hardware_profile(self.profile_key)
         summary = " · ".join(
             f"{name}: {'OK' if ready else detail}"

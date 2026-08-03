@@ -62,18 +62,22 @@ UI 启动时会检测本机 Ollama；若已安装但服务未运行，会自动�
 并可能为 8-bit 或 10-bit 4:2:2。对于常见的 PP8 4K 10-bit 4:2:2 素材以及本项目的
 外部自动组装流程，建议直接安装 Resolve Studio。
 
-界面中的“原素材色彩配置”默认选择 Sony PP8。导演 JSON 会记录技术色彩管线；Resolve
-执行器在导入任何素材前强制设置：
+提取器现在优先读取每条 Sony `CxxxxM01.XML` 伴随文件，不再把整批素材强行当成
+同一种 PP8。S-Log2/S-Gamut、S-Log3/S-Gamut3 和 S-Log3/S-Gamut3.Cine 会分别
+映射为 Resolve 的逐素材输入变换；XML 缺失时才使用界面中的显式回退配置。工程工作
+空间统一为：
 
 ```text
-Sony S-Gamut3.Cine / S-Log3
+每条素材的 Sony XML 输入色彩空间 / Gamma
         → DaVinci Wide Gamut / Intermediate
         → Rec.709 Gamma 2.4
 ```
 
-任何关键设置被 Resolve 拒绝都会停止执行，不再静默输出灰片。FFmpeg 审片预览也会用
-标准库运行时生成的 3D LUT 做同一技术还原，再叠加 AI 选择的克制创意风格。若当前工程
-已有时间线，PP8 流程会新建独立的 `Director Cut` 工程，避免修改用户已有工程色彩设置。
+OpenCV 会在关键帧上估计中性像素、亮度与 RGB 平衡，按整批素材的中位参考生成受限
+修正（曝光 ±1.5EV、RGB 增益 0.667–1.5）；低置信度结果自动向“不修正”收敛，避免
+把有意的彩色灯光强行校白。任何 Log 素材的关键 Resolve 设置被拒绝都会停止执行，
+不再静默输出灰片。FFmpeg 预览对 S-Log3 应用技术 LUT；混入 S-Log2 时以最终 Resolve
+RCM 输出为准，绝不会错误套用 S-Log3 LUT。
 
 参考：
 [Blackmagic Design 版本对比](https://www.blackmagicdesign.com/products/davinciresolve)、
@@ -99,7 +103,10 @@ MP4，并调用 DaVinci Resolve Python API 组装可继续精修的时间线。
 Whisper + OpenCV 子进程
           │ 完全退出，Windows 回收 CUDA 上下文
           ▼
-Ollama 分块导演子进程
+Ollama 视觉审片模型（如 qwen3.5:35b-a3b）
+          │ keep_alive=0；显存清空
+          ▼
+Ollama 72B 纯文字全局导演
           │ keep_alive=0 + 父进程二次卸载
           ▼
 FFmpeg 预览渲染子进程
@@ -112,8 +119,26 @@ DaVinci Resolve 执行子进程
 - 父调度器不导入 PyTorch、Whisper、OpenCV、requests 或 Resolve API。
 - 任意时刻最多存在一个项目重型子进程。
 - Ollama `/api/ps` 若发现其他模型驻留，会拒绝加载导演模型。
-- 导演每次只处理 10–15 分钟数据，默认 12 分钟。
+- 导演每次只处理一个 10–15 分钟分析窗口（默认 12 分钟），这不是素材数量或
+  总时长上限。多个视频及一小时以上素材会拆成多个窗口串行审片，再统一编排。
 - `timeline_cuts.json` 只在所有分块成功、校验和合并后原子写入。
+
+## Qwen2.5 72B：Q4_K_M 与 Q5_K_M
+
+- `Q4_K_M` 约 47GB，平均约 4.x bit/权重；读取更少、速度略快，也能让更多层驻留
+  16GB 显存。它是 64GB RAM 机器更稳妥的 72B 选择。
+- `Q5_K_M` 约 54GB，平均约 5.x bit/权重；文件约大 15%，内存带宽与混合卸载压力
+  更高，但通常有更好的权重保真度和细节判断。用户允许慢、优先最终剪辑质量时采用它。
+
+本项目把 `qwen3.5:35b-a3b` 保留为视觉审片模型，把
+`qwen2.5:72b-instruct-q5_K_M` 作为**纯文字全局导演**。两者不会同时驻留：完成视觉
+候选后先卸载 35B，再加载 72B 做主题、节奏和跨素材取舍。64GB RAM + 16GB VRAM
+运行 Q5 时建议分页文件总量至少 40GB；仓库提供：
+
+```powershell
+# 右键 scripts\configure_pagefile_admin.cmd，选择“以管理员身份运行”
+# 默认保留 C: 4–8GB，并在 D: 创建 32–48GB；脚本不会自动重启。
+```
 
 ## 四阶段自动成片能力
 
@@ -121,15 +146,17 @@ DaVinci Resolve 执行子进程
 
 1. **提取期**：每个视频单独启动 Whisper/OpenCV 子进程，写入台词、真实 JPEG
    关键帧和素材元数据；每个子进程退出后，父调度器再执行显存释放屏障。
-2. **思考期**：视觉 Ollama 模型以 10–15 分钟窗口审片，再进行一次跨全部素材的
-   全局编排，原子生成 `timeline_cuts.json`；随后发送 `keep_alive: 0` 并由父进程
-   二次确认卸载。UI 会自动列出本机已安装模型；当前推荐的
-   `qwen3.5:35b-a3b` 是 36B Q4 MoE 视觉推理模型，不会被错误标成 70B。
-3. **执行期**：Resolve 原生 API 完成素材导入、按源素材 FPS 换帧、拼接、Voice
+2. **配乐期（CPU）**：只搜索用户提供的本地授权曲库；可选 `library.json` 记录
+   许可证、情绪和标签。Librosa 提取 BPM 与全部鼓点，结果写入 `music_analysis.json`。
+3. **思考期**：视觉 Ollama 模型以 10–15 分钟窗口审片并落盘检查点，随后完全卸载；
+   单独加载 72B 文字模型进行跨素材全局编排。镜头时长按角色动态限制：B-roll 10 秒、
+   桥段 12 秒、语境 20 秒、高潮 25 秒、结尾 30 秒、完整采访语义最长 45 秒。
+   纯画面出点可在 ±0.25 秒内吸附鼓点，对话与结尾绝不为卡点截断。
+4. **执行期**：Resolve 原生 API 完成素材导入、按源素材 FPS 换帧、拼接、Voice
    Isolation、基础 CDL、`Stabilize()`、`CreateMagicMask()` 和 `SmartReframe()`；
    用户导出的 DRX 通过节点图 `ApplyGradeFromDRX()` 注入。Resolve 21 已原生公开
    防抖与 Magic Mask 接口，因此默认不使用脆弱的坐标宏。
-4. **导出期**：启用 UI 中“Resolve 导出最终成片”后，执行器创建 Render Job、启动
+5. **导出期**：启用 UI 中“Resolve 导出最终成片”后，执行器创建 Render Job、启动
    渲染、持续报告百分比并校验完成状态；默认沿用当前 Deliver 页面格式/编码设置，
    也可填写一个现有的 Resolve 渲染预设名。
 

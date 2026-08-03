@@ -99,22 +99,23 @@ recording settings, the files may be XAVC S, XAVC HS, or XAVC S-I and may be
 10-bit 4:2:2 footage and is required for this project's external timeline
 automation.
 
-The UI defaults `Source camera color profile` to Sony PP8. The director JSON
-records a technical color pipeline, and the Resolve executor applies it before
-any media is imported:
+Extraction now reads each Sony `CxxxxM01.XML` sidecar first instead of forcing
+one PP8 assumption across the batch. S-Log2/S-Gamut, S-Log3/S-Gamut3, and
+S-Log3/S-Gamut3.Cine map to distinct per-source Resolve input transforms. The
+UI camera profile is only an explicit fallback when a sidecar is missing:
 
 ```text
-Sony S-Gamut3.Cine / S-Log3
+Per-source Sony XML input color space / gamma
         → DaVinci Wide Gamut / Intermediate
         → Rec.709 Gamma 2.4
 ```
 
-If Resolve rejects any required setting, execution stops instead of silently
-rendering flat log footage. The FFmpeg review uses a standard-library-generated
-3D LUT for the same technical normalization before the restrained creative
-look. When the current project already contains a timeline, PP8 execution
-creates an isolated `Director Cut` project rather than changing that project's
-global color settings.
+OpenCV estimates neutral pixels, luminance, and RGB balance from keyframes,
+then creates bounded per-source matching around the batch median (±1.5 EV and
+0.667–1.5 RGB gains). Low-confidence estimates blend toward identity. A failed
+Log input transform is fatal rather than producing a flat render. The FFmpeg
+review transforms S-Log3; mixed S-Log2 footage is left to Resolve's verified
+native RCM instead of receiving an incorrect S-Log3 LUT.
 
 References:
 [Blackmagic Design edition comparison](https://www.blackmagicdesign.com/products/davinciresolve),
@@ -132,7 +133,10 @@ process exit as a hard VRAM barrier:
 Whisper + OpenCV child process
           │ exits completely; Windows releases the CUDA context
           ▼
-Chunked Ollama director child process
+Ollama vision reviewer (for example qwen3.5:35b-a3b)
+          │ keep_alive=0; VRAM released
+          ▼
+Ollama 72B text-only global director
           │ keep_alive=0 plus a second parent-process unload request
           ▼
 FFmpeg review-render child process
@@ -147,10 +151,27 @@ DaVinci Resolve executor child process
 - At most one project-owned heavy child process runs at any time.
 - The director refuses to load its model if Ollama `/api/ps` reports another
   resident model.
-- The director handles only 10–15 minutes of data per request; the default is
-  12 minutes.
+- The director handles one 10–15 minute analysis window per request (12 minutes
+  by default). This is not a source-count or total-runtime limit: multiple videos
+  and hour-long footage are reviewed as sequential windows and then assembled
+  globally.
 - `timeline_cuts.json` is written atomically only after every chunk succeeds
   and all decisions are validated and merged.
+
+## Qwen2.5 72B: Q4_K_M versus Q5_K_M
+
+- `Q4_K_M` is about 47 GB. It reads less data, is slightly faster, and allows
+  more GPU offload on a 16 GB card. It is the safer 72B choice for 64 GB RAM.
+- `Q5_K_M` is about 54 GB—roughly 15% larger—with higher weight fidelity and
+  usually modestly better fine-grained judgment, at the cost of memory
+  bandwidth and speed. Use it when final editing quality matters more than time.
+
+CyberEditor keeps `qwen3.5:35b-a3b` for visual review and uses
+`qwen2.5:72b-instruct-q5_K_M` only as the text-only global director. They are
+never resident together. On 64 GB RAM + 16 GB VRAM, a total page-file budget of
+at least 40 GB is recommended. Right-click
+`scripts\configure_pagefile_admin.cmd` and run it as Administrator to keep a
+4–8 GB C: page file and add a 32–48 GB D: page file. It never reboots Windows.
 
 ## Four-stage automatic finishing pipeline
 
@@ -159,18 +180,20 @@ The implementation now follows this strict serial chain:
 1. **Extraction**: each video gets its own Whisper/OpenCV child process, which
    writes dialogue, real JPEG keyframes, and media metadata. The process exits
    before the parent crosses the VRAM-release barrier.
-2. **Direction**: a vision-capable Ollama model reviews 10–15 minute windows,
-   then performs one cross-source story pass and atomically publishes
-   `timeline_cuts.json`. The child sends `keep_alive: 0`, and the parent performs
-   a second unload request. The UI lists installed models automatically. The
-   recommended `qwen3.5:35b-a3b` is a 36B Q4 vision/reasoning MoE, not a 70B
-   model mislabeled by the application.
-3. **Resolve execution**: native APIs import media, use each source's native FPS,
+2. **Licensed music (CPU)**: search only the user-supplied authorized library;
+   an optional `library.json` records license, mood, and tags. Librosa writes BPM
+   and beat timestamps to `music_analysis.json`.
+3. **Direction**: the vision model reviews 10–15 minute windows and is fully
+   unloaded. A separate 72B text model then performs cross-source story assembly.
+   Dynamic shot limits range from 10-second B-roll to complete 45-second interview
+   thoughts. Visual-only out-points may snap ±0.25 seconds to a beat; dialogue and
+   closing thoughts are never truncated for rhythm.
+4. **Resolve execution**: native APIs import media, use each source's native FPS,
    assemble clips, and apply Voice Isolation, basic CDL, `Stabilize()`,
    `CreateMagicMask()`, and `SmartReframe()`. User-exported DRX grades are applied
    through the node graph's `ApplyGradeFromDRX()`. Resolve 21 exposes stabilization
    and Magic Mask natively, so fragile coordinate macros are not the default.
-4. **Final export**: enable **Export final movie in Resolve** in the UI to create
+5. **Final export**: enable **Export final movie in Resolve** in the UI to create
    a Render Job, start it, log percentage progress, and validate completion. The
    current Deliver format/codec is preserved unless an existing Resolve render
    preset is entered.

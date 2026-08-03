@@ -21,6 +21,11 @@ from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+try:
+    from .color_analysis import build_project_color_match
+except ImportError:  # pragma: no cover - direct ``python src/...`` fallback.
+    from color_analysis import build_project_color_match
+
 
 VIDEO_EXTENSIONS = frozenset(
     {
@@ -196,12 +201,14 @@ def build_combined_raw_data(
             "无法构建空素材清单 / Cannot build an empty asset manifest."
         )
     total_duration = sum(float(item.get("duration_sec") or 0.0) for item in assets)
+    normalized_assets = list(assets)
     return {
         "schema_version": "2.0",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "duration_sec": round(total_duration, 3),
         "asset_count": len(assets),
-        "assets": list(assets),
+        "assets": normalized_assets,
+        "color_match_plan": build_project_color_match(normalized_assets),
     }
 
 

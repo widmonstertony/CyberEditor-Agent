@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import importlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import platform
@@ -57,6 +58,9 @@ class ClipDecision(NamedTuple):
     stabilization: str = "none"
     tracking: str = "none"
     smart_reframe: bool = False
+    asset_id: str = ""
+    source_color: Optional[Dict[str, Any]] = None
+    color_match: Optional[Dict[str, Any]] = None
 
 
 class MediaRecord(NamedTuple):
@@ -339,6 +343,15 @@ class DaVinciExecutor:
                         if isinstance(item.get("smart_reframe", False), bool)
                         else False
                     ),
+                    asset_id=str(item.get("asset_id") or ""),
+                    source_color=(
+                        dict(item["source_color"])
+                        if isinstance(item.get("source_color"), dict) else None
+                    ),
+                    color_match=(
+                        dict(item["color_match"])
+                        if isinstance(item.get("color_match"), dict) else None
+                    ),
                 )
             )
         self.logger.info(
@@ -619,9 +632,9 @@ class DaVinciExecutor:
         """
         if not bool(self.color_pipeline.get("enabled")):
             return
-        if str(self.color_pipeline.get("camera_profile") or "").casefold() != (
-            "sony_pp8_slog3_sgamut3cine"
-        ):
+        mode = str(self.color_pipeline.get("mode") or "legacy").casefold()
+        profile = str(self.color_pipeline.get("camera_profile") or "").casefold()
+        if mode != "per_source" and profile != "sony_pp8_slog3_sgamut3cine":
             raise ResolveExecutorError(
                 "启用了未知色彩配置 / Unknown enabled color pipeline."
             )
@@ -631,16 +644,26 @@ class DaVinciExecutor:
                 "当前 Resolve 工程不提供 SetSetting，无法安全还原 Sony PP8。"
                 " / Resolve project does not expose SetSetting for PP8 color management."
             )
+        input_color_space = (
+            str(self.color_pipeline.get("default_input_color_space") or "Rec.709")
+            if mode == "per_source"
+            else str(self.color_pipeline.get("input_color_space") or "Sony S-Gamut3.Cine")
+        )
+        input_gamma = (
+            str(self.color_pipeline.get("default_input_gamma") or "Gamma 2.4")
+            if mode == "per_source"
+            else str(self.color_pipeline.get("input_gamma") or "S-Log3")
+        )
         settings = (
             ("colorScienceMode", "davinciYRGBColorManaged"),
             ("isAutoColorManage", "0"),
             ("separateColorSpaceAndGamma", "1"),
-            ("colorSpaceInput", "Sony S-Gamut3.Cine"),
-            ("colorSpaceInputGamma", "S-Log3"),
-            ("colorSpaceTimeline", "DaVinci WG"),
-            ("colorSpaceTimelineGamma", "DaVinci Intermediate"),
-            ("colorSpaceOutput", "Rec.709"),
-            ("colorSpaceOutputGamma", "Gamma 2.4"),
+            ("colorSpaceInput", input_color_space),
+            ("colorSpaceInputGamma", input_gamma),
+            ("colorSpaceTimeline", str(self.color_pipeline.get("timeline_color_space") or "DaVinci WG")),
+            ("colorSpaceTimelineGamma", str(self.color_pipeline.get("timeline_gamma") or "DaVinci Intermediate")),
+            ("colorSpaceOutput", str(self.color_pipeline.get("output_color_space") or "Rec.709")),
+            ("colorSpaceOutputGamma", str(self.color_pipeline.get("output_gamma") or "Gamma 2.4")),
         )
         for key, value in settings:
             try:
@@ -655,7 +678,7 @@ class DaVinciExecutor:
                     " / Resolve rejected a required color setting; stopped to prevent flat output."
                 )
         self.logger.info(
-            "Sony PP8 已还原：S-Gamut3.Cine/S-Log3 → DaVinci WG/Intermediate → Rec.709 Gamma 2.4"
+            "Resolve 色彩管理已启用；逐素材 Sony XML 输入变换将在导入后设置 / Per-source input transforms enabled"
         )
 
     def ensure_timeline(self) -> Any:
@@ -794,6 +817,7 @@ class DaVinciExecutor:
         prepared: List[Tuple[ClipDecision, Dict[str, Any]]] = []
         for decision in clips:
             item, index = self._resolve_media(decision, index)
+            self._configure_media_input_transform(item, decision)
             source_fps = self._media_fps(item) or fps
             start_frame, end_frame = self.seconds_to_frames(
                 decision.cut_in_sec, decision.cut_out_sec, source_fps
@@ -820,6 +844,70 @@ class DaVinciExecutor:
                 end_frame,
             )
         return prepared
+
+    def _configure_media_input_transform(
+        self, media_item: Any, decision: ClipDecision
+    ) -> None:
+        """
+        Apply the Sony-XML-derived input transform to one Media Pool item.
+        将 Sony XML 检测到的输入变换应用到单条媒体池素材。
+
+        Parameters / 参数:
+            media_item: Resolve ``MediaPoolItem``. / Resolve 媒体池条目。
+            decision: Clip decision carrying normalized source metadata. / 含规范化源元数据的剪辑决策。
+
+        Resolve versions expose either one combined ``Input Color Space`` value
+        or separate color-space/gamma properties, so both documented shapes are
+        attempted and every log-source failure is fatal.
+        不同 Resolve 版本可能暴露组合字段或分离字段，因此依次尝试；Log 素材设置
+        失败时立即停止，避免生成未还原的灰片。
+        """
+        source = decision.source_color or {}
+        if not isinstance(source, dict) or not source:
+            return
+        is_log = bool(source.get("is_log"))
+        supported = bool(source.get("transform_supported"))
+        color_space = str(source.get("resolve_input_color_space") or "").strip()
+        gamma = str(source.get("resolve_input_gamma") or "").strip()
+        if not is_log:
+            return
+        if not supported or not color_space or not gamma:
+            raise ResolveExecutorError(
+                f"clip_id={decision.clip_id!r} 是 Log 素材但没有安全输入变换；已停止。"
+                " / Log source has no safe input transform."
+            )
+        setter = getattr(media_item, "SetClipProperty", None)
+        if not callable(setter):
+            raise ResolveExecutorError(
+                f"Resolve 无法为 clip_id={decision.clip_id!r} 设置逐素材输入色彩空间。"
+                " / MediaPoolItem.SetClipProperty is unavailable."
+            )
+        combined_values = (
+            f"{color_space}/{gamma}",
+            f"{color_space} / {gamma}",
+        )
+        for combined in combined_values:
+            try:
+                if setter("Input Color Space", combined) is True:
+                    self.logger.info(
+                        "逐素材输入变换 clip_id=%r：%s / %s",
+                        decision.clip_id, color_space, gamma,
+                    )
+                    return
+            except Exception:
+                pass
+        try:
+            color_ok = setter("Input Color Space", color_space)
+            gamma_ok = setter("Input Gamma", gamma)
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"Resolve 设置输入变换失败 clip_id={decision.clip_id!r}: {exc}"
+            ) from exc
+        if color_ok is not True or gamma_ok is not True:
+            raise ResolveExecutorError(
+                f"Resolve 拒绝 clip_id={decision.clip_id!r} 的 {color_space}/{gamma} 输入变换；"
+                "请确认 Resolve 色彩管理与脚本 API 权限。 / Resolve rejected the source transform."
+            )
 
     def _media_fps(self, media_item: Any) -> Optional[Decimal]:
         """
@@ -1130,6 +1218,26 @@ class DaVinciExecutor:
         set_cdl = getattr(timeline_item, "SetCDL", None)
         if decision.color_look in color_values and callable(set_cdl):
             cdl = {"NodeIndex": "1", **color_values[decision.color_look]}
+            match = decision.color_match or {}
+            if isinstance(match, dict):
+                try:
+                    exposure_multiplier = 2.0 ** max(
+                        -1.5, min(1.5, float(match.get("exposure_ev", 0)))
+                    )
+                    raw_gains = match.get("rgb_gain", [1.0, 1.0, 1.0])
+                    gains = [float(raw_gains[index]) for index in range(3)]
+                    base = [float(value) for value in str(cdl["Slope"]).split()]
+                    matched = [
+                        max(0.25, min(4.0, base[index] * exposure_multiplier * gains[index]))
+                        for index in range(3)
+                    ]
+                    if all(math.isfinite(value) for value in matched):
+                        cdl["Slope"] = " ".join(f"{value:.6f}" for value in matched)
+                except (IndexError, TypeError, ValueError):
+                    self.logger.warning(
+                        "忽略无效曝光/白平衡匹配 clip_id=%r / Invalid color match ignored",
+                        decision.clip_id,
+                    )
             try:
                 if set_cdl(cdl) is False:
                     self.logger.warning(

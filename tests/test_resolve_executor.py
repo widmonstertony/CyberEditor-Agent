@@ -254,6 +254,35 @@ class ResolveExecutorTests(unittest.TestCase):
 
         self.assertEqual(timeline.GetName(), "CyberEditor Timeline")
 
+    def test_per_source_slog2_input_transform_is_applied(self):
+        class MediaItem:
+            def __init__(self):
+                self.calls = []
+
+            def SetClipProperty(self, key, value):
+                self.calls.append((key, value))
+                return value == "Sony S-Gamut/S-Log2"
+
+        decision = ClipDecision(
+            1,
+            "source.mp4",
+            Decimal("0"),
+            Decimal("2"),
+            "Sony XML test",
+            source_color={
+                "is_log": True,
+                "transform_supported": True,
+                "resolve_input_color_space": "Sony S-Gamut",
+                "resolve_input_gamma": "S-Log2",
+            },
+        )
+        item = MediaItem()
+        executor = DaVinciExecutor("timeline_cuts.json")
+
+        executor._configure_media_input_transform(item, decision)
+
+        self.assertEqual(item.calls[0], ("Input Color Space", "Sony S-Gamut/S-Log2"))
+
     def test_resolve_process_detection_ignores_windows_code_page(self):
         completed = SimpleNamespace(
             returncode=0,

@@ -257,16 +257,18 @@ class AIDirectorTests(unittest.TestCase):
         self.assertEqual(merged[0]["reason_for_cut"], "A；B")
         self.assertEqual(merged[0]["confidence"], 0.8)
 
-    def test_merge_never_creates_a_candidate_longer_than_fifteen_seconds(self):
+    def test_merge_respects_dynamic_broll_duration(self):
         merged = self.make_director().merge_decisions(
             [
                 {
                     "file_name": "proxy.mp4", "cut_in_sec": 0.0,
                     "cut_out_sec": 10.0, "reason_for_cut": "A", "confidence": 0.9,
+                    "story_role": "broll",
                 },
                 {
                     "file_name": "proxy.mp4", "cut_in_sec": 10.1,
                     "cut_out_sec": 20.0, "reason_for_cut": "B", "confidence": 0.9,
+                    "story_role": "broll",
                 },
             ]
         )
@@ -278,6 +280,29 @@ class AIDirectorTests(unittest.TestCase):
             '```json\n{"decisions": []}\n```'
         )
         self.assertEqual(parsed, {"decisions": []})
+
+    def test_visual_cut_snaps_to_nearby_beat_but_interview_does_not(self):
+        director = self.make_director()
+        clips = [
+            {
+                "asset_id": "a", "story_role": "broll", "cut_in_sec": 0.0,
+                "cut_out_sec": 2.9,
+            },
+            {
+                "asset_id": "a", "story_role": "interview", "cut_in_sec": 3.0,
+                "cut_out_sec": 6.0,
+            },
+        ]
+        result = director.snap_visual_cuts_to_beats(
+            clips,
+            {"beats_sec": [3.0, 6.0], "duration_sec": 10.0},
+            [{"asset_id": "a", "duration_sec": 20.0}],
+        )
+
+        self.assertEqual(result[0]["cut_out_sec"], 3.0)
+        self.assertIn("beat_snap", result[0])
+        self.assertEqual(result[1]["cut_out_sec"], 6.0)
+        self.assertNotIn("beat_snap", result[1])
 
     def test_empty_thinking_response_retries_without_qwen_thinking(self):
         session = EmptyThinkingSession()
@@ -412,7 +437,8 @@ class AIDirectorTests(unittest.TestCase):
             self.assertEqual(len(image_requests), 1)
             self.assertEqual(output["schema_version"], "3.0")
             self.assertEqual(
-                output["color_pipeline"]["input_gamma"], "S-Log3"
+                output["color_pipeline"]["sources"]["asset-1"]["resolve_input_gamma"],
+                "S-Log3",
             )
             self.assertEqual(
                 output["director_treatment"]["chronology_policy"],
