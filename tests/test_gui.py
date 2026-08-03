@@ -226,19 +226,22 @@ class WorkflowOptionsTests(unittest.TestCase):
         )
         self.assertEqual(recommendation["chunk_minutes"], 10.0)
 
-    def test_auto_profile_separates_vision_and_72b_text_director(self) -> None:
+    def test_auto_profile_prefers_qwen36_dense_q8_for_both_roles(self) -> None:
         recommendation = recommend_automatic_settings(
             {"ram_gb": 64, "vram_gb": 16, "cpu_threads": 16, "torch_cuda": True},
             [
                 {"name": "qwen3.5:35b-a3b", "size": 23 * 1024**3},
                 {"name": "qwen2.5:72b-instruct-q5_K_M", "size": 54 * 1024**3},
+                {"name": "qwen3.6:27b-mtp-q8_0", "size": 30 * 1024**3},
             ],
         )
 
-        self.assertEqual(recommendation["ollama_model"], "qwen3.5:35b-a3b")
+        self.assertEqual(
+            recommendation["ollama_model"], "qwen3.6:27b-mtp-q8_0"
+        )
         self.assertEqual(
             recommendation["director_model"],
-            "qwen2.5:72b-instruct-q5_K_M",
+            "qwen3.6:27b-mtp-q8_0",
         )
 
     def test_auto_profile_does_not_assume_pytorch_cuda(self) -> None:

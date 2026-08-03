@@ -499,6 +499,8 @@ def recommend_automatic_settings(
         # long-context reasoning, and quantization—not simply file size.
         # 剪辑质量取决于指令遵循、中文、长上下文与量化，而非只看文件大小。
         family_scores = (
+            ("qwen3.6:27b", 1200.0),
+            ("qwen3.6:35b-a3b", 1160.0),
             ("qwen3.5:35b-a3b", 1000.0),
             ("qwen3.5:27b", 980.0),
             ("qwen3.5:9b", 940.0),
@@ -530,10 +532,18 @@ def recommend_automatic_settings(
     )
     text_director_candidates = [
         item for item in all_models
-        if any(marker in item[0].casefold() for marker in ("qwen2.5:72b", "qwen2.5:70b"))
+        if any(
+            marker in item[0].casefold()
+            for marker in (
+                "qwen3.6:27b",
+                "qwen3.6:35b-a3b",
+                "qwen2.5:72b",
+                "qwen2.5:70b",
+            )
+        )
     ]
     director_model = (
-        max(text_director_candidates, key=lambda item: item[1])[0]
+        max(text_director_candidates, key=lambda item: (item[2], item[1]))[0]
         if text_director_candidates else selected_model
     )
     return {
@@ -726,7 +736,7 @@ class WorkflowOptions:
     whisper_model: str = "small"
     whisper_device: str = "auto"
     language: str = ""
-    ollama_model: str = "qwen2.5:3b"
+    ollama_model: str = "qwen3.6:27b-mtp-q8_0"
     director_model: str = ""
     ollama_url: str = "http://localhost:11434"
     chunk_minutes: float = 12.0
@@ -1148,7 +1158,7 @@ class CyberEditorApp:
         self.whisper_var = tk.StringVar(value="small")
         self.device_var = tk.StringVar(value="auto")
         self.language_var = tk.StringVar()
-        self.ollama_model_var = tk.StringVar(value="qwen2.5:3b")
+        self.ollama_model_var = tk.StringVar(value="qwen3.6:27b-mtp-q8_0")
         self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
         self.chunk_var = tk.DoubleVar(value=12.0)
         self.fps_var = tk.DoubleVar(value=25.0)
@@ -1360,7 +1370,11 @@ class CyberEditorApp:
             "Ollama 模型",
             ttk.Combobox,
             textvariable=self.ollama_model_var,
-            values=("qwen2.5:3b", "qwen2.5:14b", "qwen2.5:32b"),
+            values=(
+                "qwen3.6:27b-mtp-q8_0",
+                "qwen3.6:27b-mtp-q4_K_M",
+                "qwen3.6:35b-a3b-mtp-q4_K_M",
+            ),
         )
         self._field(
             grid,

@@ -606,8 +606,8 @@ class WorkflowOrchestrator:
             raise WorkflowError(
                 f"模型 {model!r} 不支持图像输入，不能审阅视频画面。"
                 "请先安装并选择视觉模型，例如：\n"
-                "  ollama pull qwen3.5:35b-a3b\n"
-                "  ollama pull qwen3.5:9b-q8_0\n"
+                "  ollama pull qwen3.6:27b-mtp-q8_0\n"
+                "  ollama pull qwen3.6:27b-mtp-q4_K_M\n"
                 "The selected model is text-only; a vision model is required."
             )
 
@@ -701,7 +701,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene-threshold", type=float, default=0.28)
     parser.add_argument("--sample-interval", type=float, default=2.0)
     parser.add_argument("--max-keyframes", type=int, default=240)
-    parser.add_argument("--ollama-model", default="qwen2.5:32b")
+    parser.add_argument("--ollama-model", default="qwen3.6:27b-mtp-q8_0")
     parser.add_argument(
         "--director-model",
         default="",

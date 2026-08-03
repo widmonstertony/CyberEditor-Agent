@@ -103,10 +103,7 @@ MP4，并调用 DaVinci Resolve Python API 组装可继续精修的时间线。
 Whisper + OpenCV 子进程
           │ 完全退出，Windows 回收 CUDA 上下文
           ▼
-Ollama 视觉审片模型（如 qwen3.5:35b-a3b）
-          │ keep_alive=0；显存清空
-          ▼
-Ollama 72B 纯文字全局导演
+Ollama Qwen3.6-27B Dense Q8 视觉审片 + 全局导演
           │ keep_alive=0 + 父进程二次卸载
           ▼
 FFmpeg 预览渲染子进程
@@ -123,17 +120,18 @@ DaVinci Resolve 执行子进程
   总时长上限。多个视频及一小时以上素材会拆成多个窗口串行审片，再统一编排。
 - `timeline_cuts.json` 只在所有分块成功、校验和合并后原子写入。
 
-## Qwen2.5 72B：Q4_K_M 与 Q5_K_M
+## 为什么默认改用 Qwen3.6-27B Dense Q8
 
-- `Q4_K_M` 约 47GB，平均约 4.x bit/权重；读取更少、速度略快，也能让更多层驻留
-  16GB 显存。它是 64GB RAM 机器更稳妥的 72B 选择。
-- `Q5_K_M` 约 54GB，平均约 5.x bit/权重；文件约大 15%，内存带宽与混合卸载压力
-  更高，但通常有更好的权重保真度和细节判断。用户允许慢、优先最终剪辑质量时采用它。
+- `qwen3.6:27b-mtp-q8_0` 是 27B 全量稠密、原生图文模型，约 30GB；Q8 接近原始
+  权重精度，适合 16GB VRAM + 64GB RAM 混合推理。
+- 官方视频理解评测中，27B 在 VideoMME、VideoMMMU、MLVU、MVBench 上整体高于
+  只激活约 3B 参数的 35B-A3B。后者更快，但本项目优先剪辑判断质量。
+- 旧 `Qwen2.5 72B Q5` 虽有更多参数，但模型代际更早、纯文本且约 54GB；参数数量
+  不能直接抵消 3.6 的新训练、原生视觉与指令遵循优势，因此不再作为默认导演。
 
-本项目把 `qwen3.5:35b-a3b` 保留为视觉审片模型，把
-`qwen2.5:72b-instruct-q5_K_M` 作为**纯文字全局导演**。两者不会同时驻留：完成视觉
-候选后先卸载 35B，再加载 72B 做主题、节奏和跨素材取舍。64GB RAM + 16GB VRAM
-运行 Q5 时建议分页文件总量至少 40GB；仓库提供：
+同一 Qwen3.6 模型先结合关键帧与台词生成候选，再进行纯文字全局编排；始终只有一个
+模型驻留，也避免卸载、加载另一套 54GB 权重。分页文件脚本仍用于给 Windows 和长上下文
+保留安全余量：
 
 ```powershell
 # 右键 scripts\configure_pagefile_admin.cmd，选择“以管理员身份运行”
@@ -148,8 +146,8 @@ DaVinci Resolve 执行子进程
    关键帧和素材元数据；每个子进程退出后，父调度器再执行显存释放屏障。
 2. **配乐期（CPU）**：只搜索用户提供的本地授权曲库；可选 `library.json` 记录
    许可证、情绪和标签。Librosa 提取 BPM 与全部鼓点，结果写入 `music_analysis.json`。
-3. **思考期**：视觉 Ollama 模型以 10–15 分钟窗口审片并落盘检查点，随后完全卸载；
-   单独加载 72B 文字模型进行跨素材全局编排。镜头时长按角色动态限制：B-roll 10 秒、
+3. **思考期**：Qwen3.6 以 10–15 分钟窗口结合画面与台词审片并落盘检查点，随后以
+   同一模型进行纯文字跨素材全局编排。镜头时长按角色动态限制：B-roll 10 秒、
    桥段 12 秒、语境 20 秒、高潮 25 秒、结尾 30 秒、完整采访语义最长 45 秒。
    纯画面出点可在 ±0.25 秒内吸附鼓点，对话与结尾绝不为卡点截断。
 4. **执行期**：Resolve 原生 API 完成素材导入、按源素材 FPS 换帧、拼接、Voice
@@ -244,17 +242,15 @@ CyberEditor-Agent/
 
 | 设备 | Whisper | Ollama 建议 | 说明 |
 |---|---|---|---|
-| 核显/纯 CPU | `tiny` / `base` | Qwen 3.5 4B/9B Q4 | 慢，但整个流程仍可运行 |
-| 8–12GB VRAM | `small` / `turbo` | `qwen3.5:9b-q4_K_M` | 6.6GB，中文与长上下文表现好 |
-| 16GB VRAM | `large-v3` | `qwen3.5:9b-q8_0` | 约 11GB，可完整放入显存，推荐日常高质量档 |
-| 16GB VRAM + 64GB RAM | `large-v3` | `qwen3.5:35b-a3b` | 约 24GB，CPU/GPU 混合，质量优先且更慢 |
-| 24GB+ VRAM | `large-v3` | Qwen 3.5 27B/35B | 仍建议保留串行策略 |
+| 核显/纯 CPU | `tiny` / `base` | Qwen 3.6 27B Q4（很慢） | 可运行但建议更小视觉模型 |
+| 8–12GB VRAM | `small` / `turbo` | `qwen3.6:27b-mtp-q4_K_M` | 约 18GB，RAM/GPU 混合 |
+| 16GB VRAM | `large-v3` | `qwen3.6:27b-mtp-q4_K_M` | 约 18GB，大部分权重可卸载至 GPU |
+| 16GB VRAM + 64GB RAM | `large-v3` | `qwen3.6:27b-mtp-q8_0` | 约 30GB，稠密 Q8，质量优先默认档 |
+| 24GB+ VRAM | `large-v3` | Qwen 3.6 27B Q8 | 仍建议保留串行策略 |
 
-对本项目而言，当前的 `qwen2.5:3b` 适合功能测试，不是高质量纪录片剪辑模型。
-你的 16GB Quadro + 64GB RAM 可优先选择 `qwen3.5:35b-a3b`；若希望更稳定地
-全 GPU 运行，则选择 `qwen3.5:9b-q8_0`。混合卸载的实际速度取决于量化、内存带宽
-和上下文长度。Qwen 3.5 官方模型同时支持视觉、工具、推理与 201 种语言：
-[Qwen 3.5 on Ollama](https://ollama.com/library/qwen3.5)。
+你的 16GB Quadro + 64GB RAM 默认选择 `qwen3.6:27b-mtp-q8_0`；若更看重速度和
+磁盘空间，则选择 Q4_K_M。两者都支持文字、图片与思考模式：
+[Qwen 3.6 on Ollama](https://ollama.com/library/qwen3.6)。
 
 Whisper 官方列出的近似显存占用从 tiny/base 的约 1GB 到 turbo 的约 6GB：
 [OpenAI Whisper README](https://github.com/openai/whisper#available-models-and-languages)。
@@ -312,16 +308,16 @@ Whisper 需要系统 FFmpeg；其官方安装和 Python 调用方式见
 
 ### 3. 准备 Ollama
 
-质量优先（16GB VRAM + 64GB RAM，下载约 24GB，运行较慢）：
+质量优先（16GB VRAM + 64GB RAM，下载约 30GB，运行较慢）：
 
 ```powershell
-ollama pull qwen3.5:35b-a3b
+ollama pull qwen3.6:27b-mtp-q8_0
 ```
 
-更快且可完整放入 16GB 显存的高质量选择（约 11GB）：
+更快、更省磁盘的高质量选择（约 18GB）：
 
 ```powershell
-ollama pull qwen3.5:9b-q8_0
+ollama pull qwen3.6:27b-mtp-q4_K_M
 ```
 
 模型只需下载一次。之后 UI 会自动启动 Ollama 服务并优先选择已安装的高质量模型，
@@ -350,7 +346,7 @@ Studio 的 External Scripting 仍需预先设置一次为 `Local`。
 ```powershell
 python main.py `
   --input-folder "D:\Documentary\Camera originals" `
-  --ollama-model "qwen3.5:35b-a3b" `
+  --ollama-model "qwen3.6:27b-mtp-q8_0" `
   --project-fps 23.976 `
   --chunk-minutes 10
 ```
@@ -362,7 +358,7 @@ python main.py `
   --video "D:\Shoot\A001.mp4" `
   --video "D:\Shoot\B001.mp4" `
   --input-folder "D:\Shoot\B-roll" `
-  --ollama-model "qwen3.5:35b-a3b"
+  --ollama-model "qwen3.6:27b-mtp-q8_0"
 ```
 
 默认输出：
@@ -384,7 +380,7 @@ data/cybereditor.log
 # 已有 raw_data.json，只重跑导演与 Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen3.5:35b-a3b" `
+  --ollama-model "qwen3.6:27b-mtp-q8_0" `
   --creative-brief "按拍摄时间讲述团队从准备到完成动作的过程" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
@@ -478,7 +474,7 @@ from src.resolve_executor import DaVinciExecutor
 - 如果中途某个 Resolve 片段追加失败，API 没有可靠事务回滚；日志会指出已追加
   数量，用户需要检查时间线并撤销。
 - 视觉理解由支持图片输入的 Ollama 模型完成。普通 `qwen2.5:3b` 是纯文本烟雾测试
-  模型，不能用于此多模态流程；推荐 Qwen 3.5 或其他 Ollama 报告 `vision` 能力的模型。
+  模型，不能用于此多模态流程；质量优先时建议使用 `qwen3.6:27b-mtp-q8_0`。
 
 ## 测试
 

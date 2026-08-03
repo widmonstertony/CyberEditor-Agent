@@ -504,7 +504,7 @@ class ModernCyberEditorApp:
             value=str(data.get("language", ""))
         )
         self.ollama_model_var = tk.StringVar(
-            value=str(data.get("ollama_model", "qwen2.5:3b"))
+            value=str(data.get("ollama_model", "qwen3.6:27b-mtp-q8_0"))
         )
         self.director_model_var = tk.StringVar(
             value=str(data.get("director_model", ""))

@@ -768,7 +768,7 @@ class AIDirector:
                 )
             if self.text_model.casefold() != self.model.casefold():
                 self.logger.info(
-                    "视觉候选完成，卸载 %s 后加载 72B 文字导演 %s / Switching from vision to text director",
+                    "视觉候选完成，卸载 %s 后加载文字导演 %s / Switching from vision to text director",
                     self.model,
                     self.text_model,
                 )
@@ -1136,17 +1136,17 @@ class AIDirector:
                 return
             raise DirectorError(
                 f"模型 {self.model!r} 不支持看图，不能执行多视频视觉剪辑。"
-                "请安装视觉模型，例如：ollama pull qwen3.5:35b-a3b\n"
+                "请安装视觉模型，例如：ollama pull qwen3.6:27b-mtp-q8_0\n"
                 "The selected model has no vision capability. Install a vision model."
             )
         normalized = self.model.casefold().replace("_", "-")
         known_vision_markers = (
-            "qwen3.5", "qwen2.5-vl", "gemma3", "llava", "minicpm-v",
+            "qwen3.6", "qwen3.5", "qwen2.5-vl", "gemma3", "llava", "minicpm-v",
             "llama3.2-vision", "moondream",
         )
         if not any(marker in normalized for marker in known_vision_markers):
             raise DirectorError(
-                f"无法确认模型 {self.model!r} 支持视觉输入。请改用 qwen3.5 等视觉模型。\n"
+                f"无法确认模型 {self.model!r} 支持视觉输入。请改用 qwen3.6 等视觉模型。\n"
                 "Cannot confirm vision support for the selected model."
             )
 

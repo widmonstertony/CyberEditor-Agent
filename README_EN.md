@@ -133,10 +133,7 @@ process exit as a hard VRAM barrier:
 Whisper + OpenCV child process
           │ exits completely; Windows releases the CUDA context
           ▼
-Ollama vision reviewer (for example qwen3.5:35b-a3b)
-          │ keep_alive=0; VRAM released
-          ▼
-Ollama 72B text-only global director
+Ollama Qwen3.6-27B dense Q8 vision reviewer + global director
           │ keep_alive=0 plus a second parent-process unload request
           ▼
 FFmpeg review-render child process
@@ -158,18 +155,20 @@ DaVinci Resolve executor child process
 - `timeline_cuts.json` is written atomically only after every chunk succeeds
   and all decisions are validated and merged.
 
-## Qwen2.5 72B: Q4_K_M versus Q5_K_M
+## Why Qwen3.6-27B dense Q8 is now the default
 
-- `Q4_K_M` is about 47 GB. It reads less data, is slightly faster, and allows
-  more GPU offload on a 16 GB card. It is the safer 72B choice for 64 GB RAM.
-- `Q5_K_M` is about 54 GB—roughly 15% larger—with higher weight fidelity and
-  usually modestly better fine-grained judgment, at the cost of memory
-  bandwidth and speed. Use it when final editing quality matters more than time.
+- `qwen3.6:27b-mtp-q8_0` is a dense, native image-text model of about 30 GB.
+  Q8 preserves substantially more weight fidelity and fits mixed 16 GB VRAM +
+  64 GB RAM inference.
+- Official video benchmarks generally place dense 27B above 35B-A3B on
+  VideoMME, VideoMMMU, MLVU, and MVBench. The sparse model is faster; this
+  project prioritizes editorial judgment.
+- The older text-only Qwen2.5 72B Q5 is about 54 GB. Parameter count alone does
+  not guarantee better directing than Qwen3.6's newer multimodal post-training.
 
-CyberEditor keeps `qwen3.5:35b-a3b` for visual review and uses
-`qwen2.5:72b-instruct-q5_K_M` only as the text-only global director. They are
-never resident together. On 64 GB RAM + 16 GB VRAM, a total page-file budget of
-at least 40 GB is recommended. Right-click
+The same Qwen3.6 model first reviews images and speech, then performs the
+text-only global assembly. Only one model is resident, without loading a second
+54 GB checkpoint. A page-file safety margin remains recommended. Right-click
 `scripts\configure_pagefile_admin.cmd` and run it as Administrator to keep a
 4–8 GB C: page file and add a 32–48 GB D: page file. It never reboots Windows.
 
@@ -183,8 +182,8 @@ The implementation now follows this strict serial chain:
 2. **Licensed music (CPU)**: search only the user-supplied authorized library;
    an optional `library.json` records license, mood, and tags. Librosa writes BPM
    and beat timestamps to `music_analysis.json`.
-3. **Direction**: the vision model reviews 10–15 minute windows and is fully
-   unloaded. A separate 72B text model then performs cross-source story assembly.
+3. **Direction**: Qwen3.6 reviews 10–15 minute image/speech windows and then
+   performs text-only cross-source story assembly with the same resident model.
    Dynamic shot limits range from 10-second B-roll to complete 45-second interview
    thoughts. Visual-only out-points may snap ±0.25 seconds to a beat; dialogue and
    closing thoughts are never truncated for rhythm.
@@ -286,19 +285,15 @@ CyberEditor-Agent/
 
 | Hardware | Whisper | Ollama | Notes |
 |---|---|---|---|
-| Integrated GPU / CPU only | `tiny` / `base` | Qwen 3.5 4B/9B Q4 | Slow, but the workflow remains usable |
-| 8–12 GB VRAM | `small` / `turbo` | `qwen3.5:9b-q4_K_M` | 6.6 GB, strong Chinese and long context |
-| 16 GB VRAM | `large-v3` | `qwen3.5:9b-q8_0` | About 11 GB; recommended full-GPU quality option |
-| 16 GB VRAM + 64 GB RAM | `large-v3` | `qwen3.5:35b-a3b` | About 24 GB; slower mixed CPU/GPU quality option |
-| 24 GB+ VRAM | `large-v3` | Qwen 3.5 27B/35B | Serial execution is still recommended |
+| Integrated GPU / CPU only | `tiny` / `base` | Qwen 3.6 27B Q4 (very slow) | A smaller vision model may be more practical |
+| 8–12 GB VRAM | `small` / `turbo` | `qwen3.6:27b-mtp-q4_K_M` | About 18 GB; mixed RAM/GPU |
+| 16 GB VRAM | `large-v3` | `qwen3.6:27b-mtp-q4_K_M` | About 18 GB; mostly GPU-offloaded |
+| 16 GB VRAM + 64 GB RAM | `large-v3` | `qwen3.6:27b-mtp-q8_0` | About 30 GB; dense Q8 quality default |
+| 24 GB+ VRAM | `large-v3` | Qwen 3.6 27B Q8 | Serial execution is still recommended |
 
-The currently installed `qwen2.5:3b` is suitable for smoke tests, not
-high-quality documentary editing. On a 16 GB Quadro with 64 GB RAM, prefer
-`qwen3.5:35b-a3b` when quality matters more than speed, or
-`qwen3.5:9b-q8_0` for steadier full-GPU inference. Mixed-offload speed depends
-on quantization, memory bandwidth, and context length. Qwen 3.5 supports
-vision, tools, reasoning, and 201 languages:
-[Qwen 3.5 on Ollama](https://ollama.com/library/qwen3.5).
+On a 16 GB Quadro with 64 GB RAM, prefer `qwen3.6:27b-mtp-q8_0` for quality or
+Q4_K_M for speed and space. Both accept text and images and support thinking:
+[Qwen 3.6 on Ollama](https://ollama.com/library/qwen3.6).
 
 Whisper's published approximate VRAM requirements range from about 1 GB for
 tiny/base to about 6 GB for turbo. See the
@@ -362,17 +357,17 @@ details.
 
 ### 3. Prepare Ollama
 
-Quality-first for 16 GB VRAM + 64 GB RAM (about a 24 GB download and slower
+Quality-first for 16 GB VRAM + 64 GB RAM (about a 30 GB download and slower
 mixed CPU/GPU inference):
 
 ```powershell
-ollama pull qwen3.5:35b-a3b
+ollama pull qwen3.6:27b-mtp-q8_0
 ```
 
-For a faster high-quality model that fits fully in 16 GB VRAM (about 11 GB):
+For a faster, smaller high-quality model (about 18 GB):
 
 ```powershell
-ollama pull qwen3.5:9b-q8_0
+ollama pull qwen3.6:27b-mtp-q4_K_M
 ```
 
 Models are downloaded once. The UI subsequently starts Ollama automatically
@@ -406,7 +401,7 @@ API. Resolve Studio's External Scripting preference must still be set to
 ```powershell
 python main.py `
   --input-folder "D:\Documentary\Camera originals" `
-  --ollama-model "qwen3.5:35b-a3b" `
+  --ollama-model "qwen3.6:27b-mtp-q8_0" `
   --project-fps 23.976 `
   --chunk-minutes 10
 ```
@@ -419,7 +414,7 @@ python main.py `
   --video "D:\Shoot\A001.mp4" `
   --video "D:\Shoot\B001.mp4" `
   --input-folder "D:\Shoot\B-roll" `
-  --ollama-model "qwen3.5:35b-a3b"
+  --ollama-model "qwen3.6:27b-mtp-q8_0"
 ```
 
 Default outputs:
@@ -442,7 +437,7 @@ running:
 # Reuse raw_data.json and rerun only the director and Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen3.5:35b-a3b" `
+  --ollama-model "qwen3.6:27b-mtp-q8_0" `
   --creative-brief "Tell the preparation-to-payoff story in shooting order" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
@@ -544,7 +539,7 @@ out-point up, then subtracts one frame to match Resolve's inclusive `endFrame`.
   user can inspect and undo the partial timeline.
 - Semantic review requires an Ollama model reporting the `vision` capability.
   Plain `qwen2.5:3b` is a text-only smoke-test model and cannot run this
-  multimodal path; use Qwen 3.5 or another vision-capable model.
+  multimodal path; prefer `qwen3.6:27b-mtp-q8_0` when quality matters most.
 
 ## Tests
 
