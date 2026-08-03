@@ -753,7 +753,10 @@ class AIDirector:
                 )
 
             candidates = self.merge_decisions(candidates)
-            candidate_limit = max(24, min(160, self.num_ctx // 128))
+            candidate_limit = max(
+                24,
+                min(160, self._effective_num_ctx(self.text_model) // 128),
+            )
             candidates = self._limit_candidates(
                 candidates, limit=candidate_limit
             )
@@ -1188,6 +1191,7 @@ class AIDirector:
         """
         selected_model = str(model or self.model).strip()
         normalized_model = selected_model.casefold()
+        request_num_ctx = self._effective_num_ctx(selected_model)
         # Ollama accepts low/medium/high only for GPT-OSS. Qwen and other
         # thinking models use a boolean. Supplying "high" to Qwen can consume
         # the whole generation budget in the separate `thinking` field and
@@ -1196,7 +1200,7 @@ class AIDirector:
         # 向 Qwen 发送 "high" 可能让 thinking 耗尽预算，导致 response 为空。
         quality_think: Any = "high" if "gpt-oss" in normalized_model else True
         direct_think: Any = "low" if "gpt-oss" in normalized_model else False
-        num_predict = max(1024, min(4096, self.num_ctx // 4))
+        num_predict = max(1024, min(4096, request_num_ctx // 4))
         attempts = (
             ("quality", schema, quality_think),
             ("direct-json", schema, direct_think),
@@ -1222,7 +1226,7 @@ class AIDirector:
                 "options": {
                     "temperature": 0,
                     "seed": 42,
-                    "num_ctx": self.num_ctx,
+                    "num_ctx": request_num_ctx,
                     "num_predict": num_predict,
                 },
             }
@@ -1276,10 +1280,26 @@ class AIDirector:
 
         raise DirectorError(
             "Ollama 连续三次未返回可解析的结构化 JSON"
-            f"（最后错误：{last_issue}）。请将上下文提高到 16384 后重试。 / "
+            f"（最后错误：{last_issue}）。请减少候选数量或重试。 / "
             "Ollama failed to return parseable structured JSON after three attempts "
-            f"(last issue: {last_issue}). Retry with num_ctx=16384."
+            f"(last issue: {last_issue}). Reduce candidates or retry."
         )
+
+    def _effective_num_ctx(self, model: str) -> int:
+        """
+        Cap 70B/72B KV cache on 64GB-class mixed-memory systems.
+        在 64GB 级混合内存设备上限制 70B/72B 的 KV Cache。
+
+        Quantization quality is unchanged; only request context allocation is
+        bounded. Compact global candidates fit in 8K while leaving memory for
+        Windows, Ollama runtime state, and GPU spill.
+        量化精度不变，仅限制请求上下文；紧凑候选可容纳于 8K，并给 Windows、
+        Ollama 运行状态与显存回退保留内存。
+        """
+        normalized = str(model or "").casefold()
+        return min(self.num_ctx, 8192) if any(
+            marker in normalized for marker in ("70b", "72b")
+        ) else self.num_ctx
 
     def build_prompt(
         self,

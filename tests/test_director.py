@@ -369,6 +369,16 @@ class AIDirectorTests(unittest.TestCase):
         with self.assertRaises(DirectorError):
             self.make_director(chunk_minutes=9)
 
+    def test_72b_text_context_is_capped_without_changing_vision_context(self):
+        director = self.make_director(
+            model="qwen3.5:35b-a3b",
+            text_model="qwen2.5:72b-instruct-q5_K_M",
+            num_ctx=16384,
+        )
+
+        self.assertEqual(director._effective_num_ctx(director.model), 16384)
+        self.assertEqual(director._effective_num_ctx(director.text_model), 8192)
+
     def test_end_to_end_with_fake_ollama_unloads(self):
         raw = self.raw_data(duration=100.0)
         raw["transcript"] = [
