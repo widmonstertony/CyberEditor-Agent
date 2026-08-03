@@ -14,12 +14,10 @@ imports a machine-learning or media-processing package.
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 from pathlib import Path
 import shutil
-import string
 import subprocess
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -119,28 +117,52 @@ def find_ollama_executables() -> Tuple[Optional[Path], Optional[Path]]:
     return found_cli, found_app
 
 
-def _fixed_drive_roots() -> Sequence[Path]:
-    """
-    List mounted Windows drive roots without invoking PowerShell.
-    不调用 PowerShell，列出已挂载的 Windows 盘符根目录。
-    """
-    if os.name != "nt":
-        return ()
-    roots: List[Path] = []
+def _resolve_registry_value(hive: object, subkey: str, value_name: str) -> object:
+    """Read one Resolve registry value without raising. / 安全读取一个 Resolve 注册表值。"""
+    if winreg is None:
+        return None
+    access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
     try:
-        mask = int(ctypes.windll.kernel32.GetLogicalDrives())
-    except (AttributeError, OSError, ValueError):
-        mask = 0
-    for index, letter in enumerate(string.ascii_uppercase):
-        if mask and not (mask & (1 << index)):
-            continue
-        root = Path(f"{letter}:\\")
-        try:
-            if root.is_dir():
-                roots.append(root)
-        except OSError:
-            continue
-    return roots
+        key = winreg.OpenKey(hive, subkey, 0, access)
+    except OSError:
+        return None
+    try:
+        return winreg.QueryValueEx(key, value_name)[0]
+    except OSError:
+        return None
+    finally:
+        winreg.CloseKey(key)
+
+
+def get_resolve_registration() -> Dict[str, object]:
+    """
+    Read Blackmagic's official Resolve installation registration.
+    读取 Blackmagic 官方 Resolve 安装注册信息。
+
+    Resolve Studio activation is intentionally not inferred here: Free and
+    Studio use the same executable and MSI product name. The authoritative
+    edition is ``resolve.GetProductName()`` after a successful API connection.
+    此处不会猜测 Studio 授权：免费版与 Studio 共用可执行文件和 MSI 产品名；成功
+    连接 API 后的 ``resolve.GetProductName()`` 才是权威版本信息。
+    """
+    if winreg is None or os.name != "nt":
+        return {"installed": False, "version": "", "user_registered": False}
+    key = r"SOFTWARE\Blackmagic Design\DaVinci Resolve"
+    version = str(
+        _resolve_registry_value(winreg.HKEY_LOCAL_MACHINE, key, "Version") or ""
+    ).strip()
+    installed_value = _resolve_registry_value(
+        winreg.HKEY_CURRENT_USER, key, "installed"
+    )
+    try:
+        user_registered = int(installed_value or 0) == 1
+    except (TypeError, ValueError):
+        user_registered = False
+    return {
+        "installed": bool(version or user_registered),
+        "version": version,
+        "user_registered": user_registered,
+    }
 
 
 def _resolve_registry_installations() -> Sequence[Tuple[Path, str]]:
@@ -233,119 +255,70 @@ def _resolve_registry_candidates() -> Sequence[Path]:
     )
 
 
+def _resolve_start_app_candidates() -> Sequence[Path]:
+    """
+    Ask Windows for registered Start-app targets; never scan drives.
+    从 Windows 注册应用表读取启动目标，不扫描磁盘。
+    """
+    if os.name != "nt":
+        return ()
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        return ()
+    script = (
+        "$items = Get-StartApps | Where-Object { $_.Name -eq 'DaVinci Resolve' }; "
+        "@($items | ForEach-Object { $_.AppID }) | ConvertTo-Json -Compress"
+    )
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return ()
+        payload = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ()
+    values = payload if isinstance(payload, list) else [payload]
+    return _unique_paths(
+        [
+            Path(str(value).strip())
+            for value in values
+            if str(value).strip().casefold().endswith("resolve.exe")
+        ]
+    )
+
+
 def find_resolve_executable() -> Optional[Path]:
     """
-    Locate ``Resolve.exe`` across custom Windows installation drives.
-    在 Windows 自定义安装盘中定位 ``Resolve.exe``。
+    Locate ``Resolve.exe`` from Windows/Blackmagic registration, never drive scans.
+    通过 Windows/Blackmagic 注册信息定位 ``Resolve.exe``，绝不扫描磁盘猜测。
 
-    Registry hints are checked first, followed by every mounted drive's common
-    Program Files locations.  The latter is important because the MSI entry can
-    omit ``InstallLocation`` when Resolve is installed on another drive.
-
-    先检查注册表线索，再检查所有盘符的常见 Program Files 目录。Resolve 安装在
-    其他盘时 MSI 记录可能缺少 ``InstallLocation``，因此跨盘检查不可省略。
+    Blackmagic's MSI may omit ``InstallLocation``. Windows Start Apps still
+    records the exact custom-drive target and is the preferred path source after
+    confirming Blackmagic's installation keys.
+    Blackmagic MSI 可能不写 ``InstallLocation``；Windows 注册应用表仍保存自定义盘
+    的精确启动目标，因此在确认 Blackmagic 注册表后优先使用该目标。
     """
+    registration = get_resolve_registration()
     direct = shutil.which("Resolve.exe")
     candidates: List[Path] = [Path(direct)] if direct else []
+    library = str(os.environ.get("RESOLVE_SCRIPT_LIB") or "").strip()
+    if library:
+        candidates.append(Path(library).expanduser().parent / "Resolve.exe")
     candidates.extend(_resolve_registry_candidates())
-
-    program_roots = [
-        Path(value)
-        for value in (
-            os.environ.get("PROGRAMFILES"),
-            os.environ.get("PROGRAMFILES(X86)"),
-        )
-        if value
-    ]
-    for drive in _fixed_drive_roots():
-        program_roots.extend((drive / "Program Files", drive / "Program Files (x86)"))
-    for root in _unique_paths(program_roots):
-        candidates.extend(
-            (
-                root / "Blackmagic Design" / "DaVinci Resolve" / "Resolve.exe",
-                root
-                / "Blackmagic Design"
-                / "DaVinci Resolve Studio"
-                / "Resolve.exe",
-            )
-        )
+    if bool(registration.get("installed")):
+        candidates.extend(_resolve_start_app_candidates())
     return next(
         (path.resolve() for path in _unique_paths(candidates) if path.is_file()),
         None,
     )
-
-
-def _windows_file_product_name(executable: Path) -> str:
-    """Read the signed Windows ProductName version resource. / 读取 Windows 产品名资源。"""
-    if os.name != "nt":
-        return ""
-    try:
-        version = ctypes.windll.version
-        size = int(version.GetFileVersionInfoSizeW(str(executable), None))
-        if size <= 0:
-            return ""
-        buffer = ctypes.create_string_buffer(size)
-        if not version.GetFileVersionInfoW(str(executable), 0, size, buffer):
-            return ""
-        translation_pointer = ctypes.c_void_p()
-        translation_length = ctypes.c_uint()
-        if not version.VerQueryValueW(
-            buffer,
-            r"\VarFileInfo\Translation",
-            ctypes.byref(translation_pointer),
-            ctypes.byref(translation_length),
-        ):
-            return ""
-        if translation_length.value < 4 or not translation_pointer.value:
-            return ""
-        translation = (ctypes.c_ushort * 2).from_address(
-            translation_pointer.value
-        )
-        query = (
-            f"\\StringFileInfo\\{translation[0]:04x}{translation[1]:04x}"
-            r"\ProductName"
-        )
-        value_pointer = ctypes.c_void_p()
-        value_length = ctypes.c_uint()
-        if not version.VerQueryValueW(
-            buffer,
-            query,
-            ctypes.byref(value_pointer),
-            ctypes.byref(value_length),
-        ):
-            return ""
-        if not value_pointer.value or value_length.value <= 1:
-            return ""
-        return ctypes.wstring_at(value_pointer.value, value_length.value - 1).strip()
-    except (AttributeError, OSError, TypeError, ValueError):
-        return ""
-
-
-def detect_resolve_edition(executable: Optional[Path] = None) -> str:
-    """
-    Return ``studio``, ``free``, ``unknown``, or ``not_found``.
-    返回 ``studio``、``free``、``unknown`` 或 ``not_found``。
-
-    A matching registry product name is authoritative. Unknown layouts remain
-    connectable so portable or future installations are not falsely blocked.
-    匹配路径的注册产品名为权威依据；未知布局仍允许尝试连接，避免误拦截未来版本。
-    """
-    resolved = executable or find_resolve_executable()
-    if resolved is None:
-        return "not_found"
-    product_name = _windows_file_product_name(resolved).casefold()
-    if product_name == "davinci resolve studio":
-        return "studio"
-    if product_name == "davinci resolve":
-        return "free"
-    target = os.path.normcase(os.path.abspath(str(resolved)))
-    for path, display in _resolve_registry_installations():
-        candidate = os.path.normcase(os.path.abspath(str(path)))
-        if candidate == target:
-            return "studio" if "studio" in display.casefold() else "free"
-    if "studio" in str(resolved.parent).casefold():
-        return "studio"
-    return "unknown"
 
 
 def fetch_ollama_models(

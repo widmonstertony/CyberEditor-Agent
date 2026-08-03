@@ -12,21 +12,16 @@ from src import runtime_services
 class RuntimeServicesTests(unittest.TestCase):
     """Validate custom-drive discovery and Ollama auto-start control flow."""
 
-    def test_find_resolve_scans_non_system_drive(self) -> None:
+    def test_find_resolve_uses_windows_registered_start_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            drive = Path(directory)
-            executable = (
-                drive
-                / "Program Files"
-                / "Blackmagic Design"
-                / "DaVinci Resolve"
-                / "Resolve.exe"
-            )
+            executable = Path(directory) / "custom-drive" / "Resolve.exe"
             executable.parent.mkdir(parents=True)
             executable.touch()
             with (
                 mock.patch.object(
-                    runtime_services, "_fixed_drive_roots", return_value=[drive]
+                    runtime_services,
+                    "get_resolve_registration",
+                    return_value={"installed": True, "version": "21.0.00047"},
                 ),
                 mock.patch.object(
                     runtime_services,
@@ -34,59 +29,45 @@ class RuntimeServicesTests(unittest.TestCase):
                     return_value=[],
                 ),
                 mock.patch.object(
+                    runtime_services,
+                    "_resolve_start_app_candidates",
+                    return_value=[executable],
+                ),
+                mock.patch.object(
                     runtime_services.shutil, "which", return_value=None
+                ),
+                mock.patch.dict(
+                    runtime_services.os.environ,
+                    {"RESOLVE_SCRIPT_LIB": ""},
+                    clear=False,
                 ),
             ):
                 result = runtime_services.find_resolve_executable()
             self.assertEqual(result, executable.resolve())
 
-    def test_resolve_edition_uses_matching_registered_product(self) -> None:
-        executable = Path(
-            r"D:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"
-        )
+    def test_resolve_registration_reads_official_blackmagic_keys(self) -> None:
+        fake_winreg = mock.Mock()
+        fake_winreg.HKEY_LOCAL_MACHINE = object()
+        fake_winreg.HKEY_CURRENT_USER = object()
         with (
             mock.patch.object(
-                runtime_services, "_windows_file_product_name", return_value=""
+                runtime_services, "winreg", fake_winreg
+            ),
+            mock.patch.object(
+                runtime_services.os, "name", "nt"
             ),
             mock.patch.object(
                 runtime_services,
-                "_resolve_registry_installations",
-                return_value=[(executable, "DaVinci Resolve")],
-            ),
+                "_resolve_registry_value",
+                side_effect=["21.0.00047", 1],
+            ) as read_value,
         ):
-            self.assertEqual(
-                runtime_services.detect_resolve_edition(executable), "free"
-            )
+            registration = runtime_services.get_resolve_registration()
 
-        with (
-            mock.patch.object(
-                runtime_services, "_windows_file_product_name", return_value=""
-            ),
-            mock.patch.object(
-                runtime_services,
-                "_resolve_registry_installations",
-                return_value=[(executable, "DaVinci Resolve Studio")],
-            ),
-        ):
-            self.assertEqual(
-                runtime_services.detect_resolve_edition(executable), "studio"
-            )
-
-    def test_unknown_resolve_layout_is_not_falsely_blocked(self) -> None:
-        executable = Path(r"Z:\Portable Resolve\Resolve.exe")
-        with (
-            mock.patch.object(
-                runtime_services, "_windows_file_product_name", return_value=""
-            ),
-            mock.patch.object(
-                runtime_services,
-                "_resolve_registry_installations",
-                return_value=[],
-            ),
-        ):
-            self.assertEqual(
-                runtime_services.detect_resolve_edition(executable), "unknown"
-            )
+        self.assertTrue(registration["installed"])
+        self.assertTrue(registration["user_registered"])
+        self.assertEqual(registration["version"], "21.0.00047")
+        self.assertEqual(read_value.call_count, 2)
 
     def test_find_ollama_uses_local_app_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

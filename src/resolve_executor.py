@@ -28,9 +28,9 @@ import time
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 try:
-    from .runtime_services import detect_resolve_edition, find_resolve_executable
+    from .runtime_services import find_resolve_executable, get_resolve_registration
 except ImportError:  # pragma: no cover - direct ``python src/...`` fallback.
-    from runtime_services import detect_resolve_edition, find_resolve_executable
+    from runtime_services import find_resolve_executable, get_resolve_registration
 
 
 LOGGER_NAME = "cybereditor.resolve"
@@ -374,15 +374,21 @@ class DaVinciExecutor:
             raise ResolveExecutorError(
                 "DaVinci Resolve 需要 64 位 Python / Resolve requires 64-bit Python."
             )
+        registration = get_resolve_registration()
         executable = find_resolve_executable()
-        if detect_resolve_edition(executable) == "free":
+        if not bool(registration.get("installed")) and executable is None:
             raise ResolveExecutorError(
-                "检测到 DaVinci Resolve 免费版。Blackmagic 将外部脚本连接限制为 "
-                "Resolve Studio 功能；AI 时间线与音乐床已保留，请安装 Studio 后从“仅执行 "
-                "Resolve”继续，无需重新运行模型。 / Detected DaVinci Resolve Free. "
-                "External scripting is a Resolve Studio feature. The AI timeline and "
-                "music bed are preserved; install Studio and resume with Resolve-only."
+                "Windows 注册表中没有 DaVinci Resolve 安装记录，也没有注册启动目标。"
+                "请重新安装 Resolve。 / Resolve is not registered with Windows and no "
+                "registered launch target was found; reinstall Resolve."
             )
+        self.logger.info(
+            "Resolve 注册检测：installed=%s, version=%s, executable=%s / "
+            "Resolve registration detected",
+            bool(registration.get("installed")),
+            str(registration.get("version") or "unknown"),
+            str(executable or "unknown"),
+        )
         self._configure_resolve_library(executable)
         module, checked, errors = self._load_resolve_module()
         if module is None:
@@ -407,9 +413,10 @@ class DaVinciExecutor:
                 )
             if executable is None:
                 raise ResolveExecutorError(
-                    "未找到 Resolve.exe。已检查注册表及所有磁盘的 Program Files。"
-                    " / Resolve.exe was not found in the registry or Program Files "
-                    "on mounted drives."
+                    "Resolve 已在注册表中登记，但 Windows 注册应用表没有返回启动目标。"
+                    "请从开始菜单启动一次 Resolve 后重试。 / Resolve is registered, "
+                    "but Windows returned no registered launch target. Start Resolve "
+                    "once from the Start menu and retry."
                 )
             launched_process = self._launch_resolve(executable)
             self.logger.info(
@@ -436,12 +443,9 @@ class DaVinciExecutor:
         if resolve is None:
             raise ResolveExecutorError(
                 "Resolve 已运行，但脚本 API 在等待后仍不可用。请在 Preferences > "
-                "System > General 中将 External scripting 设为 Local 后重启。"
-                "当前安装的 API 文档要求 DaVinci Resolve Studio；免费版可能无法"
-                "接受外部脚本连接。\n"
+                "System > General 中将 External scripting 设为 Local 后重启。\n"
                 "Resolve is running but its API did not become ready. Enable Local "
-                "external scripting and restart Resolve. The bundled API documentation "
-                "targets DaVinci Resolve Studio."
+                "external scripting and restart Resolve."
             )
         try:
             name = resolve.GetProductName()
@@ -498,7 +502,10 @@ class DaVinciExecutor:
                 ) from exc
             if project is None:
                 raise ResolveExecutorError(
-                    "无法为 PP8 创建独立色彩管理工程 / Could not create an isolated PP8 project."
+                    "无法为 PP8 创建独立色彩管理工程。请先关闭 Resolve 的偏好设置、"
+                    "项目设置或其他模态对话框，然后重试。 / Could not create an "
+                    "isolated PP8 project. Close Resolve Preferences, Project Settings, "
+                    "or any other modal dialog, then retry."
                 )
             self.created_project = True
             self.logger.info(

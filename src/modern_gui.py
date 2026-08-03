@@ -38,12 +38,12 @@ from .gui import (
     build_runtime_environment,
     detect_hardware,
     detect_media_fps,
-    detect_resolve_edition,
     detect_system_theme,
     detect_torch_runtime,
     enable_windows_high_dpi,
     ensure_ollama_service,
     find_resolve_executable,
+    get_resolve_registration,
     get_primary_work_area,
     parse_frame_rate,
     recommend_automatic_settings,
@@ -1691,16 +1691,17 @@ class ModernCyberEditorApp:
             results["Ollama"] = (False, self.t("not_connected"))
 
         resolve_path = find_resolve_executable()
-        resolve_edition = detect_resolve_edition(resolve_path)
-        resolve_ready = resolve_path is not None and resolve_edition != "free"
+        resolve_registration = get_resolve_registration()
+        resolve_version = str(resolve_registration.get("version") or "").strip()
+        resolve_ready = bool(resolve_registration.get("installed")) and resolve_path is not None
         results["Resolve"] = (
             resolve_ready,
             (
-                self.t("resolve_studio_auto_start")
-                if resolve_edition == "studio"
-                else self.t("resolve_free_studio_required")
-                if resolve_edition == "free"
-                else self.t("resolve_edition_unknown")
+                self.t("resolve_registered", version=resolve_version or "Resolve")
+                if resolve_ready
+                else self.t("resolve_registered_path_missing", version=resolve_version or "Resolve")
+                if bool(resolve_registration.get("installed"))
+                else self.t("resolve_registry_missing")
                 if resolve_path is not None
                 else self.t("not_found")
             ),

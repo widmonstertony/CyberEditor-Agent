@@ -36,10 +36,10 @@ from tkinter import filedialog, messagebox, ttk
 
 from .runtime_services import (
     RuntimeServiceError,
-    detect_resolve_edition,
     ensure_ollama_service,
     find_ollama_executables,
     find_resolve_executable,
+    get_resolve_registration,
 )
 from .media_manifest import MediaManifestError, discover_video_files
 
@@ -2182,16 +2182,17 @@ class CyberEditorApp:
             results["Ollama"] = (False, "未连接")
 
         resolve_path = find_resolve_executable()
-        resolve_edition = detect_resolve_edition(resolve_path)
-        resolve_ready = resolve_path is not None and resolve_edition != "free"
+        resolve_registration = get_resolve_registration()
+        resolve_version = str(resolve_registration.get("version") or "").strip()
+        resolve_ready = bool(resolve_registration.get("installed")) and resolve_path is not None
         results["Resolve"] = (
             resolve_ready,
             (
-                "Studio 已安装 · 执行时自动启动"
-                if resolve_edition == "studio"
-                else "免费版 · 外部自动化需要 Studio"
-                if resolve_edition == "free"
-                else "已安装 · 版本待连接确认"
+                f"已注册 {resolve_version or 'Resolve'} · API 连接时确认 Studio"
+                if resolve_ready
+                else f"已注册 {resolve_version or 'Resolve'} · 缺少启动目标"
+                if bool(resolve_registration.get("installed"))
+                else "找到程序 · 注册信息缺失"
                 if resolve_path is not None
                 else "未安装"
             ),
