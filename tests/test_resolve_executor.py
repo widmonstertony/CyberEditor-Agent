@@ -4,6 +4,7 @@ import json
 import logging
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -147,6 +148,25 @@ class ResolveExecutorTests(unittest.TestCase):
 
         executor = DaVinciExecutor("timeline_cuts.json")
         self.assertEqual(executor._media_fps(NativeFpsItem()), Decimal("50"))
+
+    def test_resolve_process_detection_ignores_windows_code_page(self):
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=b'"Resolve.exe","1234","Console"\r\n\xd0',
+        )
+        with mock.patch(
+            "src.resolve_executor.subprocess.run", return_value=completed
+        ) as run:
+            self.assertTrue(DaVinciExecutor._is_resolve_running())
+
+        self.assertIs(run.call_args.kwargs["text"], False)
+
+    def test_resolve_process_detection_handles_missing_stdout(self):
+        completed = SimpleNamespace(returncode=0, stdout=None)
+        with mock.patch(
+            "src.resolve_executor.subprocess.run", return_value=completed
+        ):
+            self.assertFalse(DaVinciExecutor._is_resolve_running())
 
     def test_ai_effect_plan_calls_supported_resolve_apis(self):
         class TimelineItem:

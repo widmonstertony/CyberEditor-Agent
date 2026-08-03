@@ -1465,7 +1465,13 @@ class DaVinciExecutor:
                     "/NH",
                 ],
                 capture_output=True,
-                text=True,
+                # `tasklist` writes in the active Windows console/OEM code
+                # page, which is not necessarily UTF-8 on Chinese systems.
+                # The process image name is ASCII, so inspect raw bytes and
+                # avoid locale-dependent decoding entirely.
+                # tasklist 使用 Windows 当前控制台/OEM 代码页输出，中文系统
+                # 不一定是 UTF-8。进程名为 ASCII，直接检查原始字节最稳妥。
+                text=False,
                 timeout=10,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -1474,7 +1480,11 @@ class DaVinciExecutor:
             return None
         if completed.returncode != 0:
             return None
-        return "resolve.exe" in completed.stdout.casefold()
+        stdout = completed.stdout or b""
+        if isinstance(stdout, str):
+            # Supports subprocess-compatible test doubles and unusual wrappers.
+            return "resolve.exe" in stdout.casefold()
+        return b"resolve.exe" in bytes(stdout).lower()
 
     @staticmethod
     def _folder_items(
