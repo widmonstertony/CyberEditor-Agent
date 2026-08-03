@@ -1201,11 +1201,24 @@ class AIDirector:
         quality_think: Any = "high" if "gpt-oss" in normalized_model else True
         direct_think: Any = "low" if "gpt-oss" in normalized_model else False
         num_predict = max(1024, min(4096, request_num_ctx // 4))
-        attempts = (
-            ("quality", schema, quality_think),
-            ("direct-json", schema, direct_think),
-            ("compatibility-json", "json", direct_think),
-        )
+        if "qwen3.6" in normalized_model:
+            # Qwen3.6 commonly spends the entire first structured generation in
+            # its separate thinking channel, then returns no parseable JSON.
+            # Starting with thinking disabled preserves schema enforcement and
+            # avoids doing every expensive mixed-memory request twice.
+            # Qwen3.6 常把首轮结构化生成预算消耗在独立 thinking 字段中，最终没有
+            # 可解析 JSON。首轮直接关闭显式思考仍保留 Schema 约束，并避免混合内存
+            # 推理的每个请求都重复执行一次。
+            attempts = (
+                ("direct-json", schema, False),
+                ("compatibility-json", "json", False),
+            )
+        else:
+            attempts = (
+                ("quality", schema, quality_think),
+                ("direct-json", schema, direct_think),
+                ("compatibility-json", "json", direct_think),
+            )
         url = self.base_url + "/api/generate"
         last_issue = "unknown response"
         for attempt_index, (label, output_format, think_value) in enumerate(
@@ -1268,9 +1281,20 @@ class AIDirector:
                     last_issue = "empty response"
 
             if attempt_index < len(attempts):
+                if think_value is False:
+                    retry_message = (
+                        "Ollama 未返回可用 JSON（模式=%s, done_reason=%s, prompt_tokens=%s, "
+                        "output_tokens=%s, thinking_chars=%d）；切换 JSON 兼容模式并重试 / "
+                        "Ollama returned no usable JSON; retrying with JSON compatibility mode"
+                    )
+                else:
+                    retry_message = (
+                        "Ollama 未返回可用 JSON（模式=%s, done_reason=%s, prompt_tokens=%s, "
+                        "output_tokens=%s, thinking_chars=%d）；关闭显式思考并重试 / "
+                        "Ollama returned no usable JSON; retrying without explicit thinking"
+                    )
                 self.logger.warning(
-                    "Ollama 未返回可用 JSON（模式=%s, done_reason=%s, prompt_tokens=%s, output_tokens=%s, "
-                    "thinking_chars=%d）；关闭显式思考并重试 / Ollama returned no usable JSON; retrying without explicit thinking",
+                    retry_message,
                     label,
                     envelope.get("done_reason") if isinstance(envelope, dict) else None,
                     envelope.get("prompt_eval_count") if isinstance(envelope, dict) else None,

@@ -59,23 +59,78 @@ class WorkflowLock:
         """Acquire the lock atomically and record the owner PID. / 原子获取锁并记录所有者 PID。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self.fd = os.open(
-                str(self.path),
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            )
-            os.write(self.fd, str(os.getpid()).encode("ascii"))
+            self._acquire()
         except FileExistsError as exc:
             owner = "unknown"
             try:
                 owner = self.path.read_text(encoding="ascii").strip() or owner
             except OSError:
                 pass
+            if owner.isdecimal() and not self._pid_is_running(int(owner)):
+                try:
+                    self.path.unlink()
+                    self._acquire()
+                    return self
+                except FileNotFoundError:
+                    try:
+                        self._acquire()
+                        return self
+                    except FileExistsError:
+                        pass
+                except FileExistsError:
+                    pass
             raise WorkflowError(
                 f"检测到另一个工作流或遗留锁文件：{self.path}（PID={owner}）。"
                 "确认没有任务运行后删除该文件。\n"
                 f"Another workflow or stale lock exists at {self.path} (PID={owner})."
             ) from exc
         return self
+
+    def _acquire(self) -> None:
+        """Create this lock atomically. / 原子创建本锁文件。"""
+        self.fd = os.open(
+            str(self.path),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        )
+        os.write(self.fd, str(os.getpid()).encode("ascii"))
+
+    @staticmethod
+    def _pid_is_running(pid: int) -> bool:
+        """Return whether a lock-owner PID still exists. / 判断锁所有者进程是否仍存在。"""
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            # ``os.kill(pid, 0)`` is not a harmless existence probe on Windows:
+            # CPython maps non-console signals to TerminateProcess. Query a
+            # limited process handle instead so stale-lock recovery can never
+            # terminate the workflow it is checking.
+            # Windows 上 ``os.kill(pid, 0)`` 并非无副作用的存在性检查；改用只读
+            # 进程句柄查询，确保遗留锁恢复绝不会终止被检查的工作流。
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = (
+                ctypes.c_ulong,
+                ctypes.c_int,
+                ctypes.c_ulong,
+            )
+            open_process.restype = ctypes.c_void_p
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = (ctypes.c_void_p,)
+            close_handle.restype = ctypes.c_int
+            handle = open_process(0x1000, False, pid)
+            if handle:
+                close_handle(handle)
+                return True
+            return ctypes.get_last_error() == 5
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            return True
+        except (OSError, OverflowError, ValueError):
+            return False
+        return True
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         """Close and remove only the lock acquired by this process. / 关闭并仅删除本进程获取的锁。"""

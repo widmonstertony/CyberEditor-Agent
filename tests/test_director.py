@@ -330,6 +330,28 @@ class AIDirectorTests(unittest.TestCase):
             generation_posts[0]["options"]["num_predict"], 2048
         )
 
+    def test_qwen36_structured_json_disables_thinking_on_first_attempt(self):
+        session = FakeSession()
+        director = self.make_director(
+            model="qwen3.6:27b-mtp-q8_0", session=session
+        )
+
+        result = director._request_json(
+            "Return one decision.",
+            {
+                "type": "object",
+                "properties": {"decisions": {"type": "array"}},
+                "required": ["decisions"],
+            },
+        )
+
+        self.assertIn("decisions", result)
+        generation_posts = [
+            item for item in session.posts if item.get("keep_alive") != 0
+        ]
+        self.assertEqual(len(generation_posts), 1)
+        self.assertIs(generation_posts[0]["think"], False)
+
     def test_director_checkpoint_round_trip_and_fingerprint_guard(self):
         director = self.make_director()
         with tempfile.TemporaryDirectory() as temporary:

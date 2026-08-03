@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -50,6 +51,18 @@ class OrchestratorTests(unittest.TestCase):
                 with self.assertRaises(WorkflowError):
                     with WorkflowLock(lock_path):
                         pass
+            self.assertFalse(lock_path.exists())
+
+    def test_stale_lock_is_recovered_automatically(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = Path(temporary) / "workflow.lock"
+            lock_path.write_text("2147483647", encoding="ascii")
+
+            with WorkflowLock(lock_path):
+                self.assertEqual(
+                    lock_path.read_text(encoding="ascii"), str(os.getpid())
+                )
+
             self.assertFalse(lock_path.exists())
 
     def test_text_only_model_is_rejected_before_extraction(self):
