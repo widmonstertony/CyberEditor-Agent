@@ -40,6 +40,54 @@ class RuntimeServicesTests(unittest.TestCase):
                 result = runtime_services.find_resolve_executable()
             self.assertEqual(result, executable.resolve())
 
+    def test_resolve_edition_uses_matching_registered_product(self) -> None:
+        executable = Path(
+            r"D:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"
+        )
+        with (
+            mock.patch.object(
+                runtime_services, "_windows_file_product_name", return_value=""
+            ),
+            mock.patch.object(
+                runtime_services,
+                "_resolve_registry_installations",
+                return_value=[(executable, "DaVinci Resolve")],
+            ),
+        ):
+            self.assertEqual(
+                runtime_services.detect_resolve_edition(executable), "free"
+            )
+
+        with (
+            mock.patch.object(
+                runtime_services, "_windows_file_product_name", return_value=""
+            ),
+            mock.patch.object(
+                runtime_services,
+                "_resolve_registry_installations",
+                return_value=[(executable, "DaVinci Resolve Studio")],
+            ),
+        ):
+            self.assertEqual(
+                runtime_services.detect_resolve_edition(executable), "studio"
+            )
+
+    def test_unknown_resolve_layout_is_not_falsely_blocked(self) -> None:
+        executable = Path(r"Z:\Portable Resolve\Resolve.exe")
+        with (
+            mock.patch.object(
+                runtime_services, "_windows_file_product_name", return_value=""
+            ),
+            mock.patch.object(
+                runtime_services,
+                "_resolve_registry_installations",
+                return_value=[],
+            ),
+        ):
+            self.assertEqual(
+                runtime_services.detect_resolve_edition(executable), "unknown"
+            )
+
     def test_find_ollama_uses_local_app_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             local = Path(directory)

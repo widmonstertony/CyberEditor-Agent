@@ -143,14 +143,19 @@ def _fixed_drive_roots() -> Sequence[Path]:
     return roots
 
 
-def _resolve_registry_candidates() -> Sequence[Path]:
+def _resolve_registry_installations() -> Sequence[Tuple[Path, str]]:
     """
-    Read Resolve install hints from Windows uninstall entries.
-    从 Windows 卸载注册表项读取 Resolve 安装线索。
+    Read Resolve paths together with registered product names.
+    读取 Resolve 路径及其注册产品名。
+
+    Both Free and Studio can install scripting modules, so module presence is
+    insufficient to determine whether external automation is available.
+    免费版与 Studio 都可能安装脚本模块，因此不能仅凭模块存在判断外部自动化能力。
     """
     if winreg is None or os.name != "nt":
         return ()
-    candidates: List[Path] = []
+    installations: List[Tuple[Path, str]] = []
+    seen = set()
     hives = (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER)
     subkeys = (
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -177,11 +182,11 @@ def _resolve_registry_candidates() -> Sequence[Path]:
                             entry = winreg.OpenKey(root, name)
                             display = str(
                                 winreg.QueryValueEx(entry, "DisplayName")[0]
-                            )
+                            ).strip()
                         except OSError:
                             continue
                         try:
-                            if display.strip().casefold() not in {
+                            if display.casefold() not in {
                                 "davinci resolve",
                                 "davinci resolve studio",
                             }:
@@ -202,16 +207,30 @@ def _resolve_registry_candidates() -> Sequence[Path]:
                                     continue
                                 value = value.split(",", 1)[0]
                                 path = Path(value)
-                                candidates.append(
+                                executable = (
                                     path
                                     if path.suffix.casefold() == ".exe"
                                     else path / "Resolve.exe"
                                 )
+                                key = (
+                                    os.path.normcase(os.path.abspath(str(executable))),
+                                    display.casefold(),
+                                )
+                                if key not in seen:
+                                    seen.add(key)
+                                    installations.append((executable, display))
                         finally:
                             winreg.CloseKey(entry)
                 finally:
                     winreg.CloseKey(root)
-    return _unique_paths(candidates)
+    return installations
+
+
+def _resolve_registry_candidates() -> Sequence[Path]:
+    """Read Resolve executable hints from uninstall entries. / 读取 Resolve 路径线索。"""
+    return _unique_paths(
+        [path for path, _display in _resolve_registry_installations()]
+    )
 
 
 def find_resolve_executable() -> Optional[Path]:
@@ -254,6 +273,79 @@ def find_resolve_executable() -> Optional[Path]:
         (path.resolve() for path in _unique_paths(candidates) if path.is_file()),
         None,
     )
+
+
+def _windows_file_product_name(executable: Path) -> str:
+    """Read the signed Windows ProductName version resource. / 读取 Windows 产品名资源。"""
+    if os.name != "nt":
+        return ""
+    try:
+        version = ctypes.windll.version
+        size = int(version.GetFileVersionInfoSizeW(str(executable), None))
+        if size <= 0:
+            return ""
+        buffer = ctypes.create_string_buffer(size)
+        if not version.GetFileVersionInfoW(str(executable), 0, size, buffer):
+            return ""
+        translation_pointer = ctypes.c_void_p()
+        translation_length = ctypes.c_uint()
+        if not version.VerQueryValueW(
+            buffer,
+            r"\VarFileInfo\Translation",
+            ctypes.byref(translation_pointer),
+            ctypes.byref(translation_length),
+        ):
+            return ""
+        if translation_length.value < 4 or not translation_pointer.value:
+            return ""
+        translation = (ctypes.c_ushort * 2).from_address(
+            translation_pointer.value
+        )
+        query = (
+            f"\\StringFileInfo\\{translation[0]:04x}{translation[1]:04x}"
+            r"\ProductName"
+        )
+        value_pointer = ctypes.c_void_p()
+        value_length = ctypes.c_uint()
+        if not version.VerQueryValueW(
+            buffer,
+            query,
+            ctypes.byref(value_pointer),
+            ctypes.byref(value_length),
+        ):
+            return ""
+        if not value_pointer.value or value_length.value <= 1:
+            return ""
+        return ctypes.wstring_at(value_pointer.value, value_length.value - 1).strip()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return ""
+
+
+def detect_resolve_edition(executable: Optional[Path] = None) -> str:
+    """
+    Return ``studio``, ``free``, ``unknown``, or ``not_found``.
+    返回 ``studio``、``free``、``unknown`` 或 ``not_found``。
+
+    A matching registry product name is authoritative. Unknown layouts remain
+    connectable so portable or future installations are not falsely blocked.
+    匹配路径的注册产品名为权威依据；未知布局仍允许尝试连接，避免误拦截未来版本。
+    """
+    resolved = executable or find_resolve_executable()
+    if resolved is None:
+        return "not_found"
+    product_name = _windows_file_product_name(resolved).casefold()
+    if product_name == "davinci resolve studio":
+        return "studio"
+    if product_name == "davinci resolve":
+        return "free"
+    target = os.path.normcase(os.path.abspath(str(resolved)))
+    for path, display in _resolve_registry_installations():
+        candidate = os.path.normcase(os.path.abspath(str(path)))
+        if candidate == target:
+            return "studio" if "studio" in display.casefold() else "free"
+    if "studio" in str(resolved.parent).casefold():
+        return "studio"
+    return "unknown"
 
 
 def fetch_ollama_models(

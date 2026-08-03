@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -395,6 +396,32 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
         },
     },
     "required": ["project_summary", "music_plan", "sequence"],
+    "additionalProperties": False,
+}
+
+# The final directing pass is deliberately split into two schema-constrained
+# requests while the same Ollama process remains loaded.  Resolve sequencing
+# and music cue design have different evidence requirements; separating their
+# schemas prevents the combined prompt/schema from consuming the generation
+# window on long, multi-asset projects.
+# 最终导演在同一次 Ollama 模型驻留期间拆成两次 Schema 约束请求。镜头编排与音乐
+# cue 设计依赖不同证据，拆分后可避免长项目的组合 Prompt/Schema 吃光 JSON 输出空间。
+SEQUENCE_SELECTION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "project_summary": SEQUENCE_SCHEMA["properties"]["project_summary"],
+        "sequence": SEQUENCE_SCHEMA["properties"]["sequence"],
+    },
+    "required": ["project_summary", "sequence"],
+    "additionalProperties": False,
+}
+
+MUSIC_PLAN_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "music_plan": SEQUENCE_SCHEMA["properties"]["music_plan"],
+    },
+    "required": ["music_plan"],
     "additionalProperties": False,
 }
 
@@ -1433,7 +1460,47 @@ class AIDirector:
         # 向 Qwen 发送 "high" 可能让 thinking 耗尽预算，导致 response 为空。
         quality_think: Any = "high" if "gpt-oss" in normalized_model else True
         direct_think: Any = "low" if "gpt-oss" in normalized_model else False
-        num_predict = max(1024, min(4096, request_num_ctx // 4))
+        desired_num_predict = max(1024, min(4096, request_num_ctx // 4))
+        system_prompt = (
+            "You are a senior documentary editor and visual storyteller. "
+            "Use only supplied transcript, timestamps, and images. Return "
+            "only the requested JSON and never invent content."
+        )
+        schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        estimated_input_tokens = self._estimate_prompt_tokens(
+            system_prompt + "\n" + prompt + "\n" + schema_text
+        )
+        # Ollama's num_ctx is shared by the prompt and generated response. Keep
+        # a safety margin and lower num_predict only when a compact request is
+        # still close to the configured window. Semantic prompt compaction is
+        # performed by the caller (not by blindly truncating JSON evidence).
+        # Ollama 的 num_ctx 由输入和输出共享。这里保留安全余量；语义压缩由调用方
+        # 完成，绝不从中间粗暴截断 JSON 证据。
+        available_output_tokens = request_num_ctx - estimated_input_tokens - 256
+        num_predict = min(
+            desired_num_predict,
+            max(1024, available_output_tokens),
+        )
+        utilization = estimated_input_tokens / max(1, request_num_ctx)
+        if utilization >= 0.70:
+            self.logger.warning(
+                "Ollama 上下文预检：预计输入约 %d token，保留输出 %d / 总计 %d；"
+                "若仍超限将由分阶段导演避免截断 / Context preflight: ~%d input, "
+                "%d output of %d tokens",
+                estimated_input_tokens,
+                num_predict,
+                request_num_ctx,
+                estimated_input_tokens,
+                num_predict,
+                request_num_ctx,
+            )
+        else:
+            self.logger.debug(
+                "Ollama context preflight: ~%d input + %d output <= %d",
+                estimated_input_tokens,
+                num_predict,
+                request_num_ctx,
+            )
         if "qwen3.6" in normalized_model:
             # Qwen3.6 commonly spends the entire first structured generation in
             # its separate thinking channel, then returns no parseable JSON.
@@ -1459,11 +1526,7 @@ class AIDirector:
         ):
             payload: Dict[str, Any] = {
                 "model": selected_model,
-                "system": (
-                    "You are a senior documentary editor and visual storyteller. "
-                    "Use only supplied transcript, timestamps, and images. Return "
-                    "only the requested JSON and never invent content."
-                ),
+                "system": system_prompt,
                 "prompt": prompt,
                 "stream": False,
                 "format": output_format,
@@ -1540,6 +1603,25 @@ class AIDirector:
             f"（最后错误：{last_issue}）。请减少候选数量或重试。 / "
             "Ollama failed to return parseable structured JSON after three attempts "
             f"(last issue: {last_issue}). Reduce candidates or retry."
+        )
+
+    @staticmethod
+    def _estimate_prompt_tokens(value: str) -> int:
+        """
+        Conservatively estimate mixed Chinese/English JSON prompt tokens.
+        保守估算中英混合 JSON Prompt 的 token 数。
+
+        This is a dependency-free guard, not a tokenizer replacement. ASCII
+        JSON is budgeted at roughly 2.5 characters/token while UTF-8 byte size
+        protects CJK text, where one visible character is often one token.
+        该方法是零依赖预算守门而非 tokenizer；ASCII JSON 按约 2.5 字符/token，
+        同时用 UTF-8 字节数保护通常接近一字一 token 的中日韩文本。
+        """
+        text = str(value or "")
+        return max(
+            1,
+            int(math.ceil(len(text) / 2.5)),
+            int(math.ceil(len(text.encode("utf-8")) / 3.0)),
         )
 
     def _effective_num_ctx(self, model: str) -> int:
@@ -2386,8 +2468,12 @@ class AIDirector:
                     "in": item["cut_in_sec"],
                     "out": item["cut_out_sec"],
                     "story_role": item.get("story_role", "context"),
-                    "visual_summary": item.get("visual_summary", ""),
-                    "reason": item.get("reason_for_cut", ""),
+                    "visual_summary": self._compact_prompt_text(
+                        item.get("visual_summary", ""), 220
+                    ),
+                    "reason": self._compact_prompt_text(
+                        item.get("reason_for_cut", ""), 180
+                    ),
                     "confidence": item.get("confidence", 0.5),
                     "quality_score": item.get("quality_score", 0.5),
                     "suggested_transition": item.get("transition_to_next", "cut"),
@@ -2411,29 +2497,33 @@ class AIDirector:
             for source_order, asset in enumerate(assets)
         ]
         treatment = treatment or self._active_treatment
+        compact_treatment = self._compact_treatment_for_prompt(treatment)
         music_choices = [
             {
                 "track_file": Path(str(item.get("file_name") or "")).name,
-                "title": item.get("title", ""),
-                "mood": item.get("mood", ""),
-                "tags": item.get("tags", []),
+                "title": self._compact_prompt_text(item.get("title", ""), 120),
+                "mood": self._compact_prompt_text(item.get("mood", ""), 120),
+                "tags": list(item.get("tags") or [])[:8],
                 "tempo_bpm": item.get("tempo_bpm", 0),
                 "duration_sec": item.get("duration_sec", 0),
                 "key": item.get("key", ""),
                 "mode": item.get("mode", ""),
                 "integrated_lufs": item.get("integrated_lufs"),
                 "dynamic_range_db": item.get("dynamic_range_db"),
-                "strong_beats_sec": (item.get("strong_beats_sec") or [])[:80],
-                "downbeats_sec": (item.get("downbeats_sec") or [])[:60],
-                "sections": (item.get("sections") or [])[:12],
-                "license": item.get("license", ""),
-                "source_url": item.get("source_url", ""),
+                "strong_beats_sec": self._sample_numeric_landmarks(
+                    item.get("strong_beats_sec") or [], 48
+                ),
+                "downbeats_sec": self._sample_numeric_landmarks(
+                    item.get("downbeats_sec") or [], 32
+                ),
+                "sections": (item.get("sections") or [])[:10],
+                "director_match": item.get("director_match", {}),
             }
             for item in self._music_analysis.get("tracks", [])
             if isinstance(item, dict)
         ] or [{"track_file": path.name} for path in self._music_files]
-        prompt = (
-            "You have already inspected representative frames and transcripts "
+        sequence_prompt = (
+            "PICTURE ASSEMBLY STEP 1/2. You have already inspected representative frames and transcripts "
             "from every source video. Build one coherent documentary edit from "
             "the candidate list below. Select only useful candidate_id values, "
             "never invent or duplicate an id. Follow the treatment. Preserve the "
@@ -2447,28 +2537,165 @@ class AIDirector:
             "for major chapter endings. Keep the sum of selected clip durations "
             f"between {self._active_target_duration_sec * 0.85:.1f} and "
             f"{self._active_target_duration_sec * 1.10:.1f} seconds. Select only "
-            "the strongest minority of candidates; never include everything. Build "
-            "a deliberate music cue sheet with zero to three cues from AVAILABLE "
-            "MUSIC. Choose exact filenames only. A cue may begin inside a track at a "
-            "musically useful section and must fit both the track and final program. "
-            "Use sections/downbeats/strong beats for openings, changes, and climax "
-            "hits; do not cut every beat. Protect intelligible dialogue with 6-14 dB "
-            "ducking. Use silence_regions for emotional breathing room and meaningful "
-            "speech. Different tracks must serve distinct story beats, not add random "
-            "variety. The CPU conformer will render your exact cue sheet into one "
-            "music_bed.wav. Return JSON only.\n"
-            f"Required JSON schema: {json.dumps(SEQUENCE_SCHEMA, ensure_ascii=False)}\n"
-            f"DIRECTOR TREATMENT:\n{json.dumps(treatment, ensure_ascii=False)}\n"
-            f"AVAILABLE MUSIC:\n{json.dumps(music_choices, ensure_ascii=False)}\n"
-            f"ASSETS:\n{json.dumps(asset_names, ensure_ascii=False)}\n"
-            f"CANDIDATES:\n{json.dumps(compact_candidates, ensure_ascii=False)}"
+            "the strongest minority of candidates; never include everything. "
+            "Return project_summary and sequence only; the next constrained call "
+            "will score music against this exact edit. Return JSON only.\n"
+            f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"ASSETS:\n{json.dumps(asset_names, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"CANDIDATES:\n{json.dumps(compact_candidates, ensure_ascii=False, separators=(',', ':'))}"
         )
         self.logger.info(
-            "正在进行跨素材全局编排（%d 个候选）/ Global story assembly (%d candidates)",
+            "正在进行跨素材全局编排（%d 个候选，第 1/2 步：镜头）/ "
+            "Global story assembly (%d candidates, step 1/2: picture)",
             len(candidates),
             len(candidates),
         )
-        return self._request_json(prompt, SEQUENCE_SCHEMA, model=self.text_model)
+        sequence_payload = self._request_json(
+            sequence_prompt,
+            SEQUENCE_SELECTION_SCHEMA,
+            model=self.text_model,
+        )
+
+        selected_storyboard = self._build_music_storyboard(
+            sequence_payload.get("sequence"), candidates
+        )
+        if music_choices:
+            music_prompt = (
+                "Design the final documentary music cue sheet for the already selected "
+                "picture edit below. Use zero to three cues from AVAILABLE MUSIC and "
+                "choose exact track_file values only. A cue may begin inside a track at "
+                "a musically useful section and must fit both the track and program. "
+                "Use sections, downbeats, and strong beats for openings, transitions, "
+                "and a few meaningful climax hits; do not cut every beat. Protect "
+                "intelligible dialogue with 6-14 dB ducking. Use silence_regions for "
+                "emotional breathing room and important speech. Different tracks must "
+                "serve distinct story beats, not add random variety. The CPU conformer "
+                "will render this cue sheet into one music_bed.wav. Return music_plan "
+                "JSON only.\n"
+                f"TARGET PROGRAM: {self._active_target_duration_sec:.1f}s\n"
+                f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"SELECTED PICTURE STORYBOARD:\n{json.dumps(selected_storyboard, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"AVAILABLE MUSIC:\n{json.dumps(music_choices, ensure_ascii=False, separators=(',', ':'))}"
+            )
+            self.logger.info(
+                "正在设计最终配乐（第 2/2 步：音乐）/ "
+                "Designing final music (step 2/2: cue sheet)"
+            )
+            music_payload = self._request_json(
+                music_prompt,
+                MUSIC_PLAN_SCHEMA,
+                model=self.text_model,
+            )
+            music_plan = music_payload.get("music_plan")
+        else:
+            music_plan = {
+                "strategy": "No analyzed music candidates were supplied.",
+                "silence_regions": [],
+                "cues": [],
+            }
+        return {
+            "project_summary": sequence_payload.get("project_summary", ""),
+            "sequence": sequence_payload.get("sequence", []),
+            "music_plan": music_plan,
+        }
+
+    @staticmethod
+    def _compact_prompt_text(value: object, limit: int) -> str:
+        """Normalize and bound one model-facing string. / 规范并限制模型输入字符串。"""
+        text = " ".join(str(value or "").split())
+        return text if len(text) <= limit else text[: max(1, limit - 1)].rstrip() + "…"
+
+    @classmethod
+    def _compact_treatment_for_prompt(cls, treatment: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep treatment semantics while removing prompt-only verbosity. / 保留导演意图并压缩提示。"""
+        compact: Dict[str, Any] = {}
+        for key, value in treatment.items():
+            if key in {"generated_at_utc", "director_model", "story_anchors"}:
+                continue
+            if isinstance(value, str):
+                compact[key] = cls._compact_prompt_text(value, 320)
+            elif isinstance(value, list):
+                compact[key] = [
+                    cls._compact_prompt_text(item, 180) if isinstance(item, str) else item
+                    for item in value[:12]
+                ]
+            else:
+                compact[key] = value
+        anchors = treatment.get("story_anchors") or []
+        compact["story_anchors"] = [
+            {
+                "asset_id": item.get("asset_id", ""),
+                "in": item.get("cut_in_sec", 0),
+                "out": item.get("cut_out_sec", 0),
+                "beat": item.get("beat", ""),
+                "reason": cls._compact_prompt_text(item.get("reason", ""), 160),
+            }
+            for item in anchors[:16]
+            if isinstance(item, dict)
+        ]
+        return compact
+
+    @staticmethod
+    def _sample_numeric_landmarks(values: Sequence[Any], limit: int) -> List[float]:
+        """Evenly sample time landmarks across the full track. / 在整首音乐中均匀采样时间标记。"""
+        numeric: List[float] = []
+        for value in values:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number) and number >= 0:
+                numeric.append(round(number, 3))
+        if len(numeric) <= limit:
+            return numeric
+        if limit <= 1:
+            return numeric[:1]
+        indexes = {
+            int(round(index * (len(numeric) - 1) / (limit - 1)))
+            for index in range(limit)
+        }
+        return [numeric[index] for index in sorted(indexes)]
+
+    @classmethod
+    def _build_music_storyboard(
+        cls,
+        sequence: object,
+        candidates: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert the selected source ranges into a compact timeline storyboard.
+        将选中的源片段转换成紧凑的时间线故事板。
+        """
+        by_id = {str(item.get("candidate_id") or ""): item for item in candidates}
+        result: List[Dict[str, Any]] = []
+        seen = set()
+        cursor = 0.0
+        for selected in sequence if isinstance(sequence, list) else []:
+            if not isinstance(selected, dict):
+                continue
+            candidate_id = str(selected.get("candidate_id") or "")
+            item = by_id.get(candidate_id)
+            if item is None or candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            duration = max(
+                0.0,
+                float(item.get("cut_out_sec", 0)) - float(item.get("cut_in_sec", 0)),
+            )
+            result.append(
+                {
+                    "candidate_id": candidate_id,
+                    "timeline_in": round(cursor, 3),
+                    "timeline_out": round(cursor + duration, 3),
+                    "story_role": item.get("story_role", "context"),
+                    "visual": cls._compact_prompt_text(item.get("visual_summary", ""), 180),
+                    "position_reason": cls._compact_prompt_text(
+                        selected.get("reason_for_position", ""), 140
+                    ),
+                }
+            )
+            cursor += duration
+        return result
 
     def validate_sequence(
         self,

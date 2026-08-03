@@ -28,9 +28,9 @@ import time
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 try:
-    from .runtime_services import find_resolve_executable
+    from .runtime_services import detect_resolve_edition, find_resolve_executable
 except ImportError:  # pragma: no cover - direct ``python src/...`` fallback.
-    from runtime_services import find_resolve_executable
+    from runtime_services import detect_resolve_edition, find_resolve_executable
 
 
 LOGGER_NAME = "cybereditor.resolve"
@@ -375,6 +375,14 @@ class DaVinciExecutor:
                 "DaVinci Resolve 需要 64 位 Python / Resolve requires 64-bit Python."
             )
         executable = find_resolve_executable()
+        if detect_resolve_edition(executable) == "free":
+            raise ResolveExecutorError(
+                "检测到 DaVinci Resolve 免费版。Blackmagic 将外部脚本连接限制为 "
+                "Resolve Studio 功能；AI 时间线与音乐床已保留，请安装 Studio 后从“仅执行 "
+                "Resolve”继续，无需重新运行模型。 / Detected DaVinci Resolve Free. "
+                "External scripting is a Resolve Studio feature. The AI timeline and "
+                "music bed are preserved; install Studio and resume with Resolve-only."
+            )
         self._configure_resolve_library(executable)
         module, checked, errors = self._load_resolve_module()
         if module is None:

@@ -36,6 +36,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from .runtime_services import (
     RuntimeServiceError,
+    detect_resolve_edition,
     ensure_ollama_service,
     find_ollama_executables,
     find_resolve_executable,
@@ -2180,10 +2181,20 @@ class CyberEditorApp:
         ):
             results["Ollama"] = (False, "未连接")
 
-        resolve_ready = find_resolve_executable() is not None
+        resolve_path = find_resolve_executable()
+        resolve_edition = detect_resolve_edition(resolve_path)
+        resolve_ready = resolve_path is not None and resolve_edition != "free"
         results["Resolve"] = (
             resolve_ready,
-            "已安装 · 执行时自动启动" if resolve_ready else "未安装",
+            (
+                "Studio 已安装 · 执行时自动启动"
+                if resolve_edition == "studio"
+                else "免费版 · 外部自动化需要 Studio"
+                if resolve_edition == "free"
+                else "已安装 · 版本待连接确认"
+                if resolve_path is not None
+                else "未安装"
+            ),
         )
         hardware = detect_hardware()
         hardware.update(detect_torch_runtime())

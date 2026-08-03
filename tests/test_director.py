@@ -119,14 +119,6 @@ class VisionSession(FakeSession):
         elif "Build one coherent documentary edit" in prompt:
             generated = {
                 "project_summary": "A coherent multi-camera story",
-                "music_plan": {
-                    "track_file": "",
-                    "reason": "No library supplied",
-                    "target_level_db": -20,
-                    "fade_in_sec": 2,
-                    "fade_out_sec": 3,
-                    "duck_dialogue": True,
-                },
                 "sequence": [
                     {
                         "candidate_id": "C0001",
@@ -138,6 +130,14 @@ class VisionSession(FakeSession):
                         "motion": "gentle_push_in",
                     }
                 ],
+            }
+        elif "Design the final documentary music cue sheet" in prompt:
+            generated = {
+                "music_plan": {
+                    "strategy": "One restrained cue under the payoff",
+                    "silence_regions": [],
+                    "cues": [],
+                }
             }
         else:
             generated = {
@@ -406,6 +406,70 @@ class AIDirectorTests(unittest.TestCase):
         ]
         self.assertEqual(len(generation_posts), 1)
         self.assertIs(generation_posts[0]["think"], False)
+
+    def test_final_director_splits_picture_and_music_contexts(self):
+        session = VisionSession()
+        director = self.make_director(session=session)
+        director._active_target_duration_sec = 12.0
+        director._active_treatment = {
+            "title": "A short ride",
+            "central_theme": "preparation and release",
+            "target_duration_sec": 12.0,
+            "story_anchors": [],
+        }
+        director._music_analysis = {
+            "tracks": [
+                {
+                    "file_name": "authorized.wav",
+                    "title": "Quiet Motion",
+                    "duration_sec": 60.0,
+                    "tempo_bpm": 90.0,
+                    "strong_beats_sec": [float(index) for index in range(100)],
+                    "downbeats_sec": [float(index * 2) for index in range(50)],
+                    "sections": [
+                        {"start_sec": 0.0, "end_sec": 30.0, "energy": "low"},
+                        {"start_sec": 30.0, "end_sec": 60.0, "energy": "high"},
+                    ],
+                }
+            ]
+        }
+        candidates = [
+            {
+                "candidate_id": "C0001",
+                "asset_id": "asset-1",
+                "source_order": 0,
+                "file_name": "source.mp4",
+                "cut_in_sec": 1.0,
+                "cut_out_sec": 4.0,
+                "story_role": "opening",
+                "visual_summary": "A rider prepares the motorcycle.",
+                "reason_for_cut": "Clear visual opening.",
+            }
+        ]
+        assets = [
+            {"asset_id": "asset-1", "source_video": "source.mp4", "duration_sec": 8.0}
+        ]
+
+        result = director.request_sequence(
+            candidates, assets, director._active_treatment
+        )
+
+        generation_posts = [
+            item for item in session.posts if item.get("keep_alive") != 0
+        ]
+        self.assertEqual(len(generation_posts), 2)
+        self.assertIn("step 1", generation_posts[0]["prompt"].casefold())
+        self.assertIn(
+            "Design the final documentary music cue sheet",
+            generation_posts[1]["prompt"],
+        )
+        self.assertNotIn("AVAILABLE MUSIC", generation_posts[0]["prompt"])
+        self.assertEqual(result["sequence"][0]["candidate_id"], "C0001")
+        self.assertIn("music_plan", result)
+
+    def test_prompt_token_estimator_protects_chinese_and_ascii(self):
+        self.assertGreaterEqual(AIDirector._estimate_prompt_tokens("剪辑" * 100), 200)
+        self.assertGreaterEqual(AIDirector._estimate_prompt_tokens("x" * 1000), 400)
 
     def test_director_checkpoint_round_trip_and_fingerprint_guard(self):
         director = self.make_director()

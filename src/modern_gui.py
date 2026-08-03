@@ -38,6 +38,7 @@ from .gui import (
     build_runtime_environment,
     detect_hardware,
     detect_media_fps,
+    detect_resolve_edition,
     detect_system_theme,
     detect_torch_runtime,
     enable_windows_high_dpi,
@@ -1690,12 +1691,17 @@ class ModernCyberEditorApp:
             results["Ollama"] = (False, self.t("not_connected"))
 
         resolve_path = find_resolve_executable()
-        resolve_ready = resolve_path is not None
+        resolve_edition = detect_resolve_edition(resolve_path)
+        resolve_ready = resolve_path is not None and resolve_edition != "free"
         results["Resolve"] = (
             resolve_ready,
             (
-                self.t("installed_auto_start")
-                if resolve_ready
+                self.t("resolve_studio_auto_start")
+                if resolve_edition == "studio"
+                else self.t("resolve_free_studio_required")
+                if resolve_edition == "free"
+                else self.t("resolve_edition_unknown")
+                if resolve_path is not None
                 else self.t("not_found")
             ),
         )
