@@ -22,6 +22,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -153,12 +154,19 @@ class MediaExtractor:
         srt_destination.parent.mkdir(parents=True, exist_ok=True)
         frames_destination.mkdir(parents=True, exist_ok=True)
 
-        self.logger.info(
-            "阶段 1/2：Whisper 转写开始，模型=%s / Stage 1/2: Whisper transcription started, model=%s",
-            self.whisper_model,
-            self.whisper_model,
-        )
-        transcription = self.transcribe(source)
+        if self.has_audio_stream(source):
+            self.logger.info(
+                "阶段 1/2：Whisper 转写开始，模型=%s / Stage 1/2: Whisper transcription started, model=%s",
+                self.whisper_model,
+                self.whisper_model,
+            )
+            transcription = self.transcribe(source)
+        else:
+            self.logger.info(
+                "素材没有音轨，跳过 Whisper；将作为纯画面素材分析"
+                " / No audio stream; skipping Whisper and analyzing visuals only"
+            )
+            transcription = {"language": None, "segments": []}
         segments = transcription["segments"]
         self.write_srt(segments, srt_destination)
         self.logger.info(
@@ -305,6 +313,10 @@ class MediaExtractor:
             previous_gray = None
             last_saved_at = -self.min_keyframe_gap_sec
             timestamp = 0.0
+            coverage_gap = duration / max(1, self.max_keyframes - 1)
+            effective_min_gap = max(
+                self.min_keyframe_gap_sec, coverage_gap
+            )
 
             while timestamp <= duration and len(keyframes) < self.max_keyframes:
                 capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
@@ -322,16 +334,37 @@ class MediaExtractor:
                     else float(cv2.mean(cv2.absdiff(gray, previous_gray))[0])
                     / 255.0
                 )
-                should_save = previous_gray is None or (
-                    difference >= self.scene_threshold
-                    and timestamp - last_saved_at >= self.min_keyframe_gap_sec
+                # Scene changes capture visual events; a periodic 30-second
+                # floor also guarantees coverage of static interviews and
+                # long takes whose pixels do not change enough to cross the
+                # threshold. The director later selects a bounded, evenly
+                # distributed subset for each 10–15 minute request.
+                since_last = timestamp - last_saved_at
+                periodic_due = since_last >= max(
+                    30.0, effective_min_gap
+                )
+                should_save = (
+                    previous_gray is None
+                    or periodic_due
+                    or (
+                        difference >= self.scene_threshold
+                        and since_last >= effective_min_gap
+                    )
                 )
                 if should_save:
                     file_name = "keyframe_{:04d}_{:010.3f}.jpg".format(
                         len(keyframes) + 1, timestamp
                     )
                     destination = output_dir / file_name
-                    self._write_jpeg_unicode_safe(cv2, frame, destination)
+                    preview = frame
+                    if frame.shape[1] > 1280:
+                        scale = 1280.0 / float(frame.shape[1])
+                        preview = cv2.resize(
+                            frame,
+                            (1280, max(1, int(frame.shape[0] * scale))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    self._write_jpeg_unicode_safe(cv2, preview, destination)
                     keyframes.append(
                         {
                             "timestamp_sec": round(timestamp, 3),
@@ -379,6 +412,46 @@ class MediaExtractor:
             )
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text("\n".join(lines), encoding="utf-8")
+
+    @staticmethod
+    def has_audio_stream(media_path: Path) -> bool:
+        """
+        Detect an audio stream with ffprobe before loading Whisper.
+        在加载 Whisper 前使用 ffprobe 检测音轨。
+
+        Silent B-roll is valid project media and must not fail the complete
+        batch merely because Whisper has nothing to decode.
+        无声 B-roll 是合法素材，不能因为 Whisper 无音频可解码而导致整批失败。
+        """
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            # FFmpeg distributions normally ship both tools. If only ffmpeg is
+            # present, preserve the historical behavior and let Whisper report
+            # a detailed decode error.
+            return True
+        try:
+            completed = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=index",
+                    "-of",
+                    "csv=p=0",
+                    str(media_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True
+        return completed.returncode == 0 and bool(completed.stdout.strip())
 
     @staticmethod
     def format_srt_timestamp(seconds: float) -> str:

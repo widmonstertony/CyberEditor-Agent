@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from src.extractor import ExtractionError, MediaExtractor
 
@@ -64,6 +65,17 @@ class MediaExtractorTests(unittest.TestCase):
             value = destination.read_text(encoding="utf-8")
             self.assertIn("00:00:01,000 --> 00:00:02,250", value)
             self.assertIn("中文台词", value)
+
+
+    def test_silent_broll_is_detected_without_loading_whisper(self):
+        completed = mock.Mock(returncode=0, stdout="")
+        with (
+            mock.patch("src.extractor.shutil.which", return_value="ffprobe"),
+            mock.patch("src.extractor.subprocess.run", return_value=completed),
+        ):
+            self.assertFalse(
+                MediaExtractor.has_audio_stream(Path("silent-broll.mp4"))
+            )
 
 
 if __name__ == "__main__":

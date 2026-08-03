@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from main import WorkflowError, WorkflowLock, WorkflowOrchestrator
 
@@ -50,6 +51,22 @@ class OrchestratorTests(unittest.TestCase):
                     with WorkflowLock(lock_path):
                         pass
             self.assertFalse(lock_path.exists())
+
+    def test_text_only_model_is_rejected_before_extraction(self):
+        response = mock.MagicMock()
+        response.read.return_value = b'{"capabilities":["completion"]}'
+        response.__enter__.return_value = response
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            orchestrator = WorkflowOrchestrator(root, root / "data")
+            with (
+                mock.patch("main.ensure_ollama_service", return_value=([], False)),
+                mock.patch("main.urllib_request.urlopen", return_value=response),
+            ):
+                with self.assertRaisesRegex(WorkflowError, "vision model"):
+                    orchestrator._require_vision_model(
+                        "qwen2.5:3b", "http://localhost:11434"
+                    )
 
     def test_all_skipped_uses_existing_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:

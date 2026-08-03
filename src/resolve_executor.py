@@ -46,6 +46,16 @@ class ClipDecision(NamedTuple):
     cut_in_sec: Decimal
     cut_out_sec: Decimal
     reason_for_cut: str
+    transition_to_next: str = "cut"
+    transition_duration_sec: Decimal = Decimal("0")
+    audio_cleanup: str = "light"
+    color_look: str = "neutral"
+    motion: str = "static"
+    volume_db: Decimal = Decimal("0")
+    drx_preset: str = "none"
+    stabilization: str = "none"
+    tracking: str = "none"
+    smart_reframe: bool = False
 
 
 class MediaRecord(NamedTuple):
@@ -94,6 +104,15 @@ class DaVinciExecutor:
         strict_fps: bool = False,
         auto_start_resolve: bool = True,
         startup_timeout: float = 120.0,
+        drx_root: Optional[os.PathLike] = None,
+        fairlight_preset: str = "",
+        render_enabled: bool = False,
+        render_dir: Optional[os.PathLike] = None,
+        render_name: str = "CyberEditor_final",
+        render_preset: str = "",
+        render_timeout: float = 86400.0,
+        macro_profile: Optional[os.PathLike] = None,
+        macro_action: str = "post_assembly",
         logger: Optional[logging.Logger] = None,
     ) -> None:
         """Initialize paths and policy without connecting to Resolve. / 初始化路径和策略，但不连接 Resolve。"""
@@ -108,6 +127,25 @@ class DaVinciExecutor:
         self.strict_fps = strict_fps
         self.auto_start_resolve = bool(auto_start_resolve)
         self.startup_timeout = float(startup_timeout)
+        self.drx_root = (
+            Path(drx_root).expanduser().resolve()
+            if drx_root
+            else Path(__file__).resolve().parents[1] / "config" / "drx"
+        )
+        self.fairlight_preset = fairlight_preset.strip()
+        self.render_enabled = bool(render_enabled)
+        self.render_dir = (
+            Path(render_dir).expanduser().resolve()
+            if render_dir
+            else self.json_path.parent / "final"
+        )
+        self.render_name = render_name.strip()
+        self.render_preset = render_preset.strip()
+        self.render_timeout = float(render_timeout)
+        self.macro_profile = (
+            Path(macro_profile).expanduser().resolve() if macro_profile else None
+        )
+        self.macro_action = macro_action.strip()
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         if not self.timeline_name or not self.project_name:
             raise ResolveExecutorError(
@@ -117,6 +155,11 @@ class DaVinciExecutor:
             raise ResolveExecutorError(
                 "Resolve 启动超时必须大于 0 秒"
                 " / Resolve startup timeout must be greater than zero."
+            )
+        if not self.render_name or self.render_timeout <= 0:
+            raise ResolveExecutorError(
+                "导出文件名不能为空，渲染超时必须大于 0 / "
+                "Render name cannot be empty and render timeout must be positive."
             )
 
         self.resolve: Any = None
@@ -150,7 +193,11 @@ class DaVinciExecutor:
         self.compare_fps(json_fps, active_fps)
         prepared = self.prepare_clips(clips, active_fps)
         appended = self.append_clips(prepared)
+        self.apply_timeline_audio_preset()
+        self.run_macro_fallback()
         self.save_project()
+        if self.render_enabled:
+            self.render_final()
         self.logger.info(
             "执行完成：时间线“%s”已追加 %d 个片段 / Complete: appended %d clips to '%s'",
             self._safe_name(self.timeline, self.timeline_name),
@@ -219,6 +266,16 @@ class DaVinciExecutor:
                 raise ResolveExecutorError(
                     f"{prefix}.reason_for_cut 必须是字符串 / must be a string."
                 )
+            transition = self._enum_text(
+                item.get("transition_to_next"),
+                {"cut", "cross_dissolve", "fade_black"},
+                "cut",
+            )
+            transition_duration = self._non_negative_decimal(
+                item.get("transition_duration_sec", 0),
+                f"{prefix}.transition_duration_sec",
+            )
+            transition_duration = min(transition_duration, Decimal("2"))
             decisions.append(
                 ClipDecision(
                     clip_id=clip_id,
@@ -226,6 +283,53 @@ class DaVinciExecutor:
                     cut_in_sec=cut_in,
                     cut_out_sec=cut_out,
                     reason_for_cut=reason.strip(),
+                    transition_to_next=transition,
+                    transition_duration_sec=transition_duration,
+                    audio_cleanup=self._enum_text(
+                        item.get("audio_cleanup"),
+                        {"none", "light", "strong"},
+                        "light",
+                    ),
+                    color_look=self._enum_text(
+                        item.get("color_look"),
+                        {"source", "neutral", "warm", "cool", "contrast"},
+                        "neutral",
+                    ),
+                    motion=self._enum_text(
+                        item.get("motion"),
+                        {"static", "gentle_push_in"},
+                        "static",
+                    ),
+                    volume_db=max(
+                        Decimal("-24"),
+                        min(
+                            Decimal("12"),
+                            self._decimal(item.get("volume_db", 0), f"{prefix}.volume_db"),
+                        ),
+                    ),
+                    drx_preset=self._enum_text(
+                        item.get("drx_preset"),
+                        {"none", "interview_clean", "cinematic", "low_light_cleanup"},
+                        "none",
+                    ),
+                    stabilization=self._enum_text(
+                        item.get("stabilization"), {"none", "auto"}, "none"
+                    ),
+                    tracking=self._enum_text(
+                        item.get("tracking"),
+                        {
+                            "none",
+                            "magic_mask_forward",
+                            "magic_mask_backward",
+                            "magic_mask_bidirectional",
+                        },
+                        "none",
+                    ),
+                    smart_reframe=(
+                        item.get("smart_reframe", False)
+                        if isinstance(item.get("smart_reframe", False), bool)
+                        else False
+                    ),
                 )
             )
         self.logger.info(
@@ -498,8 +602,9 @@ class DaVinciExecutor:
         prepared: List[Tuple[ClipDecision, Dict[str, Any]]] = []
         for decision in clips:
             item, index = self._resolve_media(decision, index)
+            source_fps = self._media_fps(item) or fps
             start_frame, end_frame = self.seconds_to_frames(
-                decision.cut_in_sec, decision.cut_out_sec, fps
+                decision.cut_in_sec, decision.cut_out_sec, source_fps
             )
             prepared.append(
                 (
@@ -523,6 +628,39 @@ class DaVinciExecutor:
                 end_frame,
             )
         return prepared
+
+    def _media_fps(self, media_item: Any) -> Optional[Decimal]:
+        """
+        Read a source clip's native FPS, falling back to project FPS if absent.
+        读取源片段原生 FPS；API 未提供时由调用方回退到工程 FPS。
+
+        Parameters / 参数:
+            media_item:
+                Resolve MediaPoolItem selected for the decision.
+                剪辑决策对应的 Resolve MediaPoolItem。
+        """
+        getter = getattr(media_item, "GetClipProperty", None)
+        if not callable(getter):
+            return None
+        candidates: List[Any] = []
+        for key in ("FPS", "Frame Rate"):
+            try:
+                candidates.append(getter(key))
+            except Exception:
+                pass
+        try:
+            properties = getter()
+        except Exception:
+            properties = None
+        if isinstance(properties, dict):
+            candidates.extend(
+                properties.get(key) for key in ("FPS", "Frame Rate")
+            )
+        for value in candidates:
+            parsed = self._parse_fps(value)
+            if parsed is not None:
+                return parsed
+        return None
 
     @staticmethod
     def seconds_to_frames(
@@ -570,6 +708,8 @@ class DaVinciExecutor:
                     )
                 )
             result_items.extend(items)
+            for timeline_item in items:
+                self.apply_clip_effects(timeline_item, decision)
             completed += 1
             self.logger.info(
                 "已追加 %d/%d：clip_id=%r / Appended %d/%d: clip_id=%r",
@@ -581,6 +721,462 @@ class DaVinciExecutor:
                 decision.clip_id,
             )
         return result_items
+
+    def apply_clip_effects(self, timeline_item: Any, decision: ClipDecision) -> None:
+        """
+        Apply Resolve-supported parts of the AI effect plan without breaking assembly.
+        应用 Resolve 公共 API 支持的 AI 效果；单个效果失败时仍保留已组装时间线。
+
+        Parameters / 参数:
+            timeline_item:
+                Timeline item returned by ``AppendToTimeline``.
+                ``AppendToTimeline`` 返回的时间线片段。
+            decision:
+                Validated editorial and effect decision for this clip.
+                已校验的片段剪辑与效果决策。
+
+        Resolve's public scripting API does not expose a stable generic
+        transition-insertion method. Transition intent is stored in a marker
+        and rendered exactly by ``review_renderer``.
+        Resolve 公共脚本 API 没有稳定的通用转场插入方法；转场意图会写入标记，
+        并由 ``review_renderer`` 精确生成到可观看预览中。
+        """
+        voice_isolation = getattr(timeline_item, "SetVoiceIsolationState", None)
+        if decision.audio_cleanup != "none" and callable(voice_isolation):
+            amount = 75.0 if decision.audio_cleanup == "strong" else 45.0
+            try:
+                applied = voice_isolation({"isEnabled": True, "amount": amount})
+                if applied is False:
+                    self.logger.warning(
+                        "Voice Isolation unavailable for clip_id=%r; "
+                        "the FFmpeg preview still applies denoise.",
+                        decision.clip_id,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Voice Isolation failed for clip_id=%r: %s",
+                    decision.clip_id,
+                    exc,
+                )
+
+        set_property = getattr(timeline_item, "SetProperty", None)
+        if decision.motion == "gentle_push_in" and callable(set_property):
+            try:
+                applied = set_property(
+                    {"ZoomX": 1.04, "ZoomY": 1.04, "ZoomGang": True}
+                )
+                if applied is False:
+                    self.logger.warning(
+                        "Resolve could not apply push-in to clip_id=%r",
+                        decision.clip_id,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Resolve motion effect failed for clip_id=%r: %s",
+                    decision.clip_id,
+                    exc,
+                )
+
+        if decision.volume_db != 0:
+            self._apply_native_clip_volume(timeline_item, decision)
+
+        color_values = {
+            "neutral": {
+                "Slope": "1.02 1.02 1.02", "Offset": "0 0 0",
+                "Power": "1 1 1", "Saturation": "1.02",
+            },
+            "warm": {
+                "Slope": "1.05 1.02 0.98", "Offset": "0 0 0",
+                "Power": "1 1 1.01", "Saturation": "1.04",
+            },
+            "cool": {
+                "Slope": "0.98 1.01 1.05", "Offset": "0 0 0",
+                "Power": "1.01 1 1", "Saturation": "1.02",
+            },
+            "contrast": {
+                "Slope": "1.06 1.06 1.06", "Offset": "-0.01 -0.01 -0.01",
+                "Power": "0.98 0.98 0.98", "Saturation": "1.05",
+            },
+        }
+        set_cdl = getattr(timeline_item, "SetCDL", None)
+        if decision.color_look in color_values and callable(set_cdl):
+            cdl = {"NodeIndex": "1", **color_values[decision.color_look]}
+            try:
+                if set_cdl(cdl) is False:
+                    self.logger.warning(
+                        "Resolve could not apply CDL look to clip_id=%r",
+                        decision.clip_id,
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    "Resolve color look failed for clip_id=%r: %s",
+                    decision.clip_id,
+                    exc,
+                )
+
+        if decision.drx_preset != "none":
+            self._apply_drx_preset(timeline_item, decision)
+
+        if decision.stabilization == "auto":
+            self._call_ai_clip_method(
+                timeline_item,
+                "Stabilize",
+                decision,
+                "stabilization / 防抖",
+            )
+
+        magic_mask_modes = {
+            "magic_mask_forward": "F",
+            "magic_mask_backward": "B",
+            "magic_mask_bidirectional": "BI",
+        }
+        if decision.tracking in magic_mask_modes:
+            self._call_ai_clip_method(
+                timeline_item,
+                "CreateMagicMask",
+                decision,
+                "Magic Mask tracking / 魔法遮罩跟踪",
+                magic_mask_modes[decision.tracking],
+            )
+
+        if decision.smart_reframe:
+            self._call_ai_clip_method(
+                timeline_item,
+                "SmartReframe",
+                decision,
+                "Smart Reframe / 智能重构图",
+            )
+
+        add_marker = getattr(timeline_item, "AddMarker", None)
+        if callable(add_marker):
+            effect_plan = {
+                "transition_to_next": decision.transition_to_next,
+                "transition_duration_sec": self._decimal_text(
+                    decision.transition_duration_sec
+                ),
+                "audio_cleanup": decision.audio_cleanup,
+                "color_look": decision.color_look,
+                "motion": decision.motion,
+                "volume_db": self._decimal_text(decision.volume_db),
+                "drx_preset": decision.drx_preset,
+                "stabilization": decision.stabilization,
+                "tracking": decision.tracking,
+                "smart_reframe": decision.smart_reframe,
+            }
+            try:
+                add_marker(
+                    0,
+                    "Cyan",
+                    "CyberEditor AI",
+                    decision.reason_for_cut or "AI-selected clip",
+                    1,
+                    json.dumps(effect_plan, ensure_ascii=False),
+                )
+            except Exception as exc:
+                self.logger.debug(
+                    "Could not add AI marker for clip_id=%r: %s",
+                    decision.clip_id,
+                    exc,
+                )
+
+    def _apply_native_clip_volume(
+        self, timeline_item: Any, decision: ClipDecision
+    ) -> None:
+        """
+        Apply clip gain only when this Resolve build exposes an audio property.
+        仅当当前 Resolve 版本公开音频属性时应用片段增益。
+
+        Resolve 21 documents video transform keys but not a stable audio-level
+        key. Some builds/plugins expose one dynamically through ``GetProperty``;
+        probing the returned dictionary avoids writing an unsupported key.
+
+        Resolve 21 文档只保证视频变换键，并未承诺稳定的音量键；部分版本或插件会
+        通过 ``GetProperty`` 动态公开该属性，因此先探测再写入，避免误调用。
+        """
+        getter = getattr(timeline_item, "GetProperty", None)
+        setter = getattr(timeline_item, "SetProperty", None)
+        if not callable(getter) or not callable(setter):
+            self.logger.warning(
+                "Resolve has no scriptable clip-volume property for clip_id=%r; "
+                "the requested %.2f dB remains recorded in the AI marker.",
+                decision.clip_id,
+                float(decision.volume_db),
+            )
+            return
+        try:
+            properties = getter()
+        except Exception as exc:
+            self.logger.warning(
+                "Could not inspect clip-volume properties for clip_id=%r: %s",
+                decision.clip_id,
+                exc,
+            )
+            return
+        if not isinstance(properties, dict):
+            properties = {}
+        by_normalized = {
+            re.sub(r"[^a-z]", "", str(key).casefold()): str(key)
+            for key in properties
+        }
+        property_key = next(
+            (
+                by_normalized[key]
+                for key in ("audiolevel", "clipvolume", "volume")
+                if key in by_normalized
+            ),
+            None,
+        )
+        if property_key is None:
+            self.logger.warning(
+                "Resolve %s does not expose per-clip volume through its public API; "
+                "clip_id=%r keeps %.2f dB as metadata for macro/manual fallback.",
+                self._resolve_version(),
+                decision.clip_id,
+                float(decision.volume_db),
+            )
+            return
+        try:
+            if setter(property_key, float(decision.volume_db)) is False:
+                raise RuntimeError("SetProperty returned False")
+        except Exception as exc:
+            self.logger.warning(
+                "Clip volume failed for clip_id=%r: %s", decision.clip_id, exc
+            )
+
+    def _apply_drx_preset(
+        self, timeline_item: Any, decision: ClipDecision
+    ) -> None:
+        """
+        Apply a user-exported DRX preset through the clip node graph.
+        通过片段节点图应用用户从 Resolve 导出的 DRX 预设。
+
+        The logical preset name is constrained by JSON validation and resolved
+        below ``drx_root``; arbitrary model-produced paths are never opened.
+        逻辑预设名已由 JSON 校验限制，只会在 ``drx_root`` 下解析，绝不打开模型
+        随意生成的路径。
+        """
+        preset = (self.drx_root / f"{decision.drx_preset}.drx").resolve()
+        try:
+            preset.relative_to(self.drx_root.resolve())
+        except ValueError:
+            self.logger.warning("Rejected unsafe DRX path: %s", preset)
+            return
+        if not preset.is_file():
+            self.logger.warning(
+                "DRX preset %r was requested for clip_id=%r but is not installed: %s",
+                decision.drx_preset,
+                decision.clip_id,
+                preset,
+            )
+            return
+        get_graph = getattr(timeline_item, "GetNodeGraph", None)
+        try:
+            graph = get_graph() if callable(get_graph) else None
+            apply_drx = getattr(graph, "ApplyGradeFromDRX", None)
+            if not callable(apply_drx):
+                raise RuntimeError("GetNodeGraph().ApplyGradeFromDRX is unavailable")
+            if apply_drx(str(preset), 0) is False:
+                raise RuntimeError("ApplyGradeFromDRX returned False")
+            self.logger.info(
+                "Applied DRX %s to clip_id=%r", decision.drx_preset, decision.clip_id
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "DRX apply failed for clip_id=%r: %s", decision.clip_id, exc
+            )
+
+    def _call_ai_clip_method(
+        self,
+        timeline_item: Any,
+        method_name: str,
+        decision: ClipDecision,
+        label: str,
+        *args: Any,
+    ) -> None:
+        """
+        Run one potentially long Resolve AI operation with explicit diagnostics.
+        运行一个可能耗时较长的 Resolve AI 操作，并给出明确诊断。
+
+        Parameters / 参数:
+            timeline_item: Target Resolve timeline item. / 目标时间线片段。
+            method_name: Public Resolve API method. / Resolve 公共 API 方法名。
+            decision: Validated clip decision. / 已校验的片段决策。
+            label: Bilingual log label. / 双语日志标签。
+            args: Positional method arguments. / 方法位置参数。
+        """
+        method = getattr(timeline_item, method_name, None)
+        if not callable(method):
+            self.logger.warning(
+                "%s API is unavailable for clip_id=%r", label, decision.clip_id
+            )
+            return
+        self.logger.info("Starting %s for clip_id=%r", label, decision.clip_id)
+        try:
+            result = method(*args)
+        except Exception as exc:
+            self.logger.warning(
+                "%s failed for clip_id=%r: %s", label, decision.clip_id, exc
+            )
+            return
+        if result is False:
+            self.logger.warning(
+                "%s returned False for clip_id=%r. The feature may require "
+                "Resolve Studio, supported hardware, or an installed AI Extra.",
+                label,
+                decision.clip_id,
+            )
+        else:
+            self.logger.info("Completed %s for clip_id=%r", label, decision.clip_id)
+
+    def apply_timeline_audio_preset(self) -> None:
+        """
+        Apply an optional user-created Fairlight preset to the current timeline.
+        将可选的用户自建 Fairlight 预设应用到当前时间线。
+        """
+        if not self.fairlight_preset:
+            return
+        method = getattr(self.project, "ApplyFairlightPresetToCurrentTimeline", None)
+        if not callable(method):
+            raise ResolveExecutorError(
+                "当前 Resolve 不支持 Fairlight 预设脚本接口 / "
+                "This Resolve build does not expose the Fairlight preset API."
+            )
+        try:
+            applied = method(self.fairlight_preset)
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"Fairlight 预设应用失败 / Fairlight preset failed: {exc}"
+            ) from exc
+        if applied is False:
+            raise ResolveExecutorError(
+                f"找不到或无法应用 Fairlight 预设 / Cannot apply Fairlight preset: "
+                f"{self.fairlight_preset!r}"
+            )
+        self.logger.info("Applied Fairlight preset: %s", self.fairlight_preset)
+
+    def render_final(self) -> Dict[str, Any]:
+        """
+        Queue, start, monitor, and validate one final Resolve render job.
+        创建、启动、监控并校验一个 Resolve 最终渲染任务。
+
+        Returns / 返回:
+            Final render-job status dictionary. / 最终渲染任务状态字典。
+        """
+        self.render_dir.mkdir(parents=True, exist_ok=True)
+        if self.render_preset:
+            try:
+                loaded = self.project.LoadRenderPreset(self.render_preset)
+            except Exception as exc:
+                raise ResolveExecutorError(
+                    f"无法加载渲染预设 / Cannot load render preset: {exc}"
+                ) from exc
+            if loaded is False:
+                available = self.project.GetRenderPresetList() or []
+                raise ResolveExecutorError(
+                    f"渲染预设不存在 / Render preset not found: {self.render_preset!r}. "
+                    f"Available: {available}"
+                )
+        settings = {
+            "SelectAllFrames": True,
+            "TargetDir": str(self.render_dir),
+            "CustomName": self.render_name,
+            "ExportVideo": True,
+            "ExportAudio": True,
+        }
+        try:
+            if self.project.SetRenderSettings(settings) is False:
+                raise RuntimeError("SetRenderSettings returned False")
+            job_id = self.project.AddRenderJob()
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"无法创建渲染任务 / Cannot create render job: {exc}"
+            ) from exc
+        if not job_id:
+            raise ResolveExecutorError(
+                "Resolve 未返回渲染任务 ID / Resolve returned no render job id."
+            )
+        try:
+            started = self.project.StartRendering([job_id], False)
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"无法启动最终渲染 / Cannot start final render: {exc}"
+            ) from exc
+        if started is False:
+            raise ResolveExecutorError(
+                "Resolve 拒绝启动最终渲染 / Resolve refused to start rendering."
+            )
+        deadline = time.monotonic() + self.render_timeout
+        last_percent = -1
+        while True:
+            try:
+                status = self.project.GetRenderJobStatus(job_id) or {}
+            except Exception as exc:
+                raise ResolveExecutorError(
+                    f"无法读取渲染状态 / Cannot read render status: {exc}"
+                ) from exc
+            percent = int(float(status.get("CompletionPercentage", 0) or 0))
+            if percent >= last_percent + 5 or percent == 100:
+                self.logger.info(
+                    "最终渲染 %d%% / Final render %d%%", percent, percent
+                )
+                last_percent = percent
+            state = str(status.get("JobStatus") or "").casefold()
+            if state in {"complete", "completed"}:
+                self.logger.info("Final render complete: %s", self.render_dir)
+                return dict(status)
+            if state in {"failed", "cancelled", "canceled"}:
+                raise ResolveExecutorError(
+                    f"最终渲染失败 / Final render failed: {status}"
+                )
+            if time.monotonic() >= deadline:
+                try:
+                    self.project.StopRendering()
+                finally:
+                    raise ResolveExecutorError(
+                        f"最终渲染超过 {self.render_timeout:.0f} 秒，已停止 / "
+                        "Final render timed out and was stopped."
+                    )
+            try:
+                in_progress = bool(self.project.IsRenderingInProgress())
+            except Exception:
+                in_progress = True
+            if not in_progress and state not in {"complete", "completed"}:
+                raise ResolveExecutorError(
+                    f"渲染提前停止 / Rendering stopped unexpectedly: {status}"
+                )
+            time.sleep(1.0)
+
+    def run_macro_fallback(self) -> None:
+        """
+        Run an explicit guarded UI action only when a profile was supplied.
+        仅当用户提供配置时运行显式指定的受保护 UI 动作。
+        """
+        if self.macro_profile is None:
+            return
+        if not self.macro_action:
+            raise ResolveExecutorError(
+                "宏动作名不能为空 / Macro action name cannot be empty."
+            )
+        try:
+            from .resolve_macro import ResolveMacroError, SafeResolveMacroRunner
+        except ImportError:  # pragma: no cover - direct script fallback.
+            from resolve_macro import ResolveMacroError, SafeResolveMacroRunner
+        try:
+            SafeResolveMacroRunner(self.macro_profile, self.logger).run(
+                self.macro_action
+            )
+        except ResolveMacroError as exc:
+            raise ResolveExecutorError(
+                f"Resolve UI 后备宏失败 / Resolve UI fallback failed: {exc}"
+            ) from exc
+
+    def _resolve_version(self) -> str:
+        """Return a safe Resolve version string. / 安全返回 Resolve 版本字符串。"""
+        method = getattr(self.resolve, "GetVersionString", None)
+        try:
+            return str(method()) if callable(method) else "unknown"
+        except Exception:
+            return "unknown"
 
     def save_project(self) -> None:
         """Persist the completed Resolve project if possible. / 尽可能保存已完成的 Resolve 工程。"""
@@ -1031,6 +1627,12 @@ class DaVinciExecutor:
         return converted
 
     @staticmethod
+    def _enum_text(value: Any, allowed: set, default: str) -> str:
+        """Normalize an optional JSON enum. / 规范化可选 JSON 枚举值。"""
+        normalized = str(value or default).strip().lower()
+        return normalized if normalized in allowed else default
+
+    @staticmethod
     def _decimal_text(value: Decimal) -> str:
         """Format Decimal without redundant trailing zeros. / 格式化 Decimal 并去除多余尾零。"""
         text = format(value, "f")
@@ -1078,6 +1680,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-name", default="CyberEditor Project")
     parser.add_argument("--strict-fps", action="store_true")
     parser.add_argument(
+        "--drx-root",
+        help="Folder containing interview_clean.drx, cinematic.drx, etc.",
+    )
+    parser.add_argument(
+        "--fairlight-preset",
+        default="",
+        help="Existing Resolve Fairlight preset name to apply to the timeline.",
+    )
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="Render the completed timeline through Resolve.",
+    )
+    parser.add_argument("--render-dir")
+    parser.add_argument("--render-name", default="CyberEditor_final")
+    parser.add_argument(
+        "--render-preset",
+        default="",
+        help="Existing Resolve Deliver-page render preset; current settings are used when empty.",
+    )
+    parser.add_argument("--render-timeout", type=float, default=86400.0)
+    parser.add_argument(
+        "--macro-profile",
+        help="Guarded PyAutoGUI profile for an API-unavailable post action.",
+    )
+    parser.add_argument("--macro-action", default="post_assembly")
+    parser.add_argument(
         "--no-auto-start-resolve",
         action="store_true",
         help="Do not launch Resolve automatically when it is not running.",
@@ -1109,6 +1738,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             strict_fps=args.strict_fps,
             auto_start_resolve=not args.no_auto_start_resolve,
             startup_timeout=args.resolve_startup_timeout,
+            drx_root=args.drx_root,
+            fairlight_preset=args.fairlight_preset,
+            render_enabled=args.render,
+            render_dir=args.render_dir,
+            render_name=args.render_name,
+            render_preset=args.render_preset,
+            render_timeout=args.render_timeout,
+            macro_profile=args.macro_profile,
+            macro_action=args.macro_action,
             logger=logger,
         )
         executor.run()

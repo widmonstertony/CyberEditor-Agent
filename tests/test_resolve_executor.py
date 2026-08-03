@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from src.resolve_executor import DaVinciExecutor, Decimal
+from src.resolve_executor import ClipDecision, DaVinciExecutor, Decimal
 
 
 class FakeItem:
@@ -138,6 +138,171 @@ class ResolveExecutorTests(unittest.TestCase):
             ),
             (312, 454),
         )
+
+    def test_native_source_fps_is_used_when_available(self):
+        class NativeFpsItem:
+            def GetClipProperty(self, name=None):
+                properties = {"FPS": "50", "Frame Rate": "50"}
+                return properties if name is None else properties.get(name, "")
+
+        executor = DaVinciExecutor("timeline_cuts.json")
+        self.assertEqual(executor._media_fps(NativeFpsItem()), Decimal("50"))
+
+    def test_ai_effect_plan_calls_supported_resolve_apis(self):
+        class TimelineItem:
+            def __init__(self):
+                self.voice = None
+                self.properties = None
+                self.cdl = None
+                self.marker = None
+
+            def SetVoiceIsolationState(self, value):
+                self.voice = value
+                return True
+
+            def SetProperty(self, value):
+                self.properties = value
+                return True
+
+            def SetCDL(self, value):
+                self.cdl = value
+                return True
+
+            def AddMarker(self, *value):
+                self.marker = value
+                return True
+
+        executor = DaVinciExecutor("timeline_cuts.json")
+        item = TimelineItem()
+        decision = ClipDecision(
+            1,
+            "source.mp4",
+            Decimal("1"),
+            Decimal("3"),
+            "Strong opening",
+            "cross_dissolve",
+            Decimal("0.5"),
+            "strong",
+            "warm",
+            "gentle_push_in",
+        )
+
+        executor.apply_clip_effects(item, decision)
+
+        self.assertEqual(item.voice["amount"], 75.0)
+        self.assertEqual(item.properties["ZoomX"], 1.04)
+        self.assertEqual(item.cdl["NodeIndex"], "1")
+        self.assertIn("cross_dissolve", item.marker[-1])
+
+    def test_native_ai_apis_and_drx_are_applied(self):
+        class Graph:
+            def __init__(self):
+                self.applied = None
+
+            def ApplyGradeFromDRX(self, path, mode):
+                self.applied = (path, mode)
+                return True
+
+        class TimelineItem:
+            def __init__(self):
+                self.graph = Graph()
+                self.stabilized = False
+                self.mask_mode = None
+                self.reframed = False
+                self.volume = None
+
+            def GetNodeGraph(self):
+                return self.graph
+
+            def Stabilize(self):
+                self.stabilized = True
+                return True
+
+            def CreateMagicMask(self, mode):
+                self.mask_mode = mode
+                return True
+
+            def SmartReframe(self):
+                self.reframed = True
+                return True
+
+            def GetProperty(self):
+                return {"Audio Level": 0.0}
+
+            def SetProperty(self, key, value):
+                self.volume = (key, value)
+                return True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            drx_root = Path(temporary)
+            preset = drx_root / "cinematic.drx"
+            preset.write_bytes(b"mock drx")
+            executor = DaVinciExecutor(
+                "timeline_cuts.json", drx_root=drx_root
+            )
+            item = TimelineItem()
+            decision = ClipDecision(
+                1,
+                "source.mp4",
+                Decimal("1"),
+                Decimal("3"),
+                "Track a moving subject",
+                volume_db=Decimal("-3.5"),
+                drx_preset="cinematic",
+                stabilization="auto",
+                tracking="magic_mask_bidirectional",
+                smart_reframe=True,
+            )
+
+            executor.apply_clip_effects(item, decision)
+
+            self.assertEqual(item.volume, ("Audio Level", -3.5))
+            self.assertEqual(item.graph.applied, (str(preset.resolve()), 0))
+            self.assertTrue(item.stabilized)
+            self.assertEqual(item.mask_mode, "BI")
+            self.assertTrue(item.reframed)
+
+    def test_final_render_uses_current_settings_and_waits_for_completion(self):
+        class RenderProject:
+            def __init__(self):
+                self.settings = None
+                self.started = None
+
+            def SetRenderSettings(self, settings):
+                self.settings = settings
+                return True
+
+            def AddRenderJob(self):
+                return "job-1"
+
+            def StartRendering(self, job_ids, interactive):
+                self.started = (job_ids, interactive)
+                return True
+
+            def GetRenderJobStatus(self, job_id):
+                return {"JobStatus": "Complete", "CompletionPercentage": 100}
+
+            def IsRenderingInProgress(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "final"
+            executor = DaVinciExecutor(
+                "timeline_cuts.json",
+                render_enabled=True,
+                render_dir=output,
+                render_name="documentary",
+            )
+            executor.project = RenderProject()
+
+            status = executor.render_final()
+
+            self.assertEqual(status["JobStatus"], "Complete")
+            self.assertEqual(executor.project.started, (["job-1"], False))
+            self.assertEqual(
+                executor.project.settings["TargetDir"], str(output.resolve())
+            )
+            self.assertEqual(executor.project.settings["CustomName"], "documentary")
 
     def test_mocked_run(self):
         with tempfile.TemporaryDirectory() as temporary:

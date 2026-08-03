@@ -4,10 +4,10 @@
 
 A fully local, privacy-first automatic long-form video editing MVP for Windows.
 
-CyberEditor-Agent uses Whisper to extract timestamped dialogue, OpenCV to create
-lightweight scene markers, a local Ollama model to make chunked editorial
-decisions, and the DaVinci Resolve Python API to assemble 1080p proxy media on a
-timeline.
+CyberEditor-Agent uses Whisper for timestamped dialogue, OpenCV for actual
+visual samples, a vision-capable local Ollama model for chunk review and
+cross-source story assembly, FFmpeg for a watchable result, and the DaVinci
+Resolve Python API for an editable timeline.
 
 > Project status: runnable MVP. Before using it on a production project, test
 > timecode conversion, proxy relinking, and Resolve compatibility on a copy of
@@ -23,9 +23,19 @@ repository root. You can also launch it from PowerShell:
 .\.venv\Scripts\python.exe gui.py
 ```
 
-The bilingual desktop UI includes source/proxy selection, Whisper and Ollama
-settings, resumable workflow modes, Resolve controls, live logs, stage
+The bilingual desktop UI can multi-select any number of videos or recursively
+load a media folder. It also includes Whisper and Ollama settings, resumable
+workflow modes, Resolve controls, a watchable preview render, live logs, stage
 progress, safe cancellation, environment checks, and output shortcuts.
+
+The full workflow does not merely concatenate every file. Each source is
+transcribed and sampled into time-distributed real frames. A vision model
+reviews each 10–15 minute window with both images and speech, and a second
+global-director pass chooses candidates from every source, orders them across
+files, and plans cuts/dissolves/fades, audio cleanup, basic looks, and gentle
+push-ins, gain, stabilization, and tracking. The result can include an editable
+Resolve timeline, an immediately watchable FFmpeg 1080p review, and a final
+movie rendered by Resolve's Deliver pipeline.
 
 The modern UI uses lightweight CustomTkinter and launches the existing
 `main.py` orchestrator as a child process. The resident UI never imports
@@ -47,7 +57,7 @@ profile: Whisper `large-v3`, 10-minute chunks, and a 16K context.
 At UI startup, an installed but stopped local Ollama service is launched
 automatically without loading a model or consuming model VRAM. Resolve is found
 across C:, D:, and other custom install drives, but is launched only when the
-strict serial workflow reaches stage 3. The executor then waits for the
+strict serial workflow reaches its final Resolve stage. The executor then waits for the
 scripting API, so Resolve cannot compete with Whisper or Ollama for VRAM.
 
 `Project FPS` defaults to **Auto from source media**, not a fixed 25. After a
@@ -104,7 +114,11 @@ Whisper + OpenCV child process
 Chunked Ollama director child process
           │ keep_alive=0 plus a second parent-process unload request
           ▼
+FFmpeg review-render child process
+          │ renders transitions, denoise, looks, and basic motion
+          ▼
 DaVinci Resolve executor child process
+          │ native effects / DRX / optional guarded UI macro / final render
 ```
 
 - The parent orchestrator does not import PyTorch, Whisper, OpenCV, requests,
@@ -116,6 +130,49 @@ DaVinci Resolve executor child process
   12 minutes.
 - `timeline_cuts.json` is written atomically only after every chunk succeeds
   and all decisions are validated and merged.
+
+## Four-stage automatic finishing pipeline
+
+The implementation now follows this strict serial chain:
+
+1. **Extraction**: each video gets its own Whisper/OpenCV child process, which
+   writes dialogue, real JPEG keyframes, and media metadata. The process exits
+   before the parent crosses the VRAM-release barrier.
+2. **Direction**: a vision-capable Ollama model reviews 10–15 minute windows,
+   then performs one cross-source story pass and atomically publishes
+   `timeline_cuts.json`. The child sends `keep_alive: 0`, and the parent performs
+   a second unload request. The UI lists installed models automatically. The
+   recommended `qwen3.5:35b-a3b` is a 36B Q4 vision/reasoning MoE, not a 70B
+   model mislabeled by the application.
+3. **Resolve execution**: native APIs import media, use each source's native FPS,
+   assemble clips, and apply Voice Isolation, basic CDL, `Stabilize()`,
+   `CreateMagicMask()`, and `SmartReframe()`. User-exported DRX grades are applied
+   through the node graph's `ApplyGradeFromDRX()`. Resolve 21 exposes stabilization
+   and Magic Mask natively, so fragile coordinate macros are not the default.
+4. **Final export**: enable **Export final movie in Resolve** in the UI to create
+   a Render Job, start it, log percentage progress, and validate completion. The
+   current Deliver format/codec is preserved unless an existing Resolve render
+   preset is entered.
+
+### DRX, Fairlight, and the UI fallback
+
+- Export grades from Resolve into `config/drx/` using exactly
+  `interview_clean.drx`, `cinematic.drx`, or `low_light_cleanup.drx`. The model
+  selects logical names only and cannot construct arbitrary filesystem paths.
+- The UI accepts an existing Resolve Fairlight preset name. A missing preset is
+  a clear error rather than silently dropping requested audio processing.
+- `src/resolve_macro.py` is an **optional**, disabled-by-default PyAutoGUI fallback
+  for operations still absent from the API. When configured, it verifies the
+  expected display resolution, requires Resolve to be foreground, enables the
+  screen-corner fail-safe, and accepts only waits, hotkeys, key presses, and
+  normalized clicks. Copy and calibrate
+  `config/resolve_macro_profile.example.json` for your own Resolve workspace.
+
+Resolve 21 does not document a universal per-clip volume property. The executor
+probes the current build and writes gain when a supported property is exposed;
+otherwise it logs a warning and preserves the dB decision in the AI marker. The
+FFmpeg review always applies that gain. Use a calibrated fallback or verified
+Fairlight workflow when exact per-clip gain is required in the final Resolve job.
 
 The Ollama API supports JSON Schema constrained output and immediate model
 unloading with `keep_alive: 0`:
@@ -133,6 +190,9 @@ CyberEditor-Agent/
 ├─ scripts/
 │  └─ install_windows.ps1        # Windows CPU/CUDA auto-installer
 ├─ requirements.txt
+├─ config/
+│  ├─ drx/                      # Constrained user-exported DRX grades
+│  └─ resolve_macro_profile.example.json
 ├─ README.md                     # Simplified Chinese documentation
 ├─ README_EN.md                  # English documentation
 ├─ LICENSE
@@ -143,10 +203,13 @@ CyberEditor-Agent/
 │  ├─ gui.py                     # Dependency-free fallback and shared probes
 │  ├─ modern_gui.py              # Windows 11, 4K, Chinese/English UI
 │  ├─ runtime_services.py        # Cross-drive discovery and service auto-start
+│  ├─ media_manifest.py          # Multi-video/folder discovery and proxy mapping
 │  ├─ ui_i18n.py                 # GUI-independent bilingual strings
 │  ├─ extractor.py               # Whisper + OpenCV extraction
-│  ├─ director.py                # Chunked Ollama director
-│  └─ resolve_executor.py        # DaVinci Resolve assembly
+│  ├─ director.py                # Multimodal review + global story director
+│  ├─ review_renderer.py         # Watchable FFmpeg preview and effects
+│  ├─ resolve_macro.py           # Guarded optional PyAutoGUI fallback
+│  └─ resolve_executor.py        # Resolve assembly and effect mapping
 ├─ data/
 │  ├─ .gitkeep
 │  └─ keyframes/.gitkeep
@@ -280,11 +343,13 @@ setx OLLAMA_MAX_LOADED_MODELS 1
 setx OLLAMA_NUM_PARALLEL 1
 ```
 
-### 4. Prepare proxies
+### 4. Proxies (optional)
 
-Generate 1080p proxies in Resolve or with FFmpeg. The proxy and source must
-share the same start time and duration. Director decisions use seconds, while
-the executor converts them to frames using the active Resolve project FPS.
+Originals work without proxies. For long-form or 4K 10-bit material, 1080p
+proxies generated in Resolve or FFmpeg are recommended. Proxy and source must
+share the same start time and duration. Director decisions use seconds; the
+Resolve executor prefers each Media Pool item's native source FPS for frame
+conversion instead of assuming every source matches the project FPS.
 
 ## One-command workflow
 
@@ -296,20 +361,31 @@ API. Resolve Studio's External Scripting preference must still be set to
 
 ```powershell
 python main.py `
-  --video "D:\Documentary\source.mov" `
-  --proxy "D:\Documentary\proxy\source_1080p.mp4" `
+  --input-folder "D:\Documentary\Camera originals" `
   --ollama-model "qwen3.5:35b-a3b" `
-  --project-fps 25 `
+  --project-fps 23.976 `
   --chunk-minutes 10
+```
+
+You can also repeat `--video` in selection order and combine explicit files
+with a folder; duplicate paths are removed:
+
+```powershell
+python main.py `
+  --video "D:\Shoot\A001.mp4" `
+  --video "D:\Shoot\B001.mp4" `
+  --input-folder "D:\Shoot\B-roll" `
+  --ollama-model "qwen3.5:35b-a3b"
 ```
 
 Default outputs:
 
 ```text
 data/raw_data.json
-data/transcript.srt
-data/keyframes/*.jpg
+data/assets/<asset_id>/transcript.srt
+data/assets/<asset_id>/keyframes/*.jpg
 data/timeline_cuts.json
+data/review/CyberEditor_preview.mp4
 data/cybereditor.log
 ```
 
@@ -337,6 +413,7 @@ python main.py --video "D:\source.mov" --skip-resolve
 ```powershell
 python -m src.extractor --help
 python -m src.director --help
+python -m src.review_renderer --help
 python -m src.resolve_executor --help
 ```
 
@@ -362,30 +439,40 @@ The director produces this core structure:
       "cut_in_sec": 12.5,
       "cut_out_sec": 18.2,
       "reason_for_cut": "Complete statement of the main idea",
-      "confidence": 0.9
+      "confidence": 0.9,
+      "story_role": "interview",
+      "transition_to_next": "cross_dissolve",
+      "transition_duration_sec": 0.5,
+      "audio_cleanup": "strong",
+      "color_look": "warm",
+      "motion": "gentle_push_in"
     }
   ]
 }
 ```
 
-`cut_in_sec` is inclusive and `cut_out_sec` is exclusive. The Resolve executor
-rounds the in-point down and the out-point up, then subtracts one frame to match
-Resolve's inclusive `endFrame`.
+`cut_in_sec` is inclusive and `cut_out_sec` is exclusive. Using each source
+clip's native FPS, the Resolve executor rounds the in-point down and the
+out-point up, then subtracts one frame to match Resolve's inclusive `endFrame`.
 
 ## Robustness boundaries
 
-- Proxy FPS should match project FPS. The MVP converts JSON seconds using the
-  Resolve project FPS; mixed native frame rates should be normalized through
-  proxies first.
+- The vision model does not decode every 4K pixel of every frame. Extraction
+  traverses every video and retains time-distributed, scene-change-aware
+  representative frames for windowed review. This balances long-form coverage
+  with local context and memory limits.
+- Resolve's public scripting API has no stable general transition-insertion
+  method. The FFmpeg preview truly renders the AI transition, denoise, look,
+  and motion plan. The editable Resolve timeline applies supported Voice
+  Isolation, CDL, and transform properties and stores the full plan in markers.
 - The script reuses the current Resolve timeline. It creates
   `CyberEditor Timeline` only when there is no current timeline.
 - If one Resolve append operation fails, the API offers no reliable
   transaction rollback. The log reports how many clips were appended so the
   user can inspect and undo the partial timeline.
-- Scene markers use lightweight grayscale frame differences, not semantic
-  visual understanding. A visual model can replace this implementation later,
-  but it must remain inside the extractor child process and preserve the exit
-  barrier.
+- Semantic review requires an Ollama model reporting the `vision` capability.
+  Plain `qwen2.5:3b` is a text-only smoke-test model and cannot run this
+  multimodal path; use Qwen 3.5 or another vision-capable model.
 
 ## Tests
 

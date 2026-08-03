@@ -27,6 +27,14 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from src.runtime_services import RuntimeServiceError, ensure_ollama_service
+from src.media_manifest import (
+    MediaManifestError,
+    atomic_write_json,
+    build_combined_raw_data,
+    discover_video_files,
+    make_asset_id,
+    match_proxy_files,
+)
 
 
 LOGGER_NAME = "cybereditor"
@@ -110,7 +118,12 @@ class WorkflowOrchestrator:
         """Initialize paths and active-process guard. / 初始化路径及活动进程保护。"""
         self.project_root = project_root.resolve()
         self.data_dir = data_dir.resolve()
-        self.python_executable = python_executable
+        executable = Path(python_executable).expanduser()
+        if os.name == "nt" and executable.name.casefold() == "pythonw.exe":
+            console = executable.with_name("python.exe")
+            if console.is_file():
+                executable = console
+        self.python_executable = str(executable)
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         self.active_process: Optional[subprocess.Popen] = None
 
@@ -121,28 +134,27 @@ class WorkflowOrchestrator:
         """
         self.data_dir.mkdir(parents=True, exist_ok=True)
         raw_data = self.data_dir / "raw_data.json"
-        srt_path = self.data_dir / "transcript.srt"
-        keyframes_dir = self.data_dir / "keyframes"
         timeline_cuts = self.data_dir / "timeline_cuts.json"
         lock_path = self.data_dir / ".cybereditor.lock"
 
-        video_path = (
-            Path(args.video).expanduser().resolve() if args.video else None
-        )
-        proxy_path = (
-            Path(args.proxy).expanduser().resolve()
-            if args.proxy
-            else video_path
-        )
+        explicit_videos = self._argument_list(getattr(args, "video", None))
+        explicit_proxies = self._argument_list(getattr(args, "proxy", None))
+        sources: List[Path] = []
+        proxy_map: Dict[Path, Path] = {}
         if not args.skip_extraction:
-            if video_path is None or not video_path.is_file():
-                raise WorkflowError(
-                    "提取阶段需要有效的 --video / Extraction requires a valid --video."
+            try:
+                sources = discover_video_files(
+                    explicit_videos,
+                    getattr(args, "input_folder", None),
+                    recursive=not bool(getattr(args, "no_recursive", False)),
                 )
-        if proxy_path is not None and not proxy_path.is_file():
-            raise WorkflowError(
-                f"找不到代理素材 / Proxy media not found: {proxy_path}"
-            )
+                proxy_map = match_proxy_files(
+                    sources,
+                    explicit_proxies,
+                    getattr(args, "proxy_folder", None),
+                )
+            except MediaManifestError as exc:
+                raise WorkflowError(str(exc)) from exc
         if args.skip_extraction:
             self._require_file(raw_data, "跳过提取时需要现有 raw_data.json")
         if args.skip_director:
@@ -155,39 +167,87 @@ class WorkflowOrchestrator:
                 "串行工作流启动；任意时刻最多一个重型阶段 / Serial workflow started; one heavy stage at a time"
             )
 
+            if not args.skip_extraction and not args.skip_director:
+                self._require_vision_model(args.ollama_model, args.ollama_url)
+
             if not args.skip_extraction:
-                command = [
-                    self.python_executable,
-                    "-m",
-                    "src.extractor",
-                    "--video",
-                    str(video_path),
-                    "--raw-data",
-                    str(raw_data),
-                    "--srt",
-                    str(srt_path),
-                    "--keyframes-dir",
-                    str(keyframes_dir),
-                    "--whisper-model",
-                    args.whisper_model,
-                    "--device",
-                    args.whisper_device,
-                    "--scene-threshold",
-                    str(args.scene_threshold),
-                    "--sample-interval",
-                    str(args.sample_interval),
-                    "--max-keyframes",
-                    str(args.max_keyframes),
-                    "--log-level",
-                    args.log_level,
-                ]
-                if args.language:
-                    command.extend(["--language", args.language])
-                if proxy_path:
-                    command.extend(["--proxy-file-name", str(proxy_path)])
-                self._run_stage("提取 / Extract", command)
+                assets: List[Dict[str, object]] = []
+                for index, video_path in enumerate(sources, start=1):
+                    asset_id = make_asset_id(index, video_path)
+                    asset_dir = self.data_dir / "assets" / asset_id
+                    asset_raw = asset_dir / "raw_data.json"
+                    asset_srt = asset_dir / "transcript.srt"
+                    asset_keyframes = asset_dir / "keyframes"
+                    proxy_path = proxy_map[video_path]
+                    command = [
+                        self.python_executable,
+                        "-m",
+                        "src.extractor",
+                        "--video",
+                        str(video_path),
+                        "--raw-data",
+                        str(asset_raw),
+                        "--srt",
+                        str(asset_srt),
+                        "--keyframes-dir",
+                        str(asset_keyframes),
+                        "--proxy-file-name",
+                        str(proxy_path),
+                        "--whisper-model",
+                        args.whisper_model,
+                        "--device",
+                        args.whisper_device,
+                        "--scene-threshold",
+                        str(args.scene_threshold),
+                        "--sample-interval",
+                        str(args.sample_interval),
+                        "--max-keyframes",
+                        str(args.max_keyframes),
+                        "--log-level",
+                        args.log_level,
+                    ]
+                    if args.language:
+                        command.extend(["--language", args.language])
+                    self._run_stage(
+                        f"提取 {index}/{len(sources)}：{video_path.name} / Extract",
+                        command,
+                    )
+                    self._require_file(
+                        asset_raw,
+                        f"素材 {video_path.name} 未生成 raw_data.json",
+                    )
+                    try:
+                        asset_payload = json.loads(
+                            asset_raw.read_text(encoding="utf-8-sig")
+                        )
+                    except (OSError, ValueError) as exc:
+                        raise WorkflowError(
+                            f"无法读取素材提取结果 / Cannot read {asset_raw}: {exc}"
+                        ) from exc
+                    if not isinstance(asset_payload, dict):
+                        raise WorkflowError(
+                            f"素材提取结果格式错误 / Invalid asset JSON: {asset_raw}"
+                        )
+                    asset_payload["asset_id"] = asset_id
+                    asset_payload["source_video"] = str(video_path)
+                    asset_payload["proxy_file_name"] = str(proxy_path)
+                    asset_payload["raw_data_path"] = str(asset_raw)
+                    for frame in asset_payload.get("keyframes", []):
+                        if isinstance(frame, dict) and frame.get("file_name"):
+                            frame["image_path"] = str(
+                                asset_keyframes / str(frame["file_name"])
+                            )
+                    assets.append(asset_payload)
+                    self._release_barrier(
+                        f"Whisper/OpenCV asset {index}/{len(sources)}"
+                    )
+                atomic_write_json(build_combined_raw_data(assets), raw_data)
                 self._require_file(raw_data, "提取阶段未生成 raw_data.json")
-                self._release_barrier("Whisper/OpenCV")
+                self.logger.info(
+                    "批量提取完成：%d 个视频 / Batch extraction complete: %d videos",
+                    len(assets),
+                    len(assets),
+                )
 
             if not args.skip_director:
                 try:
@@ -225,8 +285,6 @@ class WorkflowOrchestrator:
                     "--log-level",
                     args.log_level,
                 ]
-                if proxy_path:
-                    command.extend(["--proxy-file-name", str(proxy_path)])
                 try:
                     self._run_stage("导演 / Direct", command)
                 finally:
@@ -240,11 +298,36 @@ class WorkflowOrchestrator:
                 )
                 self._release_barrier("Ollama")
 
+            # Programmatic callers created before preview support have no
+            # ``skip_preview`` attribute; keep those integrations backward
+            # compatible. The CLI parser always supplies its explicit default.
+            if not bool(getattr(args, "skip_preview", True)):
+                preview_path = self.data_dir / "review" / str(
+                    getattr(args, "preview_name", "CyberEditor_preview.mp4")
+                )
+                command = [
+                    self.python_executable,
+                    "-m",
+                    "src.review_renderer",
+                    "--json",
+                    str(timeline_cuts),
+                    "--output",
+                    str(preview_path),
+                    "--width",
+                    str(getattr(args, "preview_width", 1920)),
+                    "--height",
+                    str(getattr(args, "preview_height", 1080)),
+                    "--log-level",
+                    args.log_level,
+                ]
+                self._run_stage("预览成片 / Preview render", command)
+                self._require_file(preview_path, "预览渲染未生成输出文件")
+
             if not args.skip_resolve:
                 media_root = (
                     Path(args.media_root).expanduser().resolve()
                     if args.media_root
-                    else (proxy_path.parent if proxy_path else self.data_dir)
+                    else self.data_dir
                 )
                 command = [
                     self.python_executable,
@@ -263,11 +346,75 @@ class WorkflowOrchestrator:
                 ]
                 if args.strict_fps:
                     command.append("--strict-fps")
+                drx_root = str(getattr(args, "drx_root", "") or "").strip()
+                if drx_root:
+                    command.extend(["--drx-root", drx_root])
+                fairlight_preset = str(
+                    getattr(args, "fairlight_preset", "") or ""
+                ).strip()
+                if fairlight_preset:
+                    command.extend(["--fairlight-preset", fairlight_preset])
+                macro_profile = str(
+                    getattr(args, "macro_profile", "") or ""
+                ).strip()
+                if macro_profile:
+                    command.extend(
+                        [
+                            "--macro-profile",
+                            macro_profile,
+                            "--macro-action",
+                            str(
+                                getattr(args, "macro_action", "post_assembly")
+                            ),
+                        ]
+                    )
+                if bool(getattr(args, "render_final", False)):
+                    command.append("--render")
+                    render_dir = str(
+                        getattr(args, "render_dir", "") or ""
+                    ).strip()
+                    if render_dir:
+                        command.extend(["--render-dir", render_dir])
+                    command.extend(
+                        [
+                            "--render-name",
+                            str(
+                                getattr(
+                                    args, "render_name", "CyberEditor_final"
+                                )
+                            ),
+                        ]
+                    )
+                    render_preset = str(
+                        getattr(args, "render_preset", "") or ""
+                    ).strip()
+                    if render_preset:
+                        command.extend(["--render-preset", render_preset])
+                    command.extend(
+                        [
+                            "--render-timeout",
+                            str(getattr(args, "render_timeout", 86400.0)),
+                        ]
+                    )
                 self._run_stage("执行 / Resolve", command)
 
             self.logger.info(
                 "全部所选阶段完成 / All selected stages completed"
             )
+
+    @staticmethod
+    def _argument_list(value: object) -> List[str]:
+        """
+        Normalize one argparse scalar/list into a clean string list.
+        将 argparse 的标量或列表参数规范化为字符串列表。
+        """
+        if value is None:
+            return []
+        if isinstance(value, (str, os.PathLike)):
+            return [str(value)]
+        if isinstance(value, Sequence):
+            return [str(item) for item in value if str(item).strip()]
+        return [str(value)]
 
     def _run_stage(self, display_name: str, command: Sequence[str]) -> None:
         """
@@ -385,6 +532,51 @@ class WorkflowOrchestrator:
                 model,
             )
 
+    def _require_vision_model(self, model: str, base_url: str) -> None:
+        """
+        Fail before long extraction when the selected model cannot inspect images.
+        在耗时提取前确认所选模型能看图，避免数小时后才失败。
+
+        Parameters / 参数:
+            model:
+                Installed Ollama model tag. / 已安装的 Ollama 模型标签。
+            base_url:
+                Local Ollama service URL. / 本地 Ollama 服务地址。
+        """
+        try:
+            ensure_ollama_service(base_url, timeout=30.0)
+            body = json.dumps({"model": model}).encode("utf-8")
+            request = urllib_request.Request(
+                base_url.rstrip("/") + "/api/show",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib_request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (
+            RuntimeServiceError,
+            urllib_error.URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise WorkflowError(
+                f"无法检查 Ollama 模型 {model!r}。请确认模型已安装：ollama pull {model}\n"
+                f"Could not inspect the selected Ollama model: {exc}"
+            ) from exc
+        capabilities = (
+            payload.get("capabilities", []) if isinstance(payload, dict) else []
+        )
+        if "vision" not in {str(value).casefold() for value in capabilities}:
+            raise WorkflowError(
+                f"模型 {model!r} 不支持图像输入，不能审阅视频画面。"
+                "请先安装并选择视觉模型，例如：\n"
+                "  ollama pull qwen3.5:35b-a3b\n"
+                "  ollama pull qwen3.5:9b-q8_0\n"
+                "The selected model is text-only; a vision model is required."
+            )
+
     def _release_barrier(self, stage_name: str) -> None:
         """
         Document and enforce the process-exit memory barrier.
@@ -440,10 +632,28 @@ def build_parser() -> argparse.ArgumentParser:
             "/ 严格串行的本地 AI 视频剪辑。"
         )
     )
-    parser.add_argument("--video", help="源视频 / source video")
+    parser.add_argument(
+        "--video",
+        action="append",
+        help="源视频，可重复传入 / source video; repeat for multiple files",
+    )
+    parser.add_argument(
+        "--input-folder",
+        help="批量素材文件夹 / folder containing source videos",
+    )
+    parser.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="不扫描素材子文件夹 / do not scan nested folders",
+    )
     parser.add_argument(
         "--proxy",
-        help="Resolve 1080p 代理；省略则使用源视频 / Resolve proxy; defaults to source",
+        action="append",
+        help="代理素材，可重复传入 / proxy media; repeat for multiple files",
+    )
+    parser.add_argument(
+        "--proxy-folder",
+        help="代理素材目录，按同名文件匹配 / proxy folder matched by stem",
     )
     parser.add_argument(
         "--data-dir",
@@ -466,9 +676,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeline-name", default="CyberEditor Timeline")
     parser.add_argument("--project-name", default="CyberEditor Project")
     parser.add_argument("--strict-fps", action="store_true")
+    parser.add_argument("--drx-root")
+    parser.add_argument("--fairlight-preset", default="")
+    parser.add_argument("--macro-profile")
+    parser.add_argument("--macro-action", default="post_assembly")
+    parser.add_argument(
+        "--render-final",
+        action="store_true",
+        help="由 Resolve 渲染最终成片 / render the final movie in Resolve",
+    )
+    parser.add_argument("--render-dir")
+    parser.add_argument("--render-name", default="CyberEditor_final")
+    parser.add_argument("--render-preset", default="")
+    parser.add_argument("--render-timeout", type=float, default=86400.0)
     parser.add_argument("--skip-extraction", action="store_true")
     parser.add_argument("--skip-director", action="store_true")
     parser.add_argument("--skip-resolve", action="store_true")
+    parser.add_argument(
+        "--skip-preview",
+        action="store_true",
+        help="不生成可直接观看的 MP4 预览 / skip rendered MP4 preview",
+    )
+    parser.add_argument(
+        "--preview-name", default="CyberEditor_preview.mp4"
+    )
+    parser.add_argument("--preview-width", type=int, default=1920)
+    parser.add_argument("--preview-height", type=int, default=1080)
     parser.add_argument(
         "--log-level",
         default="INFO",

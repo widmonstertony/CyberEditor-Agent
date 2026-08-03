@@ -13,6 +13,7 @@ the decisions deterministically, and unloads the Ollama model in ``finally``.
 """
 
 import argparse
+import base64
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
@@ -42,6 +43,30 @@ DECISION_SCHEMA: Dict[str, Any] = {
                         "minimum": 0,
                         "maximum": 1,
                     },
+                    "volume_db": {"type": "number", "minimum": -24, "maximum": 12},
+                    "drx_preset": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "interview_clean",
+                            "cinematic",
+                            "low_light_cleanup",
+                        ],
+                    },
+                    "stabilization": {
+                        "type": "string",
+                        "enum": ["none", "auto"],
+                    },
+                    "tracking": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "magic_mask_forward",
+                            "magic_mask_backward",
+                            "magic_mask_bidirectional",
+                        ],
+                    },
+                    "smart_reframe": {"type": "boolean"},
                 },
                 "required": [
                     "cut_in_sec",
@@ -53,6 +78,159 @@ DECISION_SCHEMA: Dict[str, Any] = {
         }
     },
     "required": ["decisions"],
+    "additionalProperties": False,
+}
+
+CANDIDATE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "cut_in_sec": {"type": "number", "minimum": 0},
+                    "cut_out_sec": {"type": "number", "minimum": 0},
+                    "reason_for_cut": {"type": "string", "minLength": 1},
+                    "visual_summary": {"type": "string", "minLength": 1},
+                    "story_role": {
+                        "type": "string",
+                        "enum": [
+                            "opening",
+                            "context",
+                            "interview",
+                            "broll",
+                            "bridge",
+                            "climax",
+                            "closing",
+                        ],
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "quality_score": {"type": "number", "minimum": 0, "maximum": 1},
+                    "transition_to_next": {
+                        "type": "string",
+                        "enum": ["cut", "cross_dissolve", "fade_black"],
+                    },
+                    "transition_duration_sec": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2,
+                    },
+                    "audio_cleanup": {
+                        "type": "string",
+                        "enum": ["none", "light", "strong"],
+                    },
+                    "color_look": {
+                        "type": "string",
+                        "enum": ["source", "neutral", "warm", "cool", "contrast"],
+                    },
+                    "motion": {
+                        "type": "string",
+                        "enum": ["static", "gentle_push_in"],
+                    },
+                    "volume_db": {"type": "number", "minimum": -24, "maximum": 12},
+                    "drx_preset": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "interview_clean",
+                            "cinematic",
+                            "low_light_cleanup",
+                        ],
+                    },
+                    "stabilization": {
+                        "type": "string",
+                        "enum": ["none", "auto"],
+                    },
+                    "tracking": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "magic_mask_forward",
+                            "magic_mask_backward",
+                            "magic_mask_bidirectional",
+                        ],
+                    },
+                    "smart_reframe": {"type": "boolean"},
+                },
+                "required": [
+                    "cut_in_sec",
+                    "cut_out_sec",
+                    "reason_for_cut",
+                    "visual_summary",
+                    "story_role",
+                ],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["decisions"],
+    "additionalProperties": False,
+}
+
+SEQUENCE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "project_summary": {"type": "string"},
+        "sequence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string", "minLength": 1},
+                    "reason_for_position": {"type": "string"},
+                    "transition_to_next": {
+                        "type": "string",
+                        "enum": ["cut", "cross_dissolve", "fade_black"],
+                    },
+                    "transition_duration_sec": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 2,
+                    },
+                    "audio_cleanup": {
+                        "type": "string",
+                        "enum": ["none", "light", "strong"],
+                    },
+                    "color_look": {
+                        "type": "string",
+                        "enum": ["source", "neutral", "warm", "cool", "contrast"],
+                    },
+                    "motion": {
+                        "type": "string",
+                        "enum": ["static", "gentle_push_in"],
+                    },
+                    "volume_db": {"type": "number", "minimum": -24, "maximum": 12},
+                    "drx_preset": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "interview_clean",
+                            "cinematic",
+                            "low_light_cleanup",
+                        ],
+                    },
+                    "stabilization": {
+                        "type": "string",
+                        "enum": ["none", "auto"],
+                    },
+                    "tracking": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "magic_mask_forward",
+                            "magic_mask_backward",
+                            "magic_mask_bidirectional",
+                        ],
+                    },
+                    "smart_reframe": {"type": "boolean"},
+                },
+                "required": ["candidate_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["project_summary", "sequence"],
     "additionalProperties": False,
 }
 
@@ -164,6 +342,8 @@ class AIDirector:
         raw_path = Path(raw_data_path).expanduser().resolve()
         destination = Path(output_path).expanduser().resolve()
         raw_data = self.load_raw_data(raw_path)
+        if isinstance(raw_data.get("assets"), list):
+            return self._run_multi_asset(raw_data, raw_path, destination)
         source_name = (
             proxy_file_name
             or str(raw_data.get("proxy_file_name") or "").strip()
@@ -243,6 +423,128 @@ class AIDirector:
         )
         return output
 
+    def _run_multi_asset(
+        self,
+        raw_data: Dict[str, Any],
+        raw_path: Path,
+        destination: Path,
+    ) -> Dict[str, Any]:
+        """
+        Run visual candidate selection followed by global story assembly.
+        先执行视觉候选片段筛选，再进行全局故事编排。
+
+        Every source/chunk is analyzed once with its transcript and actual JPEG
+        frames.  A second constrained model call sees candidates from every
+        asset and decides which clips to use and in what order.
+
+        每个素材分块都会结合台词和真实 JPEG 画面分析一次；第二次受约束模型调用会
+        看到全部素材的候选片段，并决定最终选用内容与跨素材顺序。
+        """
+        assets = raw_data["assets"]
+        chunks: List[Dict[str, Any]] = []
+        for asset in assets:
+            asset_chunks = self.chunk_raw_data(asset)
+            source_name = str(
+                asset.get("proxy_file_name")
+                or asset.get("source_video")
+                or ""
+            ).strip()
+            if not source_name:
+                raise DirectorError(
+                    f"素材 {asset.get('asset_id')} 缺少媒体路径 / asset has no media path."
+                )
+            for chunk in asset_chunks:
+                chunk["asset_id"] = str(asset["asset_id"])
+                chunk["source_name"] = source_name
+                chunk["source_video"] = str(asset.get("source_video") or "")
+                chunk["asset_label"] = Path(
+                    str(asset.get("source_video") or source_name)
+                ).name
+                chunks.append(chunk)
+
+        self.logger.info(
+            "多素材视觉导演：%d 个视频，%d 个分块 / Multi-asset visual director: %d videos, %d chunks",
+            len(assets),
+            len(chunks),
+            len(assets),
+            len(chunks),
+        )
+        candidates: List[Dict[str, Any]] = []
+        try:
+            self.check_ollama(require_vision=True)
+            for index, chunk in enumerate(chunks, start=1):
+                self.logger.info(
+                    "视觉分析 %d/%d：%s %.1fs–%.1fs / Visual analysis %d/%d: %s %.1fs–%.1fs",
+                    index,
+                    len(chunks),
+                    chunk["asset_label"],
+                    chunk["start_sec"],
+                    chunk["end_sec"],
+                    index,
+                    len(chunks),
+                    chunk["asset_label"],
+                    chunk["start_sec"],
+                    chunk["end_sec"],
+                )
+                response_payload = self.request_chunk(
+                    chunk,
+                    str(chunk["source_name"]),
+                    schema=CANDIDATE_SCHEMA,
+                    include_images=True,
+                )
+                decisions = self.validate_chunk_decisions(
+                    response_payload,
+                    chunk,
+                    str(chunk["source_name"]),
+                )
+                for decision in decisions:
+                    decision["asset_id"] = str(chunk["asset_id"])
+                candidates.extend(decisions)
+
+            candidates = self.merge_decisions(candidates)
+            candidate_limit = max(24, min(160, self.num_ctx // 128))
+            candidates = self._limit_candidates(
+                candidates, limit=candidate_limit
+            )
+            for index, candidate in enumerate(candidates, start=1):
+                candidate["candidate_id"] = f"C{index:04d}"
+            if not candidates:
+                raise DirectorError(
+                    "视觉导演未找到任何可用片段 / Visual director found no usable clips."
+                )
+            sequence_payload = self.request_sequence(candidates, assets)
+            final_clips = self.validate_sequence(sequence_payload, candidates)
+        finally:
+            self.unload_model()
+
+        for index, clip in enumerate(final_clips, start=1):
+            clip["clip_id"] = index
+        output: Dict[str, Any] = {
+            "schema_version": "2.0",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "project_fps": self.project_fps,
+            "source_raw_data": str(raw_path),
+            "director_model": self.model,
+            "chunk_duration_sec": self.chunk_duration_sec,
+            "asset_count": len(assets),
+            "candidate_count": len(candidates),
+            "project_summary": str(sequence_payload.get("project_summary") or "").strip(),
+            "effects_engine": {
+                "review": "ffmpeg",
+                "editable_timeline": "davinci_resolve",
+            },
+            "clips": final_clips,
+        }
+        self._atomic_write_json(output, destination)
+        self.logger.info(
+            "全局编排完成：从 %d 个候选中选出 %d 个片段 / Global assembly selected %d of %d candidates",
+            len(candidates),
+            len(final_clips),
+            len(final_clips),
+            len(candidates),
+        )
+        return output
+
     def load_raw_data(self, path: Path) -> Dict[str, Any]:
         """
         Read and validate the extractor's ``raw_data.json``.
@@ -260,6 +562,51 @@ class AIDirector:
             raise DirectorError(
                 "raw_data.json 根节点必须是对象 / root must be an object."
             )
+        assets = payload.get("assets")
+        if isinstance(assets, list):
+            if not assets:
+                raise DirectorError(
+                    "raw_data.json 的 assets 不能为空 / assets cannot be empty."
+                )
+            normalized_assets: List[Dict[str, Any]] = []
+            seen_ids = set()
+            for index, raw_asset in enumerate(assets):
+                if not isinstance(raw_asset, dict):
+                    raise DirectorError(
+                        f"assets[{index}] 必须是对象 / must be an object."
+                    )
+                asset = dict(raw_asset)
+                asset_id = str(asset.get("asset_id") or f"asset_{index + 1}").strip()
+                if not asset_id or asset_id in seen_ids:
+                    raise DirectorError(
+                        f"assets[{index}].asset_id 缺失或重复 / missing or duplicate."
+                    )
+                seen_ids.add(asset_id)
+                asset["asset_id"] = asset_id
+                self._validate_asset_data(asset, f"assets[{index}]")
+                for frame in asset.get("keyframes", []):
+                    if not isinstance(frame, dict):
+                        continue
+                    image_path = str(frame.get("image_path") or "").strip()
+                    if image_path:
+                        frame["image_path"] = str(
+                            Path(image_path).expanduser().resolve()
+                        )
+                        continue
+                    raw_data_path = str(asset.get("raw_data_path") or "").strip()
+                    frame_name = str(frame.get("file_name") or "").strip()
+                    if raw_data_path and frame_name:
+                        frame["image_path"] = str(
+                            Path(raw_data_path).expanduser().resolve().parent
+                            / "keyframes"
+                            / frame_name
+                        )
+                normalized_assets.append(asset)
+            payload["assets"] = normalized_assets
+            payload["duration_sec"] = sum(
+                float(asset["duration_sec"]) for asset in normalized_assets
+            )
+            return payload
         transcript = payload.get("transcript")
         if not isinstance(transcript, list) or not transcript:
             raise DirectorError(
@@ -290,6 +637,48 @@ class AIDirector:
             previous_start = start
         payload["duration_sec"] = duration
         return payload
+
+    def _validate_asset_data(self, asset: Dict[str, Any], prefix: str) -> None:
+        """
+        Validate one schema-v2 asset transcript and time range.
+        校验 schema-v2 中一个素材的台词与时间范围。
+        """
+        transcript = asset.get("transcript")
+        keyframes = asset.get("keyframes")
+        if not isinstance(transcript, list):
+            raise DirectorError(f"{prefix}.transcript 必须是数组 / must be an array.")
+        if not isinstance(keyframes, list):
+            asset["keyframes"] = []
+            keyframes = []
+        if not transcript and not keyframes:
+            raise DirectorError(
+                f"{prefix} 没有台词或关键帧 / has no transcript or keyframes."
+            )
+        duration = self._finite_float(asset.get("duration_sec"), f"{prefix}.duration_sec")
+        if duration <= 0:
+            raise DirectorError(f"{prefix}.duration_sec 必须大于 0 / must be positive.")
+        previous_start = -1.0
+        for index, segment in enumerate(transcript):
+            if not isinstance(segment, dict):
+                raise DirectorError(
+                    f"{prefix}.transcript[{index}] 必须是对象 / must be an object."
+                )
+            start = self._finite_float(
+                segment.get("start_sec"), f"{prefix}.transcript[{index}].start_sec"
+            )
+            end = self._finite_float(
+                segment.get("end_sec"), f"{prefix}.transcript[{index}].end_sec"
+            )
+            if start < 0 or end <= start or start < previous_start:
+                raise DirectorError(
+                    f"{prefix}.transcript[{index}] 时间范围无效或未排序 / invalid or unsorted."
+                )
+            if not str(segment.get("text", "")).strip():
+                raise DirectorError(
+                    f"{prefix}.transcript[{index}].text 不能为空 / cannot be empty."
+                )
+            previous_start = start
+        asset["duration_sec"] = duration
 
     def chunk_raw_data(self, raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -350,7 +739,7 @@ class AIDirector:
             )
         return chunks
 
-    def check_ollama(self) -> None:
+    def check_ollama(self, require_vision: bool = False) -> None:
         """
         Verify Ollama is reachable and the configured model is installed.
         验证 Ollama 可访问且已安装配置的模型。
@@ -381,6 +770,9 @@ class AIDirector:
                 f"Ollama 中未找到模型 {self.model!r}。请先执行：ollama pull {self.model}\n"
                 f"Model not installed. Available: {available}"
             )
+
+        if require_vision:
+            self._require_vision_model()
 
         # The project promises a single-model VRAM policy. Refuse to load the
         # director while an unrelated Ollama model is already resident.
@@ -418,23 +810,92 @@ class AIDirector:
                 "Other Ollama models are loaded; stop them before continuing."
             )
 
+    def _require_vision_model(self) -> None:
+        """
+        Verify that the selected Ollama model accepts image inputs.
+        验证所选 Ollama 模型能够接收图像输入。
+        """
+        try:
+            response = self.session.post(
+                self.base_url + "/api/show",
+                json={"model": self.model},
+                timeout=(5, 30),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            self.logger.warning(
+                "无法读取 Ollama 模型能力，将按模型名称判断 / "
+                "Could not inspect model capabilities: %s",
+                exc,
+            )
+            payload = {}
+        capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
+        if isinstance(capabilities, list):
+            if "vision" in {str(value).casefold() for value in capabilities}:
+                return
+            raise DirectorError(
+                f"模型 {self.model!r} 不支持看图，不能执行多视频视觉剪辑。"
+                "请安装视觉模型，例如：ollama pull qwen3.5:35b-a3b\n"
+                "The selected model has no vision capability. Install a vision model."
+            )
+        normalized = self.model.casefold().replace("_", "-")
+        known_vision_markers = (
+            "qwen3.5", "qwen2.5-vl", "gemma3", "llava", "minicpm-v",
+            "llama3.2-vision", "moondream",
+        )
+        if not any(marker in normalized for marker in known_vision_markers):
+            raise DirectorError(
+                f"无法确认模型 {self.model!r} 支持视觉输入。请改用 qwen3.5 等视觉模型。\n"
+                "Cannot confirm vision support for the selected model."
+            )
+
     def request_chunk(
-        self, chunk: Dict[str, Any], source_name: str
+        self,
+        chunk: Dict[str, Any],
+        source_name: str,
+        schema: Optional[Dict[str, Any]] = None,
+        include_images: bool = False,
     ) -> Dict[str, Any]:
         """
         Request one non-streaming, schema-constrained Ollama completion.
         请求一次非流式、受 JSON Schema 约束的 Ollama 生成。
         """
-        prompt = self.build_prompt(chunk, source_name)
+        selected_frames = (
+            self._select_keyframes(chunk.get("keyframes", []), limit=12)
+            if include_images
+            else list(chunk.get("keyframes", []))
+        )
+        images: List[str] = []
+        if include_images:
+            selected_frames, images = self._encode_images(selected_frames)
+        prompt_chunk = dict(chunk)
+        prompt_chunk["keyframes"] = selected_frames
+        active_schema = schema or DECISION_SCHEMA
+        prompt = self.build_prompt(prompt_chunk, source_name, active_schema)
+        return self._request_json(prompt, active_schema, images)
+
+    def _request_json(
+        self,
+        prompt: str,
+        schema: Dict[str, Any],
+        images: Sequence[str] = (),
+    ) -> Dict[str, Any]:
+        """
+        Send one schema-constrained Ollama request with optional real images.
+        发送一次受 Schema 约束、可包含真实图片的 Ollama 请求。
+        """
         payload: Dict[str, Any] = {
             "model": self.model,
             "system": (
-                "You are a conservative documentary film editor. Return only "
-                "the requested JSON. Never invent timestamps or content."
+                "You are a senior documentary editor and visual storyteller. "
+                "Use only supplied transcript, timestamps, and images. Return "
+                "only the requested JSON and never invent content."
             ),
             "prompt": prompt,
             "stream": False,
-            "format": DECISION_SCHEMA,
+            "format": schema,
+            "think": "high",
             "keep_alive": "10m",
             "options": {
                 "temperature": 0,
@@ -442,11 +903,21 @@ class AIDirector:
                 "num_ctx": self.num_ctx,
             },
         }
+        if images:
+            payload["images"] = list(images)
         url = self.base_url + "/api/generate"
         try:
             response = self.session.post(
                 url, json=payload, timeout=(10, self.timeout_sec)
             )
+            if getattr(response, "status_code", 0) == 400:
+                self.logger.warning(
+                    "Ollama 拒绝高强度思考参数，使用兼容模式重试 / Retrying without high thinking"
+                )
+                payload.pop("think", None)
+                response = self.session.post(
+                    url, json=payload, timeout=(10, self.timeout_sec)
+                )
             # Older Ollama builds accept "json" but not a schema object.
             if getattr(response, "status_code", 0) == 400:
                 self.logger.warning(
@@ -473,7 +944,12 @@ class AIDirector:
             )
         return self.parse_generated_json(generated)
 
-    def build_prompt(self, chunk: Dict[str, Any], source_name: str) -> str:
+    def build_prompt(
+        self,
+        chunk: Dict[str, Any],
+        source_name: str,
+        schema: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """
         Build a compact prompt grounded by absolute timestamps and schema.
         构建由绝对时间戳和 Schema 约束的紧凑提示词。
@@ -487,23 +963,32 @@ class AIDirector:
             for item in chunk["transcript"]
         ]
         keyframe_lines = [
-            "[{:.3f}] scene_score={} file={}".format(
+            "IMAGE_{} [{:.3f}s] scene_score={} file={}".format(
+                index,
                 float(item.get("timestamp_sec", 0)),
                 item.get("scene_score", "unknown"),
                 item.get("file_name", ""),
             )
-            for item in chunk["keyframes"]
+            for index, item in enumerate(chunk["keyframes"], start=1)
         ]
-        schema_text = json.dumps(DECISION_SCHEMA, ensure_ascii=False)
+        schema_text = json.dumps(schema or DECISION_SCHEMA, ensure_ascii=False)
         return (
-            "Analyze only this documentary window: "
+            "Analyze only this source-video window: "
             "{start:.3f}s to {end:.3f}s.\n"
-            "Select coherent ranges worth KEEPING. Use absolute source seconds, "
-            "not time relative to the chunk. Prefer complete sentences, remove "
-            "dead air/repetition, and use visual evidence only as supporting context. "
+            "Select coherent ranges worth keeping as documentary candidates. Use "
+            "absolute seconds in this source, not time relative to the chunk. "
+            "Inspect every attached image in the listed IMAGE order. Prefer complete "
+            "sentences, expressive visuals, stable/focused shots, meaningful B-roll, "
+            "and authentic moments; reject dead air, repetition, camera setup, severe "
+            "shake, accidental frames, and unusable audio. Suggest restrained effects "
+            "only from the schema enums. Stabilize only genuinely shaky shots; request "
+            "Magic Mask tracking only when a clear subject benefits from it. DRX names "
+            "refer to optional user-exported Resolve presets and should be 'none' unless "
+            "the look is clearly justified. Strong audio cleanup is for visibly/noisily "
+            "problematic speech; transitions should serve the story, not decorate it. "
             "Every range must remain inside this window and cut_out_sec must be "
             "greater than cut_in_sec. An empty decisions array is allowed.\n"
-            "Proxy media: {source}\n"
+            "Source/proxy media: {source}\n"
             "Required JSON schema: {schema}\n\n"
             "TRANSCRIPT:\n{transcript}\n\nKEYFRAMES:\n{keyframes}"
         ).format(
@@ -514,6 +999,269 @@ class AIDirector:
             transcript="\n".join(transcript_lines) or "(none)",
             keyframes="\n".join(keyframe_lines) or "(none)",
         )
+
+    def request_sequence(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        assets: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Ask the model to choose and order candidates across every source.
+        让模型跨全部素材选择并排序候选片段。
+        """
+        compact_candidates = []
+        for item in candidates:
+            compact_candidates.append(
+                {
+                    "candidate_id": item["candidate_id"],
+                    "asset_id": item.get("asset_id", ""),
+                    "source": Path(str(item["file_name"])).name,
+                    "in": item["cut_in_sec"],
+                    "out": item["cut_out_sec"],
+                    "story_role": item.get("story_role", "context"),
+                    "visual_summary": item.get("visual_summary", ""),
+                    "reason": item.get("reason_for_cut", ""),
+                    "confidence": item.get("confidence", 0.5),
+                    "quality_score": item.get("quality_score", 0.5),
+                    "suggested_transition": item.get("transition_to_next", "cut"),
+                    "suggested_audio": item.get("audio_cleanup", "light"),
+                    "suggested_look": item.get("color_look", "neutral"),
+                    "suggested_motion": item.get("motion", "static"),
+                    "suggested_volume_db": item.get("volume_db", 0.0),
+                    "suggested_drx": item.get("drx_preset", "none"),
+                    "suggested_stabilization": item.get("stabilization", "none"),
+                    "suggested_tracking": item.get("tracking", "none"),
+                    "suggested_smart_reframe": item.get("smart_reframe", False),
+                }
+            )
+        asset_names = [
+            {
+                "asset_id": asset.get("asset_id", ""),
+                "file": Path(str(asset.get("source_video") or "")).name,
+                "duration_sec": asset.get("duration_sec", 0),
+            }
+            for asset in assets
+        ]
+        prompt = (
+            "You have already inspected representative frames and transcripts "
+            "from every source video. Build one coherent documentary edit from "
+            "the candidate list below. Select only useful candidate_id values, "
+            "never invent or duplicate an id, and order them for narrative flow "
+            "rather than source-file order. Establish context, develop the story, "
+            "use B-roll to cover or bridge speech, avoid repetitive points, and "
+            "finish deliberately. Preserve complete thoughts. Choose restrained "
+            "transitions and effects from the schema; default to hard cuts, use "
+            "cross dissolves for genuine time/mood changes, and fade_black only "
+            "for major chapter endings. Return JSON only.\n"
+            f"Required JSON schema: {json.dumps(SEQUENCE_SCHEMA, ensure_ascii=False)}\n"
+            f"ASSETS:\n{json.dumps(asset_names, ensure_ascii=False)}\n"
+            f"CANDIDATES:\n{json.dumps(compact_candidates, ensure_ascii=False)}"
+        )
+        self.logger.info(
+            "正在进行跨素材全局编排（%d 个候选）/ Global story assembly (%d candidates)",
+            len(candidates),
+            len(candidates),
+        )
+        return self._request_json(prompt, SEQUENCE_SCHEMA)
+
+    def validate_sequence(
+        self,
+        payload: Dict[str, Any],
+        candidates: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Validate global ordering and apply only constrained effect overrides.
+        校验全局顺序，并仅应用受约束的效果覆盖。
+        """
+        sequence = payload.get("sequence")
+        if not isinstance(sequence, list) or not sequence:
+            raise DirectorError(
+                "全局导演未返回非空 sequence / Global director returned no sequence."
+            )
+        by_id = {str(item["candidate_id"]): item for item in candidates}
+        seen = set()
+        final: List[Dict[str, Any]] = []
+        for index, sequence_item in enumerate(sequence):
+            if not isinstance(sequence_item, dict):
+                raise DirectorError(f"sequence[{index}] 必须是对象 / must be an object.")
+            candidate_id = str(sequence_item.get("candidate_id") or "").strip()
+            if candidate_id not in by_id:
+                raise DirectorError(
+                    f"sequence[{index}] 引用了未知 candidate_id={candidate_id!r}"
+                    " / references an unknown candidate."
+                )
+            if candidate_id in seen:
+                raise DirectorError(
+                    f"sequence 重复 candidate_id={candidate_id!r} / duplicate candidate."
+                )
+            seen.add(candidate_id)
+            clip = dict(by_id[candidate_id])
+            clip["reason_for_position"] = " ".join(
+                str(sequence_item.get("reason_for_position") or "").split()
+            )
+            for key, allowed, default in (
+                (
+                    "transition_to_next",
+                    {"cut", "cross_dissolve", "fade_black"},
+                    str(clip.get("transition_to_next") or "cut"),
+                ),
+                (
+                    "audio_cleanup",
+                    {"none", "light", "strong"},
+                    str(clip.get("audio_cleanup") or "light"),
+                ),
+                (
+                    "color_look",
+                    {"source", "neutral", "warm", "cool", "contrast"},
+                    str(clip.get("color_look") or "neutral"),
+                ),
+                (
+                    "motion",
+                    {"static", "gentle_push_in"},
+                    str(clip.get("motion") or "static"),
+                ),
+                (
+                    "drx_preset",
+                    {"none", "interview_clean", "cinematic", "low_light_cleanup"},
+                    str(clip.get("drx_preset") or "none"),
+                ),
+                (
+                    "stabilization",
+                    {"none", "auto"},
+                    str(clip.get("stabilization") or "none"),
+                ),
+                (
+                    "tracking",
+                    {
+                        "none",
+                        "magic_mask_forward",
+                        "magic_mask_backward",
+                        "magic_mask_bidirectional",
+                    },
+                    str(clip.get("tracking") or "none"),
+                ),
+            ):
+                value = str(sequence_item.get(key) or default).strip().casefold()
+                clip[key] = value if value in allowed else default
+            transition_duration = self._finite_float(
+                sequence_item.get(
+                    "transition_duration_sec",
+                    clip.get("transition_duration_sec", 0.0),
+                ),
+                f"sequence[{index}].transition_duration_sec",
+            )
+            clip["transition_duration_sec"] = (
+                0.0
+                if clip["transition_to_next"] == "cut"
+                else round(min(2.0, max(0.1, transition_duration)), 3)
+            )
+            volume_db = self._finite_float(
+                sequence_item.get("volume_db", clip.get("volume_db", 0.0)),
+                f"sequence[{index}].volume_db",
+            )
+            clip["volume_db"] = round(min(12.0, max(-24.0, volume_db)), 2)
+            smart_reframe = sequence_item.get(
+                "smart_reframe", clip.get("smart_reframe", False)
+            )
+            clip["smart_reframe"] = (
+                smart_reframe if isinstance(smart_reframe, bool) else False
+            )
+            final.append(clip)
+        return final
+
+    def _encode_images(
+        self, frames: Sequence[Dict[str, Any]]
+    ) -> tuple[List[Dict[str, Any]], List[str]]:
+        """
+        Read selected JPEGs as Ollama REST base64 image inputs.
+        将选中的 JPEG 读取为 Ollama REST 所需的 Base64 图片输入。
+        """
+        available: List[Dict[str, Any]] = []
+        encoded: List[str] = []
+        for frame in frames:
+            path_text = str(frame.get("image_path") or "").strip()
+            if not path_text:
+                continue
+            path = Path(path_text).expanduser()
+            if not path.is_file():
+                self.logger.warning(
+                    "关键帧不存在，跳过：%s / Missing keyframe: %s", path, path
+                )
+                continue
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                self.logger.warning(
+                    "无法读取关键帧 %s：%s / Cannot read keyframe", path, exc
+                )
+                continue
+            available.append(dict(frame))
+            encoded.append(base64.b64encode(data).decode("ascii"))
+        return available, encoded
+
+    @staticmethod
+    def _select_keyframes(
+        raw_frames: object, limit: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Select time-distributed high-change frames for one vision request.
+        为一次视觉请求选择时间分布均匀且变化明显的画面。
+        """
+        if not isinstance(raw_frames, list):
+            return []
+        frames = [dict(item) for item in raw_frames if isinstance(item, dict)]
+        frames.sort(key=lambda item: float(item.get("timestamp_sec", 0.0)))
+        if len(frames) <= limit:
+            return frames
+        selected: List[Dict[str, Any]] = []
+        for bucket in range(limit):
+            start = int(bucket * len(frames) / limit)
+            end = max(start + 1, int((bucket + 1) * len(frames) / limit))
+            group = frames[start:end]
+            selected.append(
+                max(group, key=lambda item: float(item.get("scene_score", 0.0)))
+            )
+        selected.sort(key=lambda item: float(item.get("timestamp_sec", 0.0)))
+        return selected
+
+    @staticmethod
+    def _limit_candidates(
+        candidates: Sequence[Dict[str, Any]], limit: int
+    ) -> List[Dict[str, Any]]:
+        """Bound global context while retaining the strongest candidates. / 限制全局上下文并保留最强候选。"""
+        copied = [dict(item) for item in candidates]
+        if len(copied) <= limit:
+            return copied
+
+        def rank(item: Dict[str, Any]) -> tuple[float, float]:
+            return (
+                float(item.get("quality_score", 0.5))
+                + float(item.get("confidence", 0.5)),
+                float(item.get("cut_out_sec", 0))
+                - float(item.get("cut_in_sec", 0)),
+            )
+
+        # Keep every source represented before filling the global context
+        # budget. A long interview must not crowd all B-roll sources out.
+        by_asset: Dict[str, List[Dict[str, Any]]] = {}
+        for item in copied:
+            by_asset.setdefault(str(item.get("asset_id") or ""), []).append(item)
+        per_asset = max(1, min(4, limit // max(1, len(by_asset))))
+        selected: List[Dict[str, Any]] = []
+        selected_ids = set()
+        for group in by_asset.values():
+            for item in sorted(group, key=rank, reverse=True)[:per_asset]:
+                selected.append(item)
+                selected_ids.add(id(item))
+                if len(selected) == limit:
+                    return selected
+        remaining = sorted(
+            (item for item in copied if id(item) not in selected_ids),
+            key=rank,
+            reverse=True,
+        )
+        selected.extend(remaining[: max(0, limit - len(selected))])
+        return selected
 
     def validate_chunk_decisions(
         self,
@@ -567,6 +1315,33 @@ class AIDirector:
                 confidence, f"decisions[{index}].confidence"
             )
             confidence_value = min(1.0, max(0.0, confidence_value))
+            quality_value = self._finite_float(
+                decision.get("quality_score", confidence_value),
+                f"decisions[{index}].quality_score",
+            )
+            quality_value = min(1.0, max(0.0, quality_value))
+            story_role = self._enum_value(
+                decision.get("story_role"),
+                {
+                    "opening",
+                    "context",
+                    "interview",
+                    "broll",
+                    "bridge",
+                    "climax",
+                    "closing",
+                },
+                "context",
+            )
+            transition = self._enum_value(
+                decision.get("transition_to_next"),
+                {"cut", "cross_dissolve", "fade_black"},
+                "cut",
+            )
+            transition_duration = self._finite_float(
+                decision.get("transition_duration_sec", 0.0),
+                f"decisions[{index}].transition_duration_sec",
+            )
             validated.append(
                 {
                     "file_name": source_name,
@@ -574,6 +1349,70 @@ class AIDirector:
                     "cut_out_sec": round(cut_out, 3),
                     "reason_for_cut": reason,
                     "confidence": round(confidence_value, 3),
+                    "quality_score": round(quality_value, 3),
+                    "visual_summary": " ".join(
+                        str(decision.get("visual_summary") or reason).split()
+                    ),
+                    "story_role": story_role,
+                    "transition_to_next": transition,
+                    "transition_duration_sec": (
+                        0.0
+                        if transition == "cut"
+                        else round(min(2.0, max(0.1, transition_duration)), 3)
+                    ),
+                    "audio_cleanup": self._enum_value(
+                        decision.get("audio_cleanup"),
+                        {"none", "light", "strong"},
+                        "light",
+                    ),
+                    "color_look": self._enum_value(
+                        decision.get("color_look"),
+                        {"source", "neutral", "warm", "cool", "contrast"},
+                        "neutral",
+                    ),
+                    "motion": self._enum_value(
+                        decision.get("motion"),
+                        {"static", "gentle_push_in"},
+                        "static",
+                    ),
+                    "volume_db": round(
+                        min(
+                            12.0,
+                            max(
+                                -24.0,
+                                self._finite_float(
+                                    decision.get("volume_db", 0.0),
+                                    f"decisions[{index}].volume_db",
+                                ),
+                            ),
+                        ),
+                        2,
+                    ),
+                    "drx_preset": self._enum_value(
+                        decision.get("drx_preset"),
+                        {"none", "interview_clean", "cinematic", "low_light_cleanup"},
+                        "none",
+                    ),
+                    "stabilization": self._enum_value(
+                        decision.get("stabilization"),
+                        {"none", "auto"},
+                        "none",
+                    ),
+                    "tracking": self._enum_value(
+                        decision.get("tracking"),
+                        {
+                            "none",
+                            "magic_mask_forward",
+                            "magic_mask_backward",
+                            "magic_mask_bidirectional",
+                        },
+                        "none",
+                    ),
+                    "smart_reframe": (
+                        decision.get("smart_reframe", False)
+                        if isinstance(decision.get("smart_reframe", False), bool)
+                        else False
+                    ),
                 }
             )
         return validated
@@ -707,6 +1546,12 @@ class AIDirector:
         if not decimal_value.is_finite():
             raise DirectorError(f"{field_name} 必须是有限数值 / must be finite.")
         return float(decimal_value)
+
+    @staticmethod
+    def _enum_value(value: object, allowed: set, default: str) -> str:
+        """Return a constrained lower-case enum or its safe default. / 返回受约束的小写枚举或安全默认值。"""
+        text = str(value or default).strip().casefold()
+        return text if text in allowed else default
 
     @staticmethod
     def _atomic_write_json(payload: Dict[str, Any], destination: Path) -> None:

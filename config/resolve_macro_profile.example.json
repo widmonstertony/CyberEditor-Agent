@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0",
+  "expected_resolution": [3840, 2160],
+  "actions": {
+    "post_assembly": [
+      {"type": "wait", "seconds": 1.0},
+      {"type": "hotkey", "keys": ["ctrl", "shift", "x"]}
+    ]
+  }
+}
