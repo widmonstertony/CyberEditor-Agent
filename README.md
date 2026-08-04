@@ -16,11 +16,22 @@ PowerShell 中运行：
 输出目录等功能。现代界面使用轻量级 CustomTkinter，并通过
 子进程调用原有 `main.py`；常驻 UI 不导入 PyTorch，不会改变严格串行与显存释放策略。
 
+界面顶部提供“成片主题 / AI 导演要求”输入框：可以输入希望表达的主题、受众、节奏或
+结局（例如“从车友集合到共同出发的热血夜骑短片”）；留空则由 AI 根据全部素材自由发现
+主题。目标时长是上限与创作目标，不是填充指标；本地守门只补齐开场、发展、高潮和结尾，
+不会再强制每个源文件都进入成片，也不会用重复动作或倒计时凑时长。
+
 完整流程不是把所有视频简单首尾相接。每个素材会被依次转写并抽取时间分布均匀的真实
-画面；视觉模型对每个 10–15 分钟窗口结合画面和台词挑选候选片段，第二遍全局导演再从
-全部素材的候选中决定使用哪些、如何跨文件排序，以及硬切/叠化/淡黑、音频降噪、基础
-色彩风格、音量、防抖、跟踪和轻微推镜。最终可同时输出 Resolve 可编辑时间线、
+画面；AI 先根据全部素材生成包含主题、四段叙事节拍、目标时长、配色意图和音乐情绪的
+导演阐述，再让视觉模型对每个 10–15 分钟窗口结合画面和台词挑选候选片段。第二遍全局
+导演只保留服务主题的少数镜头；本地校验器强制按真实素材顺序与素材内时间码排列，并限制
+单镜头与总成片时长。它同时规划硬切/叠化/淡黑、音频降噪、创意色彩、音量、防抖、跟踪、
+轻微推镜，以及由双导演流程选择并预混的 1–3 段配乐。最终可同时输出 Resolve 可编辑时间线、
 FFmpeg 1080p 审片预览，以及由 Resolve Deliver 页面真正渲染的最终成片。
+
+在线找歌使用严格清单：旧下载缓存不能冒充用户本地音乐，访谈、播客、解说和节目类结果
+会在下载与分析阶段被拒绝。整片只采用一个全局创意调色基线；S-Log 编码域内测得的曝光/
+白平衡统计不会在技术还原后被错误套用，避免逐镜头冷暖和亮度漂移。
 
 “性能配置”默认使用 `自动检测 / Auto`：界面以标准库读取 CPU、系统内存和 GPU，
 通过 `nvidia-smi`（可用时）读取准确显存，并在一次性子进程中确认当前 PyTorch 是否
@@ -60,6 +71,23 @@ UI 启动时会检测本机 Ollama；若已安装但服务未运行，会自动�
 并可能为 8-bit 或 10-bit 4:2:2。对于常见的 PP8 4K 10-bit 4:2:2 素材以及本项目的
 外部自动组装流程，建议直接安装 Resolve Studio。
 
+提取器现在优先读取每条 Sony `CxxxxM01.XML` 伴随文件，不再把整批素材强行当成
+同一种 PP8。S-Log2/S-Gamut、S-Log3/S-Gamut3 和 S-Log3/S-Gamut3.Cine 会分别
+映射为 Resolve 的逐素材输入变换；XML 缺失时才使用界面中的显式回退配置。工程工作
+空间统一为：
+
+```text
+每条素材的 Sony XML 输入色彩空间 / Gamma
+        → DaVinci Wide Gamut / Intermediate
+        → Rec.709 Gamma 2.4
+```
+
+OpenCV 会在关键帧上估计中性像素、亮度与 RGB 平衡，按整批素材的中位参考生成受限
+修正（曝光 ±1.5EV、RGB 增益 0.667–1.5）；低置信度结果自动向“不修正”收敛，避免
+把有意的彩色灯光强行校白。任何 Log 素材的关键 Resolve 设置被拒绝都会停止执行，
+不再静默输出灰片。FFmpeg 预览对 S-Log3 应用技术 LUT；混入 S-Log2 时以最终 Resolve
+RCM 输出为准，绝不会错误套用 S-Log3 LUT。
+
 参考：
 [Blackmagic Design 版本对比](https://www.blackmagicdesign.com/products/davinciresolve)、
 [Resolve Studio 脚本与自动化](https://www.blackmagicdesign.com/products/davinciresolve/studio)、
@@ -84,8 +112,17 @@ MP4，并调用 DaVinci Resolve Python API 组装可继续精修的时间线。
 Whisper + OpenCV 子进程
           │ 完全退出，Windows 回收 CUDA 上下文
           ▼
-Ollama 分块导演子进程
-          │ keep_alive=0 + 父进程二次卸载
+Qwen3.6 音乐导演初审（代表帧 + 台词 + 剧情）
+          │ 写出 music_brief.json，keep_alive=0 完全卸载
+          ▼
+CPU 联网/本地找歌 + Librosa/FFmpeg 音乐听诊
+          │ 节拍、强拍、段落、调性、动态范围、LUFS；0 GPU
+          ▼
+Qwen3.6 最终导演（镜头 + 1–3 段 cue + 留白 + 高潮命中点）
+          │ 写出 timeline_cuts.json，keep_alive=0 完全卸载
+          ▼
+FFmpeg CPU 合成 music_bed.wav
+          │ 换歌、淡化、响度统一、对白 ducking
           ▼
 FFmpeg 预览渲染子进程
           │ 生成真实转场、降噪与基础运动效果
@@ -97,26 +134,62 @@ DaVinci Resolve 执行子进程
 - 父调度器不导入 PyTorch、Whisper、OpenCV、requests 或 Resolve API。
 - 任意时刻最多存在一个项目重型子进程。
 - Ollama `/api/ps` 若发现其他模型驻留，会拒绝加载导演模型。
-- 导演每次只处理 10–15 分钟数据，默认 12 分钟。
+- 导演每次只处理一个 10–15 分钟分析窗口（默认 12 分钟），这不是素材数量或
+  总时长上限。多个视频及一小时以上素材会拆成多个窗口串行审片，再统一编排。
 - `timeline_cuts.json` 只在所有分块成功、校验和合并后原子写入。
 
-## 四阶段自动成片能力
+## 为什么默认改用 Qwen3.6-27B Dense Q8
+
+- `qwen3.6:27b-mtp-q8_0` 是 27B 全量稠密、原生图文模型，约 30GB；Q8 接近原始
+  权重精度，适合 16GB VRAM + 64GB RAM 混合推理。
+- 官方视频理解评测中，27B 在 VideoMME、VideoMMMU、MLVU、MVBench 上整体高于
+  只激活约 3B 参数的 35B-A3B。后者更快，但本项目优先剪辑判断质量。
+- 旧 `Qwen2.5 72B Q5` 虽有更多参数，但模型代际更早、纯文本且约 54GB；参数数量
+  不能直接抵消 3.6 的新训练、原生视觉与指令遵循优势，因此不再作为默认导演。
+
+同一 Qwen3.6 模型先结合关键帧与台词生成候选，再进行纯文字全局编排；始终只有一个
+模型驻留，也避免卸载、加载另一套 54GB 权重。分页文件脚本仍用于给 Windows 和长上下文
+保留安全余量：
+
+```powershell
+# 右键 scripts\configure_pagefile_admin.cmd，选择“以管理员身份运行”
+# 默认保留 C: 4–8GB，并在 D: 创建 32–48GB；脚本不会自动重启。
+```
+
+## 六阶段双导演自动成片能力
 
 当前实现对应以下严格串行链路：
 
 1. **提取期**：每个视频单独启动 Whisper/OpenCV 子进程，写入台词、真实 JPEG
    关键帧和素材元数据；每个子进程退出后，父调度器再执行显存释放屏障。
-2. **思考期**：视觉 Ollama 模型以 10–15 分钟窗口审片，再进行一次跨全部素材的
-   全局编排，原子生成 `timeline_cuts.json`；随后发送 `keep_alive: 0` 并由父进程
-   二次确认卸载。UI 会自动列出本机已安装模型；当前推荐的
-   `qwen3.5:35b-a3b` 是 36B Q4 MoE 视觉推理模型，不会被错误标成 70B。
-3. **执行期**：Resolve 原生 API 完成素材导入、按源素材 FPS 换帧、拼接、Voice
+2. **音乐导演初审**：Qwen3.6 读取跨素材代表帧、台词和拍摄顺序，先确定主题、情绪
+   弧线、检索词、乐器、BPM 范围、人声策略、1–3 个 cue 和有意留白，分别写入
+   `director_treatment.json` 与 `music_brief.json`，随后完全卸载。
+3. **候选获取与听诊（CPU）**：可选本地授权曲库、带许可证链接的 Jamendo，或显式
+   确认后的 yt-dlp 任意在线模式。Librosa/FFmpeg 提取 BPM、全部节拍、强拍、近似
+   downbeat、能量段落、调性、动态范围和 EBU R128 LUFS，写入 `music_analysis.json`。
+4. **最终导演**：Qwen3.6 再次加载，以 10–15 分钟窗口结合画面与台词审片并落盘
+   检查点，最后跨全部素材和已听诊曲目统一编排。镜头时长按角色动态限制：B-roll 10 秒、
+   桥段 12 秒、语境 20 秒、高潮 25 秒、结尾 30 秒、完整采访语义最长 45 秒。
+   纯画面出点可在 ±0.25 秒内吸附鼓点，对话与结尾绝不为卡点截断。
+5. **音乐床与执行期**：模型卸载后，FFmpeg 在 CPU 上按 cue 表裁切 1–3 首音乐、
+   淡入淡出、响度匹配、对白 ducking 并生成确定性的 `music_bed.wav`。Resolve 只需
+   将这一条音乐床导入 A2，再由原生 API 完成素材导入、按源素材 FPS 换帧、拼接、Voice
    Isolation、基础 CDL、`Stabilize()`、`CreateMagicMask()` 和 `SmartReframe()`；
    用户导出的 DRX 通过节点图 `ApplyGradeFromDRX()` 注入。Resolve 21 已原生公开
    防抖与 Magic Mask 接口，因此默认不使用脆弱的坐标宏。
-4. **导出期**：启用 UI 中“Resolve 导出最终成片”后，执行器创建 Render Job、启动
+6. **导出期**：启用 UI 中“Resolve 导出最终成片”后，执行器创建 Render Job、启动
    渲染、持续报告百分比并校验完成状态；默认沿用当前 Deliver 页面格式/编码设置，
    也可填写一个现有的 Resolve 渲染预设名。
+
+### 任意在线音频模式与版权
+
+UI 默认提供“任意在线音频 · 效果优先”，但**每次运行都必须重新确认**；确认不会保存。
+该模式使用 yt-dlp 搜索和下载候选，不使用 Cookie、DRM 绕过或登录自动化。项目会保存
+来源 URL、用户本次声明、许可证字段和文件 SHA-256 到审计 JSON。可下载或确认弹窗都不
+等于获得版权：用户必须自行拥有下载、改编、与画面同步和发布所需的权利，并遵守来源
+平台条款；商用前必须取得覆盖商用、改编和同步的明确授权。公开项目更稳妥的默认做法是
+改选本地授权曲库或 Jamendo 可验证许可证模式。
 
 ### DRX、Fairlight 与 UI 宏
 
@@ -166,7 +239,9 @@ CyberEditor-Agent/
 │  ├─ media_manifest.py          # 多视频/文件夹发现、去重与代理映射
 │  ├─ ui_i18n.py                 # 不依赖 GUI 包的中英文文案
 │  ├─ extractor.py               # Whisper + OpenCV 数据提取
-│  ├─ director.py                # 多模态分块审片 + 跨素材全局导演
+│  ├─ director.py                # 双导演初审、分块审片、多 cue 全局编排
+│  ├─ music_analyzer.py          # 本地/Jamendo/yt-dlp 获取与 CPU 音乐听诊
+│  ├─ music_bed.py               # 多曲裁切、淡化、ducking 与音乐床合成
 │  ├─ review_renderer.py         # FFmpeg 可观看预览与效果渲染
 │  ├─ resolve_macro.py           # 受保护的可选 PyAutoGUI 后备层
 │  └─ resolve_executor.py        # DaVinci Resolve 自动组装与效果映射
@@ -181,6 +256,8 @@ CyberEditor-Agent/
    ├─ test_director.py
    ├─ test_extractor.py
    ├─ test_gui.py
+   ├─ test_music_analyzer.py
+   ├─ test_music_bed.py
    ├─ test_orchestrator.py
    ├─ test_runtime_services.py
    └─ test_resolve_executor.py
@@ -202,17 +279,15 @@ CyberEditor-Agent/
 
 | 设备 | Whisper | Ollama 建议 | 说明 |
 |---|---|---|---|
-| 核显/纯 CPU | `tiny` / `base` | Qwen 3.5 4B/9B Q4 | 慢，但整个流程仍可运行 |
-| 8–12GB VRAM | `small` / `turbo` | `qwen3.5:9b-q4_K_M` | 6.6GB，中文与长上下文表现好 |
-| 16GB VRAM | `large-v3` | `qwen3.5:9b-q8_0` | 约 11GB，可完整放入显存，推荐日常高质量档 |
-| 16GB VRAM + 64GB RAM | `large-v3` | `qwen3.5:35b-a3b` | 约 24GB，CPU/GPU 混合，质量优先且更慢 |
-| 24GB+ VRAM | `large-v3` | Qwen 3.5 27B/35B | 仍建议保留串行策略 |
+| 核显/纯 CPU | `tiny` / `base` | Qwen 3.6 27B Q4（很慢） | 可运行但建议更小视觉模型 |
+| 8–12GB VRAM | `small` / `turbo` | `qwen3.6:27b-mtp-q4_K_M` | 约 18GB，RAM/GPU 混合 |
+| 16GB VRAM | `large-v3` | `qwen3.6:27b-mtp-q4_K_M` | 约 18GB，大部分权重可卸载至 GPU |
+| 16GB VRAM + 64GB RAM | `large-v3` | `qwen3.6:27b-mtp-q8_0` | 约 30GB，稠密 Q8，质量优先默认档 |
+| 24GB+ VRAM | `large-v3` | Qwen 3.6 27B Q8 | 仍建议保留串行策略 |
 
-对本项目而言，当前的 `qwen2.5:3b` 适合功能测试，不是高质量纪录片剪辑模型。
-你的 16GB Quadro + 64GB RAM 可优先选择 `qwen3.5:35b-a3b`；若希望更稳定地
-全 GPU 运行，则选择 `qwen3.5:9b-q8_0`。混合卸载的实际速度取决于量化、内存带宽
-和上下文长度。Qwen 3.5 官方模型同时支持视觉、工具、推理与 201 种语言：
-[Qwen 3.5 on Ollama](https://ollama.com/library/qwen3.5)。
+你的 16GB Quadro + 64GB RAM 默认选择 `qwen3.6:27b-mtp-q8_0`；若更看重速度和
+磁盘空间，则选择 Q4_K_M。两者都支持文字、图片与思考模式：
+[Qwen 3.6 on Ollama](https://ollama.com/library/qwen3.6)。
 
 Whisper 官方列出的近似显存占用从 tiny/base 的约 1GB 到 turbo 的约 6GB：
 [OpenAI Whisper README](https://github.com/openai/whisper#available-models-and-languages)。
@@ -270,16 +345,16 @@ Whisper 需要系统 FFmpeg；其官方安装和 Python 调用方式见
 
 ### 3. 准备 Ollama
 
-质量优先（16GB VRAM + 64GB RAM，下载约 24GB，运行较慢）：
+质量优先（16GB VRAM + 64GB RAM，下载约 30GB，运行较慢）：
 
 ```powershell
-ollama pull qwen3.5:35b-a3b
+ollama pull qwen3.6:27b-mtp-q8_0
 ```
 
-更快且可完整放入 16GB 显存的高质量选择（约 11GB）：
+更快、更省磁盘的高质量选择（约 18GB）：
 
 ```powershell
-ollama pull qwen3.5:9b-q8_0
+ollama pull qwen3.6:27b-mtp-q4_K_M
 ```
 
 模型只需下载一次。之后 UI 会自动启动 Ollama 服务并优先选择已安装的高质量模型，
@@ -308,7 +383,7 @@ Studio 的 External Scripting 仍需预先设置一次为 `Local`。
 ```powershell
 python main.py `
   --input-folder "D:\Documentary\Camera originals" `
-  --ollama-model "qwen3.5:35b-a3b" `
+  --ollama-model "qwen3.6:27b-mtp-q8_0" `
   --project-fps 23.976 `
   --chunk-minutes 10
 ```
@@ -320,7 +395,7 @@ python main.py `
   --video "D:\Shoot\A001.mp4" `
   --video "D:\Shoot\B001.mp4" `
   --input-folder "D:\Shoot\B-roll" `
-  --ollama-model "qwen3.5:35b-a3b"
+  --ollama-model "qwen3.6:27b-mtp-q8_0"
 ```
 
 默认输出：
@@ -329,7 +404,12 @@ python main.py `
 data/raw_data.json
 data/assets/<asset_id>/transcript.srt
 data/assets/<asset_id>/keyframes/*.jpg
+data/director_treatment.json
+data/music_brief.json
+data/music_analysis.json
 data/timeline_cuts.json
+data/music/music_bed.wav
+data/music/music_bed.audit.json
 data/review/CyberEditor_preview.mp4
 data/cybereditor.log
 ```
@@ -342,7 +422,19 @@ data/cybereditor.log
 # 已有 raw_data.json，只重跑导演与 Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen2.5:32b"
+  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --creative-brief "按拍摄时间讲述团队从准备到完成动作的过程" `
+  --target-duration-sec 80 `
+  --camera-profile sony_pp8_slog3_sgamut3cine `
+  --music-provider local `
+  --music-folder "D:\Music\Licensed"
+
+# 任意在线候选（更推荐在 UI 中运行，以看到完整、不可跳过的警告）
+python main.py --skip-extraction --skip-resolve `
+  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --music-provider yt_dlp --music-candidate-limit 8 `
+  --music-rights-confirmed `
+  --music-rights-claim "我拥有下载、改编、同步和使用候选音频所需的权利，并会遵守来源平台条款"
 
 # 已有 timeline_cuts.json，只执行 Resolve
 python main.py --skip-extraction --skip-director `
@@ -357,6 +449,8 @@ python main.py --video "D:\source.mov" --skip-resolve
 ```powershell
 python -m src.extractor --help
 python -m src.director --help
+python -m src.music_analyzer --help
+python -m src.music_bed --help
 python -m src.review_renderer --help
 python -m src.resolve_executor --help
 ```
@@ -366,6 +460,8 @@ python -m src.resolve_executor --help
 ```python
 from src.extractor import MediaExtractor
 from src.director import AIDirector
+from src.music_analyzer import LicensedMusicAnalyzer
+from src.music_bed import MusicBedRenderer
 from src.resolve_executor import DaVinciExecutor
 ```
 
@@ -375,7 +471,46 @@ from src.resolve_executor import DaVinciExecutor
 
 ```json
 {
-  "project_fps": 25.0,
+  "schema_version": "3.0",
+  "project_fps": 59.94,
+  "director_treatment": {
+    "title": "从准备到同步",
+    "central_theme": "混乱的准备最终凝聚成准确的团队动作",
+    "chronology_policy": "strict_chronological",
+    "target_duration_sec": 82.5,
+    "creative_look": "cinematic_warm"
+  },
+  "color_pipeline": {
+    "camera_profile": "sony_pp8_slog3_sgamut3cine",
+    "input_color_space": "Sony S-Gamut3.Cine",
+    "input_gamma": "S-Log3",
+    "timeline_color_space": "DaVinci WG",
+    "timeline_gamma": "DaVinci Intermediate",
+    "output_color_space": "Rec.709",
+    "output_gamma": "Gamma 2.4"
+  },
+  "music_plan": {
+    "mode": "multi_cue_pre_mix",
+    "bed_file": "D:\\Project\\data\\music\\music_bed.wav",
+    "strategy": "克制开场，发展段渐强，结尾留白",
+    "silence_regions": [
+      {"timeline_in_sec": 36.0, "timeline_out_sec": 39.0, "reason": "保留关键对白"}
+    ],
+    "cues": [
+      {
+        "cue_id": "M1",
+        "track_file": "restrained-build.wav",
+        "timeline_in_sec": 0.0,
+        "timeline_out_sec": 36.0,
+        "track_in_sec": 12.0,
+        "track_out_sec": 48.0,
+        "target_lufs": -24.0,
+        "duck_under_dialogue_db": -9.0,
+        "source_url": "https://example.invalid/source",
+        "license": "用户提供的授权记录"
+      }
+    ]
+  },
   "clips": [
     {
       "clip_id": 1,
@@ -405,12 +540,12 @@ from src.resolve_executor import DaVinciExecutor
 - Resolve 公共脚本 API 没有稳定的通用转场插入方法。FFmpeg 预览会真正执行 AI 选择
   的转场/降噪/运动效果；Resolve 时间线应用 Voice Isolation、CDL、缩放等受支持效果，
   并用片段标记保留完整效果计划，供后续人工精修。
-- 脚本会复用当前 Resolve 时间线；如果没有当前时间线，才创建
-  `CyberEditor Timeline`。
+- 普通 Rec.709 计划可复用当前空工程；需要 PP8 技术还原且当前工程已有时间线时，脚本
+  会创建独立 `Director Cut` 工程，防止全局色彩设置污染已有项目。
 - 如果中途某个 Resolve 片段追加失败，API 没有可靠事务回滚；日志会指出已追加
   数量，用户需要检查时间线并撤销。
 - 视觉理解由支持图片输入的 Ollama 模型完成。普通 `qwen2.5:3b` 是纯文本烟雾测试
-  模型，不能用于此多模态流程；推荐 Qwen 3.5 或其他 Ollama 报告 `vision` 能力的模型。
+  模型，不能用于此多模态流程；质量优先时建议使用 `qwen3.6:27b-mtp-q8_0`。
 
 ## 测试
 

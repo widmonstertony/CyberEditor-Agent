@@ -39,6 +39,7 @@ from .runtime_services import (
     ensure_ollama_service,
     find_ollama_executables,
     find_resolve_executable,
+    get_resolve_registration,
 )
 from .media_manifest import MediaManifestError, discover_video_files
 
@@ -405,7 +406,7 @@ def detect_torch_runtime() -> Dict[str, object]:
     )
     try:
         result = subprocess.run(
-            [sys.executable, "-c", script],
+            [console_python_executable(sys.executable), "-c", script],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -461,7 +462,11 @@ def recommend_automatic_settings(
     else:
         whisper_model = "base"
 
-    if ram_gb >= 64:
+    # Windows commonly reports a nominal 64 GiB machine as ~63.8 GiB.
+    # Treat 60+ GiB as the 64 GiB class instead of accidentally dropping it
+    # to the 8K balanced profile.
+    # Windows 常把标称 64 GiB 显示为约 63.8 GiB；60 GiB 以上按 64 GiB 档处理。
+    if ram_gb >= 60:
         # Shorter chunks preserve local narrative detail.  More model calls are
         # slower but produce better edit decisions for hour-long footage.
         # 更短的分块能保留局部叙事细节；调用次数更多但长视频剪辑决策更细致。
@@ -495,6 +500,8 @@ def recommend_automatic_settings(
         # long-context reasoning, and quantization—not simply file size.
         # 剪辑质量取决于指令遵循、中文、长上下文与量化，而非只看文件大小。
         family_scores = (
+            ("qwen3.6:27b", 1200.0),
+            ("qwen3.6:35b-a3b", 1160.0),
             ("qwen3.5:35b-a3b", 1000.0),
             ("qwen3.5:27b", 980.0),
             ("qwen3.5:9b", 940.0),
@@ -524,6 +531,22 @@ def recommend_automatic_settings(
         if selected_pool
         else ""
     )
+    text_director_candidates = [
+        item for item in all_models
+        if any(
+            marker in item[0].casefold()
+            for marker in (
+                "qwen3.6:27b",
+                "qwen3.6:35b-a3b",
+                "qwen2.5:72b",
+                "qwen2.5:70b",
+            )
+        )
+    ]
+    director_model = (
+        max(text_director_candidates, key=lambda item: (item[2], item[1]))[0]
+        if text_director_candidates else selected_model
+    )
     return {
         "profile": profile,
         "whisper_model": whisper_model,
@@ -531,6 +554,7 @@ def recommend_automatic_settings(
         "chunk_minutes": chunk_minutes,
         "num_ctx": num_ctx,
         "ollama_model": selected_model,
+        "director_model": director_model,
         "model_budget_gb": round(model_budget_gb, 1),
     }
 
@@ -591,11 +615,14 @@ def build_runtime_environment() -> Dict[str, str]:
             candidates.append(executable.parent)
     existing = environment.get("PATH", "").split(os.pathsep)
     normalized = {item.casefold() for item in existing if item}
-    prefixes = [
-        str(path)
-        for path in candidates
-        if path.is_dir() and str(path).casefold() not in normalized
-    ]
+    prefixes: List[str] = []
+    for path in candidates:
+        try:
+            available = path.is_dir()
+        except OSError:
+            available = False
+        if available and str(path).casefold() not in normalized:
+            prefixes.append(str(path))
     if prefixes:
         environment["PATH"] = os.pathsep.join(prefixes + existing)
     environment["PYTHONUNBUFFERED"] = "1"
@@ -713,11 +740,21 @@ class WorkflowOptions:
     whisper_model: str = "small"
     whisper_device: str = "auto"
     language: str = ""
-    ollama_model: str = "qwen2.5:3b"
+    ollama_model: str = "qwen3.6:27b-mtp-q8_0"
+    director_model: str = ""
     ollama_url: str = "http://localhost:11434"
     chunk_minutes: float = 12.0
     project_fps: float = 25.0
     num_ctx: int = 8192
+    creative_brief: str = ""
+    target_duration_sec: float = 0.0
+    camera_profile: str = "sony_pp8_slog3_sgamut3cine"
+    music_folder: str = ""
+    music_provider: str = "off"
+    music_candidate_limit: int = 8
+    jamendo_client_id: str = ""
+    music_rights_confirmed: bool = False
+    music_rights_claim: str = ""
     timeline_name: str = "CyberEditor Timeline"
     project_name: str = "CyberEditor Project"
     skip_resolve: bool = True
@@ -798,6 +835,35 @@ class WorkflowOptions:
             raise ValueError("项目 FPS 必须大于 0 / Project FPS must be positive.")
         if int(self.num_ctx) < 2048:
             raise ValueError("Ollama 上下文至少为 2048 / Ollama context must be >= 2048.")
+        if float(self.target_duration_sec) < 0:
+            raise ValueError("目标时长不能为负数 / Target duration cannot be negative.")
+        if self.camera_profile not in {
+            "sony_pp8_slog3_sgamut3cine", "rec709", "auto"
+        }:
+            raise ValueError("未知相机色彩配置 / Unknown camera color profile.")
+        if self.music_folder and not _absolute_path(
+            self.music_folder, project_root
+        ).is_dir():
+            raise ValueError(
+                f"配乐目录不存在 / Music folder not found:\n{self.music_folder}"
+            )
+        if self.music_provider not in {"off", "local", "jamendo", "yt_dlp"}:
+            raise ValueError("未知配乐来源 / Unknown music provider.")
+        if self.music_provider == "local" and not self.music_folder:
+            raise ValueError(
+                "本地配乐模式需要选择曲库文件夹 / Local music mode requires a library folder."
+            )
+        if self.music_provider == "jamendo" and not self.jamendo_client_id.strip():
+            raise ValueError("Jamendo 模式需要 client_id / Jamendo mode requires a client_id.")
+        if self.music_provider == "yt_dlp" and (
+            not self.music_rights_confirmed or not self.music_rights_claim.strip()
+        ):
+            raise ValueError(
+                "任意在线音频模式需要本次运行的版权与平台条款确认。 / "
+                "Arbitrary online audio requires per-run rights and platform-terms confirmation."
+            )
+        if not 1 <= int(self.music_candidate_limit) <= 12:
+            raise ValueError("候选配乐数量必须为 1–12 / Music candidate limit must be 1–12.")
         if self.render_final and self.skip_resolve:
             raise ValueError(
                 "最终渲染需要启用 Resolve / Final rendering requires Resolve."
@@ -834,6 +900,8 @@ class WorkflowOptions:
             self.whisper_device,
             "--ollama-model",
             self.ollama_model,
+            "--director-model",
+            self.director_model or self.ollama_model,
             "--ollama-url",
             self.ollama_url,
             "--chunk-minutes",
@@ -842,6 +910,10 @@ class WorkflowOptions:
             str(self.project_fps),
             "--num-ctx",
             str(self.num_ctx),
+            "--target-duration-sec",
+            str(self.target_duration_sec),
+            "--camera-profile",
+            self.camera_profile,
             "--timeline-name",
             self.timeline_name,
             "--project-name",
@@ -849,6 +921,25 @@ class WorkflowOptions:
             "--log-level",
             "INFO",
         ]
+        if self.creative_brief.strip():
+            command.extend(["--creative-brief", self.creative_brief.strip()])
+        if self.music_folder.strip():
+            command.extend(
+                ["--music-folder", str(_absolute_path(self.music_folder, project_root))]
+            )
+        command.extend(
+            [
+                "--music-provider",
+                self.music_provider,
+                "--music-candidate-limit",
+                str(self.music_candidate_limit),
+            ]
+        )
+        if self.jamendo_client_id.strip():
+            command.extend(["--jamendo-client-id", self.jamendo_client_id.strip()])
+        if self.music_rights_confirmed:
+            command.append("--music-rights-confirmed")
+            command.extend(["--music-rights-claim", self.music_rights_claim.strip()])
         explicit_videos = self.videos or ([self.video] if self.video else [])
         for video in explicit_videos:
             command.extend(
@@ -1106,7 +1197,7 @@ class CyberEditorApp:
         self.whisper_var = tk.StringVar(value="small")
         self.device_var = tk.StringVar(value="auto")
         self.language_var = tk.StringVar()
-        self.ollama_model_var = tk.StringVar(value="qwen2.5:3b")
+        self.ollama_model_var = tk.StringVar(value="qwen3.6:27b-mtp-q8_0")
         self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
         self.chunk_var = tk.DoubleVar(value=12.0)
         self.fps_var = tk.DoubleVar(value=25.0)
@@ -1318,7 +1409,11 @@ class CyberEditorApp:
             "Ollama 模型",
             ttk.Combobox,
             textvariable=self.ollama_model_var,
-            values=("qwen2.5:3b", "qwen2.5:14b", "qwen2.5:32b"),
+            values=(
+                "qwen3.6:27b-mtp-q8_0",
+                "qwen3.6:27b-mtp-q4_K_M",
+                "qwen3.6:35b-a3b-mtp-q4_K_M",
+            ),
         )
         self._field(
             grid,
@@ -2086,10 +2181,21 @@ class CyberEditorApp:
         ):
             results["Ollama"] = (False, "未连接")
 
-        resolve_ready = find_resolve_executable() is not None
+        resolve_path = find_resolve_executable()
+        resolve_registration = get_resolve_registration()
+        resolve_version = str(resolve_registration.get("version") or "").strip()
+        resolve_ready = bool(resolve_registration.get("installed")) and resolve_path is not None
         results["Resolve"] = (
             resolve_ready,
-            "已安装 · 执行时自动启动" if resolve_ready else "未安装",
+            (
+                f"已注册 {resolve_version or 'Resolve'} · API 连接时确认 Studio"
+                if resolve_ready
+                else f"已注册 {resolve_version or 'Resolve'} · 缺少启动目标"
+                if bool(resolve_registration.get("installed"))
+                else "找到程序 · 注册信息缺失"
+                if resolve_path is not None
+                else "未安装"
+            ),
         )
         hardware = detect_hardware()
         hardware.update(detect_torch_runtime())

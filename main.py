@@ -59,23 +59,78 @@ class WorkflowLock:
         """Acquire the lock atomically and record the owner PID. / 原子获取锁并记录所有者 PID。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self.fd = os.open(
-                str(self.path),
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            )
-            os.write(self.fd, str(os.getpid()).encode("ascii"))
+            self._acquire()
         except FileExistsError as exc:
             owner = "unknown"
             try:
                 owner = self.path.read_text(encoding="ascii").strip() or owner
             except OSError:
                 pass
+            if owner.isdecimal() and not self._pid_is_running(int(owner)):
+                try:
+                    self.path.unlink()
+                    self._acquire()
+                    return self
+                except FileNotFoundError:
+                    try:
+                        self._acquire()
+                        return self
+                    except FileExistsError:
+                        pass
+                except FileExistsError:
+                    pass
             raise WorkflowError(
                 f"检测到另一个工作流或遗留锁文件：{self.path}（PID={owner}）。"
                 "确认没有任务运行后删除该文件。\n"
                 f"Another workflow or stale lock exists at {self.path} (PID={owner})."
             ) from exc
         return self
+
+    def _acquire(self) -> None:
+        """Create this lock atomically. / 原子创建本锁文件。"""
+        self.fd = os.open(
+            str(self.path),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        )
+        os.write(self.fd, str(os.getpid()).encode("ascii"))
+
+    @staticmethod
+    def _pid_is_running(pid: int) -> bool:
+        """Return whether a lock-owner PID still exists. / 判断锁所有者进程是否仍存在。"""
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            # ``os.kill(pid, 0)`` is not a harmless existence probe on Windows:
+            # CPython maps non-console signals to TerminateProcess. Query a
+            # limited process handle instead so stale-lock recovery can never
+            # terminate the workflow it is checking.
+            # Windows 上 ``os.kill(pid, 0)`` 并非无副作用的存在性检查；改用只读
+            # 进程句柄查询，确保遗留锁恢复绝不会终止被检查的工作流。
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = (
+                ctypes.c_ulong,
+                ctypes.c_int,
+                ctypes.c_ulong,
+            )
+            open_process.restype = ctypes.c_void_p
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = (ctypes.c_void_p,)
+            close_handle.restype = ctypes.c_int
+            handle = open_process(0x1000, False, pid)
+            if handle:
+                close_handle(handle)
+                return True
+            return ctypes.get_last_error() == 5
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            return True
+        except (OSError, OverflowError, ValueError):
+            return False
+        return True
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         """Close and remove only the lock acquired by this process. / 关闭并仅删除本进程获取的锁。"""
@@ -249,6 +304,17 @@ class WorkflowOrchestrator:
                     len(assets),
                 )
 
+            treatment_path = self.data_dir / "director_treatment.json"
+            music_brief = self.data_dir / "music_brief.json"
+            music_analysis = self.data_dir / "music_analysis.json"
+            music_cache = self.data_dir / "music-candidates"
+            music_bed = self.data_dir / "music" / "music_bed.wav"
+            provider = str(getattr(args, "music_provider", "off") or "off")
+            # Preserve older CLI/UI integrations: supplying a local folder means
+            # local-provider mode even when the new flag is absent.
+            if provider == "off" and getattr(args, "music_folder", None):
+                provider = "local"
+
             if not args.skip_director:
                 try:
                     _, ollama_started = ensure_ollama_service(
@@ -262,6 +328,100 @@ class WorkflowOrchestrator:
                         "已自动启动 Ollama 服务（尚未加载模型）"
                         " / Ollama service auto-started; no model is loaded yet"
                     )
+                preliminary_command = [
+                    self.python_executable,
+                    "-m",
+                    "src.director",
+                    "--raw-data",
+                    str(raw_data),
+                    "--model",
+                    args.ollama_model,
+                    "--text-model",
+                    args.director_model or args.ollama_model,
+                    "--ollama-url",
+                    args.ollama_url,
+                    "--chunk-minutes",
+                    str(args.chunk_minutes),
+                    "--project-fps",
+                    str(args.project_fps),
+                    "--num-ctx",
+                    str(args.num_ctx),
+                    "--target-duration-sec",
+                    str(args.target_duration_sec),
+                    "--camera-profile",
+                    args.camera_profile,
+                    "--timeout",
+                    str(args.ollama_timeout),
+                    "--treatment-only",
+                    "--treatment-output",
+                    str(treatment_path),
+                    "--music-brief-output",
+                    str(music_brief),
+                    "--log-level",
+                    args.log_level,
+                ]
+                if args.creative_brief.strip():
+                    preliminary_command.extend(
+                        ["--creative-brief", args.creative_brief.strip()]
+                    )
+                try:
+                    self._run_stage(
+                        "音乐导演初审 / Music director first pass",
+                        preliminary_command,
+                    )
+                finally:
+                    self._force_ollama_unload(args.ollama_model, args.ollama_url)
+                self._require_file(treatment_path, "导演初审未生成 director_treatment.json")
+                self._require_file(music_brief, "导演初审未生成 music_brief.json")
+                self._release_barrier("Ollama music-director first pass")
+
+                if provider != "off":
+                    music_command = [
+                        self.python_executable,
+                        "-m",
+                        "src.music_analyzer",
+                        "--provider",
+                        provider,
+                        "--cache-dir",
+                        str(music_cache),
+                        "--brief",
+                        str(music_brief),
+                        "--output",
+                        str(music_analysis),
+                        "--query",
+                        str(args.creative_brief or "documentary cinematic"),
+                        "--limit",
+                        str(getattr(args, "music_candidate_limit", 8)),
+                        "--log-level",
+                        args.log_level,
+                    ]
+                    if provider == "local":
+                        if not getattr(args, "music_folder", None):
+                            raise WorkflowError(
+                                "本地配乐模式需要曲库文件夹 / Local music mode requires --music-folder."
+                            )
+                        music_command.extend(["--library", str(args.music_folder)])
+                    elif provider == "jamendo":
+                        music_command.extend([
+                            "--jamendo-client-id",
+                            str(getattr(args, "jamendo_client_id", "") or ""),
+                        ])
+                    elif provider == "yt_dlp":
+                        if bool(getattr(args, "music_rights_confirmed", False)):
+                            music_command.append("--rights-confirmed")
+                        music_command.extend([
+                            "--rights-claim",
+                            str(getattr(args, "music_rights_claim", "") or ""),
+                        ])
+                    self._run_stage(
+                        "联网候选获取与 CPU 音乐听诊 / Music retrieval and CPU analysis",
+                        music_command,
+                    )
+                    self._require_file(
+                        music_analysis, "配乐听诊未生成 music_analysis.json"
+                    )
+                    self._release_barrier("CPU music retrieval and analysis")
+
                 command = [
                     self.python_executable,
                     "-m",
@@ -272,6 +432,8 @@ class WorkflowOrchestrator:
                     str(timeline_cuts),
                     "--model",
                     args.ollama_model,
+                    "--text-model",
+                    args.director_model or args.ollama_model,
                     "--ollama-url",
                     args.ollama_url,
                     "--chunk-minutes",
@@ -280,23 +442,56 @@ class WorkflowOrchestrator:
                     str(args.project_fps),
                     "--num-ctx",
                     str(args.num_ctx),
+                    "--target-duration-sec",
+                    str(args.target_duration_sec),
+                    "--camera-profile",
+                    args.camera_profile,
+                    "--treatment-file",
+                    str(treatment_path),
                     "--timeout",
                     str(args.ollama_timeout),
                     "--log-level",
                     args.log_level,
                 ]
+                if args.creative_brief.strip():
+                    command.extend(["--creative-brief", args.creative_brief.strip()])
+                if provider != "off":
+                    command.extend(["--music-analysis", str(music_analysis)])
                 try:
-                    self._run_stage("导演 / Direct", command)
+                    self._run_stage("最终 AI 导演 / Final AI director", command)
                 finally:
                     # Second safety layer: runs even if the director is killed
                     # after loading the model but before its own finally block.
                     self._force_ollama_unload(
                         args.ollama_model, args.ollama_url
                     )
+                    if args.director_model and args.director_model != args.ollama_model:
+                        self._force_ollama_unload(
+                            args.director_model, args.ollama_url
+                        )
                 self._require_file(
                     timeline_cuts, "导演阶段未生成 timeline_cuts.json"
                 )
                 self._release_barrier("Ollama")
+
+                if provider != "off":
+                    bed_command = [
+                        self.python_executable,
+                        "-m",
+                        "src.music_bed",
+                        "--timeline",
+                        str(timeline_cuts),
+                        "--output",
+                        str(music_bed),
+                        "--log-level",
+                        args.log_level,
+                    ]
+                    self._run_stage(
+                        "音乐床合成与对白 Ducking / Music-bed conform and dialogue ducking",
+                        bed_command,
+                    )
+                    # A valid no-music creative decision intentionally produces no WAV.
+                    self._release_barrier("FFmpeg CPU music-bed conform")
 
             # Programmatic callers created before preview support have no
             # ``skip_preview`` attribute; keep those integrations backward
@@ -572,8 +767,8 @@ class WorkflowOrchestrator:
             raise WorkflowError(
                 f"模型 {model!r} 不支持图像输入，不能审阅视频画面。"
                 "请先安装并选择视觉模型，例如：\n"
-                "  ollama pull qwen3.5:35b-a3b\n"
-                "  ollama pull qwen3.5:9b-q8_0\n"
+                "  ollama pull qwen3.6:27b-mtp-q8_0\n"
+                "  ollama pull qwen3.6:27b-mtp-q4_K_M\n"
                 "The selected model is text-only; a vision model is required."
             )
 
@@ -667,11 +862,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene-threshold", type=float, default=0.28)
     parser.add_argument("--sample-interval", type=float, default=2.0)
     parser.add_argument("--max-keyframes", type=int, default=240)
-    parser.add_argument("--ollama-model", default="qwen2.5:32b")
+    parser.add_argument("--ollama-model", default="qwen3.6:27b-mtp-q8_0")
+    parser.add_argument(
+        "--director-model",
+        default="",
+        help="视觉阶段卸载后加载的全局文字导演；空值沿用视觉模型 / global text director",
+    )
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--chunk-minutes", type=float, default=12.0)
     parser.add_argument("--project-fps", type=float, default=25.0)
     parser.add_argument("--num-ctx", type=int, default=8192)
+    parser.add_argument("--creative-brief", default="")
+    parser.add_argument("--target-duration-sec", type=float, default=0.0)
+    parser.add_argument(
+        "--camera-profile",
+        default="sony_pp8_slog3_sgamut3cine",
+        choices=("sony_pp8_slog3_sgamut3cine", "rec709", "auto"),
+    )
+    parser.add_argument("--music-folder")
+    parser.add_argument(
+        "--music-provider",
+        choices=("off", "local", "jamendo", "yt_dlp"),
+        default="off",
+        help="配乐来源 / music source provider",
+    )
+    parser.add_argument("--music-candidate-limit", type=int, default=8)
+    parser.add_argument("--jamendo-client-id", default="")
+    parser.add_argument(
+        "--music-rights-confirmed",
+        action="store_true",
+        help="确认任意在线音频的下载、改编和使用权及平台条款 / confirm rights and platform terms",
+    )
+    parser.add_argument("--music-rights-claim", default="")
     parser.add_argument("--ollama-timeout", type=int, default=1800)
     parser.add_argument("--timeline-name", default="CyberEditor Timeline")
     parser.add_argument("--project-name", default="CyberEditor Project")

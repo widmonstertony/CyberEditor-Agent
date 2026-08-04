@@ -14,12 +14,10 @@ imports a machine-learning or media-processing package.
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 from pathlib import Path
 import shutil
-import string
 import subprocess
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -101,49 +99,85 @@ def find_ollama_executables() -> Tuple[Optional[Path], Optional[Path]]:
         cli_candidates.append(root / "ollama.exe")
         app_candidates.append(root / "ollama app.exe")
 
+    def safe_file(path: Path) -> bool:
+        """Ignore inaccessible per-user installs during discovery. / 检测时忽略无权访问的用户安装。"""
+        try:
+            return path.is_file()
+        except OSError:
+            return False
+
     found_cli = next(
-        (path.resolve() for path in _unique_paths(cli_candidates) if path.is_file()),
+        (path.resolve() for path in _unique_paths(cli_candidates) if safe_file(path)),
         None,
     )
     found_app = next(
-        (path.resolve() for path in _unique_paths(app_candidates) if path.is_file()),
+        (path.resolve() for path in _unique_paths(app_candidates) if safe_file(path)),
         None,
     )
     return found_cli, found_app
 
 
-def _fixed_drive_roots() -> Sequence[Path]:
-    """
-    List mounted Windows drive roots without invoking PowerShell.
-    不调用 PowerShell，列出已挂载的 Windows 盘符根目录。
-    """
-    if os.name != "nt":
-        return ()
-    roots: List[Path] = []
+def _resolve_registry_value(hive: object, subkey: str, value_name: str) -> object:
+    """Read one Resolve registry value without raising. / 安全读取一个 Resolve 注册表值。"""
+    if winreg is None:
+        return None
+    access = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
     try:
-        mask = int(ctypes.windll.kernel32.GetLogicalDrives())
-    except (AttributeError, OSError, ValueError):
-        mask = 0
-    for index, letter in enumerate(string.ascii_uppercase):
-        if mask and not (mask & (1 << index)):
-            continue
-        root = Path(f"{letter}:\\")
-        try:
-            if root.is_dir():
-                roots.append(root)
-        except OSError:
-            continue
-    return roots
+        key = winreg.OpenKey(hive, subkey, 0, access)
+    except OSError:
+        return None
+    try:
+        return winreg.QueryValueEx(key, value_name)[0]
+    except OSError:
+        return None
+    finally:
+        winreg.CloseKey(key)
 
 
-def _resolve_registry_candidates() -> Sequence[Path]:
+def get_resolve_registration() -> Dict[str, object]:
     """
-    Read Resolve install hints from Windows uninstall entries.
-    从 Windows 卸载注册表项读取 Resolve 安装线索。
+    Read Blackmagic's official Resolve installation registration.
+    读取 Blackmagic 官方 Resolve 安装注册信息。
+
+    Resolve Studio activation is intentionally not inferred here: Free and
+    Studio use the same executable and MSI product name. The authoritative
+    edition is ``resolve.GetProductName()`` after a successful API connection.
+    此处不会猜测 Studio 授权：免费版与 Studio 共用可执行文件和 MSI 产品名；成功
+    连接 API 后的 ``resolve.GetProductName()`` 才是权威版本信息。
+    """
+    if winreg is None or os.name != "nt":
+        return {"installed": False, "version": "", "user_registered": False}
+    key = r"SOFTWARE\Blackmagic Design\DaVinci Resolve"
+    version = str(
+        _resolve_registry_value(winreg.HKEY_LOCAL_MACHINE, key, "Version") or ""
+    ).strip()
+    installed_value = _resolve_registry_value(
+        winreg.HKEY_CURRENT_USER, key, "installed"
+    )
+    try:
+        user_registered = int(installed_value or 0) == 1
+    except (TypeError, ValueError):
+        user_registered = False
+    return {
+        "installed": bool(version or user_registered),
+        "version": version,
+        "user_registered": user_registered,
+    }
+
+
+def _resolve_registry_installations() -> Sequence[Tuple[Path, str]]:
+    """
+    Read Resolve paths together with registered product names.
+    读取 Resolve 路径及其注册产品名。
+
+    Both Free and Studio can install scripting modules, so module presence is
+    insufficient to determine whether external automation is available.
+    免费版与 Studio 都可能安装脚本模块，因此不能仅凭模块存在判断外部自动化能力。
     """
     if winreg is None or os.name != "nt":
         return ()
-    candidates: List[Path] = []
+    installations: List[Tuple[Path, str]] = []
+    seen = set()
     hives = (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER)
     subkeys = (
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -170,11 +204,11 @@ def _resolve_registry_candidates() -> Sequence[Path]:
                             entry = winreg.OpenKey(root, name)
                             display = str(
                                 winreg.QueryValueEx(entry, "DisplayName")[0]
-                            )
+                            ).strip()
                         except OSError:
                             continue
                         try:
-                            if display.strip().casefold() not in {
+                            if display.casefold() not in {
                                 "davinci resolve",
                                 "davinci resolve studio",
                             }:
@@ -195,54 +229,92 @@ def _resolve_registry_candidates() -> Sequence[Path]:
                                     continue
                                 value = value.split(",", 1)[0]
                                 path = Path(value)
-                                candidates.append(
+                                executable = (
                                     path
                                     if path.suffix.casefold() == ".exe"
                                     else path / "Resolve.exe"
                                 )
+                                key = (
+                                    os.path.normcase(os.path.abspath(str(executable))),
+                                    display.casefold(),
+                                )
+                                if key not in seen:
+                                    seen.add(key)
+                                    installations.append((executable, display))
                         finally:
                             winreg.CloseKey(entry)
                 finally:
                     winreg.CloseKey(root)
-    return _unique_paths(candidates)
+    return installations
+
+
+def _resolve_registry_candidates() -> Sequence[Path]:
+    """Read Resolve executable hints from uninstall entries. / 读取 Resolve 路径线索。"""
+    return _unique_paths(
+        [path for path, _display in _resolve_registry_installations()]
+    )
+
+
+def _resolve_start_app_candidates() -> Sequence[Path]:
+    """
+    Ask Windows for registered Start-app targets; never scan drives.
+    从 Windows 注册应用表读取启动目标，不扫描磁盘。
+    """
+    if os.name != "nt":
+        return ()
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        return ()
+    script = (
+        "$items = Get-StartApps | Where-Object { $_.Name -eq 'DaVinci Resolve' }; "
+        "@($items | ForEach-Object { $_.AppID }) | ConvertTo-Json -Compress"
+    )
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return ()
+        payload = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ()
+    values = payload if isinstance(payload, list) else [payload]
+    return _unique_paths(
+        [
+            Path(str(value).strip())
+            for value in values
+            if str(value).strip().casefold().endswith("resolve.exe")
+        ]
+    )
 
 
 def find_resolve_executable() -> Optional[Path]:
     """
-    Locate ``Resolve.exe`` across custom Windows installation drives.
-    在 Windows 自定义安装盘中定位 ``Resolve.exe``。
+    Locate ``Resolve.exe`` from Windows/Blackmagic registration, never drive scans.
+    通过 Windows/Blackmagic 注册信息定位 ``Resolve.exe``，绝不扫描磁盘猜测。
 
-    Registry hints are checked first, followed by every mounted drive's common
-    Program Files locations.  The latter is important because the MSI entry can
-    omit ``InstallLocation`` when Resolve is installed on another drive.
-
-    先检查注册表线索，再检查所有盘符的常见 Program Files 目录。Resolve 安装在
-    其他盘时 MSI 记录可能缺少 ``InstallLocation``，因此跨盘检查不可省略。
+    Blackmagic's MSI may omit ``InstallLocation``. Windows Start Apps still
+    records the exact custom-drive target and is the preferred path source after
+    confirming Blackmagic's installation keys.
+    Blackmagic MSI 可能不写 ``InstallLocation``；Windows 注册应用表仍保存自定义盘
+    的精确启动目标，因此在确认 Blackmagic 注册表后优先使用该目标。
     """
+    registration = get_resolve_registration()
     direct = shutil.which("Resolve.exe")
     candidates: List[Path] = [Path(direct)] if direct else []
+    library = str(os.environ.get("RESOLVE_SCRIPT_LIB") or "").strip()
+    if library:
+        candidates.append(Path(library).expanduser().parent / "Resolve.exe")
     candidates.extend(_resolve_registry_candidates())
-
-    program_roots = [
-        Path(value)
-        for value in (
-            os.environ.get("PROGRAMFILES"),
-            os.environ.get("PROGRAMFILES(X86)"),
-        )
-        if value
-    ]
-    for drive in _fixed_drive_roots():
-        program_roots.extend((drive / "Program Files", drive / "Program Files (x86)"))
-    for root in _unique_paths(program_roots):
-        candidates.extend(
-            (
-                root / "Blackmagic Design" / "DaVinci Resolve" / "Resolve.exe",
-                root
-                / "Blackmagic Design"
-                / "DaVinci Resolve Studio"
-                / "Resolve.exe",
-            )
-        )
+    if bool(registration.get("installed")):
+        candidates.extend(_resolve_start_app_candidates())
     return next(
         (path.resolve() for path in _unique_paths(candidates) if path.is_file()),
         None,

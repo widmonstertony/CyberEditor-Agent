@@ -43,6 +43,7 @@ from .gui import (
     enable_windows_high_dpi,
     ensure_ollama_service,
     find_resolve_executable,
+    get_resolve_registration,
     get_primary_work_area,
     parse_frame_rate,
     recommend_automatic_settings,
@@ -504,7 +505,10 @@ class ModernCyberEditorApp:
             value=str(data.get("language", ""))
         )
         self.ollama_model_var = tk.StringVar(
-            value=str(data.get("ollama_model", "qwen2.5:3b"))
+            value=str(data.get("ollama_model", "qwen3.6:27b-mtp-q8_0"))
+        )
+        self.director_model_var = tk.StringVar(
+            value=str(data.get("director_model", ""))
         )
         self.ollama_url_var = tk.StringVar(
             value=str(data.get("ollama_url", "http://localhost:11434"))
@@ -529,6 +533,27 @@ class ModernCyberEditorApp:
         # 首帧后重新检测恢复的素材，启动时再检查交接 JSON。
         self.detected_project_fps = 0.0
         self.ctx_var = tk.StringVar(value=str(data.get("num_ctx", 8192)))
+        self.creative_brief_var = tk.StringVar(
+            value=str(data.get("creative_brief", ""))
+        )
+        self.target_duration_var = tk.StringVar(
+            value=str(data.get("target_duration_sec", 0.0))
+        )
+        self.camera_profile_var = tk.StringVar(
+            value=str(data.get("camera_profile", "sony_pp8_slog3_sgamut3cine"))
+        )
+        self.music_folder_var = tk.StringVar(
+            value=str(data.get("music_folder", ""))
+        )
+        self.music_provider_key = str(data.get("music_provider", "yt_dlp"))
+        if self.music_provider_key not in {"off", "local", "jamendo", "yt_dlp"}:
+            self.music_provider_key = "yt_dlp"
+        self.music_candidate_limit_var = tk.StringVar(
+            value=str(data.get("music_candidate_limit", 8))
+        )
+        self.jamendo_client_id_var = tk.StringVar(
+            value=str(data.get("jamendo_client_id", ""))
+        )
         self.timeline_var = tk.StringVar(
             value=str(data.get("timeline_name", "CyberEditor Timeline"))
         )
@@ -759,20 +784,36 @@ class ModernCyberEditorApp:
                  if v == self.flow_key),
             self._on_flow_change
         )
+        # Put the creative intent before media/settings so the default workflow
+        # reads like a one-click editor: tell the director what the film should
+        # mean, or leave it blank and let the director discover the theme.
+        # 将创作意图放在素材与参数之前：可指定主题，也可留空让 AI 自由导演。
+        self._entry_field(
+            parent, 2, self.t("creative_brief"), self.creative_brief_var
+        )
+        ctk.CTkLabel(
+            parent,
+            text=self.t("creative_brief_hint"),
+            anchor="w",
+            justify="left",
+            wraplength=760,
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=10),
+        ).grid(row=3, column=0, sticky="ew", pady=(0, 7))
         self._path_field(
-            parent, 2, self.t("source_videos"), self.video_var,
+            parent, 4, self.t("source_videos"), self.video_var,
             self._choose_video, self.t("browse"), readonly=True
         )
         self._path_field(
-            parent, 3, self.t("input_folder"), self.input_folder_var,
+            parent, 5, self.t("input_folder"), self.input_folder_var,
             self._choose_input_folder, self.t("select_folder")
         )
         self._path_field(
-            parent, 4, self.t("runtime_data"), self.data_var,
+            parent, 6, self.t("runtime_data"), self.data_var,
             self._choose_data_dir, self.t("select_folder")
         )
         fps_row = ctk.CTkFrame(parent, fg_color="transparent")
-        fps_row.grid(row=5, column=0, sticky="ew", pady=(4, 12))
+        fps_row.grid(row=7, column=0, sticky="ew", pady=(4, 12))
         fps_row.grid_columnconfigure(0, weight=1)
         auto_fps_display = self._fps_auto_display()
         fps_values = [
@@ -797,7 +838,7 @@ class ModernCyberEditorApp:
             self._on_fps_change,
         )
 
-        self._section_title(parent, 6, self.t("ai_hardware"))
+        self._section_title(parent, 8, self.t("ai_hardware"))
         profile_values = [
             self.t("profile_auto"), self.t("profile_conservative"),
             self.t("profile_balanced"), self.t("profile_performance"),
@@ -808,7 +849,7 @@ class ModernCyberEditorApp:
             ("auto", "conservative", "balanced", "performance", "custom")
         ))
         self.profile_menu = self._option_field(
-            parent, 7, self.t("hardware_profile"), profile_values,
+            parent, 9, self.t("hardware_profile"), profile_values,
             next(k for k, v in self._profile_display_to_key.items()
                  if v == self.profile_key),
             self._on_profile_change
@@ -819,9 +860,9 @@ class ModernCyberEditorApp:
             fg_color=COLORS["card_alt"], text_color=COLORS["muted"],
             font=ctk.CTkFont(size=11)
         )
-        self.hardware_label.grid(row=8, column=0, sticky="ew", pady=(3, 9))
+        self.hardware_label.grid(row=10, column=0, sticky="ew", pady=(3, 9))
         ai = ctk.CTkFrame(parent, fg_color="transparent")
-        ai.grid(row=9, column=0, sticky="ew")
+        ai.grid(row=11, column=0, sticky="ew")
         ai.grid_columnconfigure((0, 1), weight=1, uniform="ai")
         self.whisper_menu = self._option_field(
             ai, 0, self.t("whisper_model"),
@@ -840,20 +881,101 @@ class ModernCyberEditorApp:
             ai, 1, self.t("ollama_model"), [self.ollama_model_var.get()],
             self.ollama_model_var.get(), self.ollama_model_var.set, column=1
         )
-        self._entry_field(
-            ai, 2, self.t("ollama_context"), self.ctx_var, column=0
+        self.director_model_menu = self._option_field(
+            ai, 2, self.t("director_model"),
+            [self.director_model_var.get() or self.ollama_model_var.get()],
+            self.director_model_var.get() or self.ollama_model_var.get(),
+            self.director_model_var.set, column=0
         )
         self._entry_field(
-            ai, 2, self.t("chunk_minutes"), self.chunk_var, column=1
+            ai, 2, self.t("ollama_context"), self.ctx_var, column=1
         )
         self._entry_field(
-            ai, 3, self.t("ollama_url"), self.ollama_url_var,
-            column=0, columnspan=2
+            ai, 3, self.t("chunk_minutes"), self.chunk_var, column=0
+        )
+        self._entry_field(
+            ai, 3, self.t("ollama_url"), self.ollama_url_var, column=1
         )
 
-        self._section_title(parent, 10, self.t("resolve_settings"))
+        self._section_title(parent, 12, self.t("director_settings"))
+        directing = ctk.CTkFrame(parent, fg_color="transparent")
+        directing.grid(row=13, column=0, sticky="ew")
+        directing.grid_columnconfigure((0, 1), weight=1, uniform="directing")
+        self._entry_field(
+            directing, 0, self.t("target_duration"), self.target_duration_var,
+            column=0
+        )
+        camera_values = [
+            self.t("camera_sony_pp8"), self.t("camera_rec709"), self.t("camera_auto")
+        ]
+        self._camera_display_to_key = dict(zip(
+            camera_values,
+            ("sony_pp8_slog3_sgamut3cine", "rec709", "auto"),
+        ))
+        current_camera = self.camera_profile_var.get()
+        if current_camera not in self._camera_display_to_key.values():
+            current_camera = "sony_pp8_slog3_sgamut3cine"
+            self.camera_profile_var.set(current_camera)
+        self.camera_menu = self._option_field(
+            directing, 0, self.t("camera_profile"), camera_values,
+            next(label for label, key in self._camera_display_to_key.items()
+                 if key == current_camera),
+            self._on_camera_profile_change, column=1
+        )
+        music_provider_values = [
+            self.t("music_provider_online"),
+            self.t("music_provider_local"),
+            self.t("music_provider_jamendo"),
+            self.t("music_provider_off"),
+        ]
+        self._music_provider_display_to_key = dict(zip(
+            music_provider_values,
+            ("yt_dlp", "local", "jamendo", "off"),
+        ))
+        self.music_provider_menu = self._option_field(
+            directing,
+            1,
+            self.t("music_provider"),
+            music_provider_values,
+            next(
+                label for label, key in self._music_provider_display_to_key.items()
+                if key == self.music_provider_key
+            ),
+            self._on_music_provider_change,
+            column=0,
+        )
+        self._entry_field(
+            directing,
+            1,
+            self.t("music_candidate_limit"),
+            self.music_candidate_limit_var,
+            column=1,
+        )
+        self._path_field(
+            parent, 14, self.t("music_folder"), self.music_folder_var,
+            self._choose_music_folder, self.t("select_folder")
+        )
+        self._entry_field(
+            parent, 15, self.t("jamendo_client_id"), self.jamendo_client_id_var
+        )
+        self.music_warning_label = ctk.CTkLabel(
+            parent,
+            text=(
+                self.t("music_online_warning")
+                if self.music_provider_key == "yt_dlp"
+                else self.t("music_verified_hint")
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=760,
+            text_color=COLORS["error"],
+            font=ctk.CTkFont(size=10),
+        )
+        self.music_warning_label.grid(row=16, column=0, sticky="ew", pady=(2, 8))
+
+        self._section_title(parent, 17, self.t("resolve_settings"))
         resolve = ctk.CTkFrame(parent, fg_color="transparent")
-        resolve.grid(row=11, column=0, sticky="ew")
+        resolve.grid(row=18, column=0, sticky="ew")
         resolve.grid_columnconfigure((0, 1), weight=1, uniform="resolve")
         self._entry_field(
             resolve, 0, self.t("timeline_name"), self.timeline_var, column=0
@@ -883,7 +1005,7 @@ class ModernCyberEditorApp:
             self.macro_profile_var, column=0, columnspan=2
         )
         switches = ctk.CTkFrame(parent, fg_color="transparent")
-        switches.grid(row=12, column=0, sticky="ew", pady=(7, 14))
+        switches.grid(row=19, column=0, sticky="ew", pady=(7, 14))
         switches.grid_columnconfigure((0, 1), weight=1)
         self.run_resolve_switch = ctk.CTkSwitch(
             switches, text=self.t("run_resolve"),
@@ -1172,6 +1294,28 @@ class ModernCyberEditorApp:
                 self._start_fps_detection(candidate)
         self._save_current_preferences()
 
+    def _on_camera_profile_change(self, display_value: str) -> None:
+        """Store the technical camera input profile. / 保存技术相机输入色彩配置。"""
+        self.camera_profile_var.set(
+            self._camera_display_to_key.get(
+                display_value, "sony_pp8_slog3_sgamut3cine"
+            )
+        )
+        self._save_current_preferences()
+
+    def _on_music_provider_change(self, display_value: str) -> None:
+        """Store the selected rights-aware music source. / 保存带权利审计的配乐来源。"""
+        self.music_provider_key = self._music_provider_display_to_key.get(
+            display_value, "yt_dlp"
+        )
+        if hasattr(self, "music_warning_label"):
+            self.music_warning_label.configure(
+                text=self.t("music_online_warning")
+                if self.music_provider_key == "yt_dlp"
+                else self.t("music_verified_hint")
+            )
+        self._save_current_preferences()
+
     def _start_initial_fps_detection(self) -> None:
         """Detect FPS for a restored media path after first paint. / 首帧显示后检测已恢复素材路径的 FPS。"""
         if self.fps_mode != "auto":
@@ -1332,12 +1476,17 @@ class ModernCyberEditorApp:
         model = str(settings.get("ollama_model", "")).strip()
         if model:
             self.ollama_model_var.set(model)
+        director_model = str(settings.get("director_model", "")).strip()
+        if director_model:
+            self.director_model_var.set(director_model)
         if hasattr(self, "whisper_menu"):
             self.whisper_menu.set(self.whisper_var.get())
         if hasattr(self, "device_menu"):
             self.device_menu.set(self.device_var.get())
         if model and hasattr(self, "ollama_menu"):
             self.ollama_menu.set(model)
+        if director_model and hasattr(self, "director_model_menu"):
+            self.director_model_menu.set(director_model)
         details = (
             f"{label}: Whisper {self.whisper_var.get()}  ·  "
             f"Context {self.ctx_var.get()}  ·  Chunk {self.chunk_var.get()}m"
@@ -1447,10 +1596,20 @@ class ModernCyberEditorApp:
             whisper_device=self.device_var.get().strip(),
             language=self.speech_language_var.get().strip(),
             ollama_model=self.ollama_model_var.get().strip(),
+            director_model=self.director_model_var.get().strip(),
             ollama_url=self.ollama_url_var.get().strip(),
             chunk_minutes=float(self.chunk_var.get()),
             project_fps=project_fps,
             num_ctx=int(self.ctx_var.get()),
+            creative_brief=self.creative_brief_var.get().strip(),
+            target_duration_sec=float(self.target_duration_var.get() or 0),
+            camera_profile=self.camera_profile_var.get().strip(),
+            music_folder=self.music_folder_var.get().strip(),
+            music_provider=self.music_provider_key,
+            music_candidate_limit=int(self.music_candidate_limit_var.get()),
+            jamendo_client_id=self.jamendo_client_id_var.get().strip(),
+            music_rights_confirmed=False,
+            music_rights_claim="",
             timeline_name=(
                 self.timeline_var.get().strip() or "CyberEditor Timeline"
             ),
@@ -1545,12 +1704,18 @@ class ModernCyberEditorApp:
             results["Ollama"] = (False, self.t("not_connected"))
 
         resolve_path = find_resolve_executable()
-        resolve_ready = resolve_path is not None
+        resolve_registration = get_resolve_registration()
+        resolve_version = str(resolve_registration.get("version") or "").strip()
+        resolve_ready = bool(resolve_registration.get("installed")) and resolve_path is not None
         results["Resolve"] = (
             resolve_ready,
             (
-                self.t("installed_auto_start")
+                self.t("resolve_registered", version=resolve_version or "Resolve")
                 if resolve_ready
+                else self.t("resolve_registered_path_missing", version=resolve_version or "Resolve")
+                if bool(resolve_registration.get("installed"))
+                else self.t("resolve_registry_missing")
+                if resolve_path is not None
                 else self.t("not_found")
             ),
         )
@@ -1609,6 +1774,13 @@ class ModernCyberEditorApp:
             if self.ollama_model_var.get() not in model_names:
                 self.ollama_model_var.set(model_names[0])
                 self.ollama_menu.set(model_names[0])
+        if model_names and hasattr(self, "director_model_menu"):
+            self.director_model_menu.set_values(model_names)
+            if self.director_model_var.get() not in model_names:
+                recommended_text = str(recommendation.get("director_model") or "")
+                selected_text = recommended_text if recommended_text in model_names else self.ollama_model_var.get()
+                self.director_model_var.set(selected_text)
+                self.director_model_menu.set(selected_text)
         self._apply_hardware_profile(self.profile_key)
         summary = " · ".join(
             f"{name}: {'OK' if ready else detail}"
@@ -1648,6 +1820,16 @@ class ModernCyberEditorApp:
             return
         try:
             options = self._collect_options()
+            if options.music_provider == "yt_dlp":
+                confirmed = messagebox.askyesno(
+                    self.t("music_rights_title"),
+                    self.t("music_rights_confirmation"),
+                    parent=self.root,
+                )
+                if not confirmed:
+                    return
+                options.music_rights_confirmed = True
+                options.music_rights_claim = self.t("music_rights_audit_claim")
             command = options.build_command(sys.executable, self.project_root)
             self._save_settings(options)
         except (ValueError, tk.TclError, OSError) as exc:
@@ -1838,8 +2020,17 @@ class ModernCyberEditorApp:
             if "Extract" in line:
                 self._set_progress(0.12)
                 self._set_stage("extracting")
-            elif "Direct" in line:
+            elif "Music director first pass" in line:
                 self._set_progress(0.48)
+                self._set_stage("directing")
+            elif "Music retrieval and CPU analysis" in line:
+                self._set_progress(0.55)
+                self._set_stage("directing")
+            elif "Final AI director" in line:
+                self._set_progress(0.64)
+                self._set_stage("directing")
+            elif "Music-bed conform" in line:
+                self._set_progress(0.75)
                 self._set_stage("directing")
             elif "Preview render" in line:
                 self._set_progress(0.72)
@@ -1971,6 +2162,13 @@ class ModernCyberEditorApp:
         if path:
             self.data_var.set(path)
 
+    def _choose_music_folder(self) -> None:
+        """Select a local licensed music library. / 选择本地已授权配乐库。"""
+        path = filedialog.askdirectory(title=self.t("select_music_folder"))
+        if path:
+            self.music_folder_var.set(path)
+            self._save_current_preferences()
+
     def _open_output(self) -> None:
         """Open or create the selected output directory. / 打开或创建所选输出目录。"""
         path = self._absolute_path(self.data_var.get() or "data/ui-run")
@@ -2040,6 +2238,10 @@ class ModernCyberEditorApp:
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.settings_path.with_suffix(".tmp")
         payload = asdict(options)
+        # Online-audio consent is per run and must never silently persist.
+        # 任意在线音频确认只对本次运行有效，绝不静默持久化。
+        payload["music_rights_confirmed"] = False
+        payload["music_rights_claim"] = ""
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",

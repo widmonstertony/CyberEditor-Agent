@@ -26,6 +26,13 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+try:
+    from .color_analysis import analyze_bgr_frame, summarize_color_samples
+    from .sony_metadata import SonyMetadataError, detect_sony_color_metadata
+except ImportError:  # pragma: no cover - direct ``python src/...`` fallback.
+    from color_analysis import analyze_bgr_frame, summarize_color_samples
+    from sony_metadata import SonyMetadataError, detect_sony_color_metadata
+
 
 LOGGER_NAME = "cybereditor.extractor"
 
@@ -173,8 +180,37 @@ class MediaExtractor:
             "Whisper 已卸载并清理缓存；开始 CPU 抽帧 / Whisper unloaded and cache cleared; starting CPU keyframes"
         )
 
+        try:
+            source_color = detect_sony_color_metadata(source)
+        except SonyMetadataError as exc:
+            self.logger.warning(
+                "Sony XML 解析失败，将标记色彩配置为未知：%s / "
+                "Sony XML parsing failed; source color remains unknown: %s",
+                exc,
+                exc,
+            )
+            source_color = {
+                "source": "invalid",
+                "camera_profile": "unknown",
+                "transform_supported": False,
+                "confidence": 0.0,
+            }
         keyframes, video_metadata = self.extract_keyframes(
-            source, frames_destination
+            source, frames_destination, source_color=source_color
+        )
+        color_analysis = summarize_color_samples(
+            item.get("color_metrics", {})
+            for item in keyframes
+            if isinstance(item, dict)
+        )
+        # OpenCV reads the encoded camera samples.  Log footage therefore has
+        # not yet passed through its technical input transform; recording this
+        # domain prevents downstream code from applying mathematically invalid
+        # exposure/WB corrections after Resolve color management.
+        # OpenCV 读取的是相机编码值；Log 素材尚未技术还原，必须标记测量域，避免
+        # 下游把 Log 域统计错误地套到还原后的画面上。
+        color_analysis["analysis_domain"] = (
+            "encoded_log" if bool(source_color.get("is_log")) else "display_referred"
         )
         duration = max(
             float(video_metadata.get("duration_sec", 0.0)),
@@ -191,6 +227,8 @@ class MediaExtractor:
             "language": transcription.get("language"),
             "whisper_model": self.whisper_model,
             "video": video_metadata,
+            "source_color": source_color,
+            "color_analysis": color_analysis,
             "transcript": segments,
             "keyframes": keyframes,
         }
@@ -272,17 +310,27 @@ class MediaExtractor:
                 )
 
     def extract_keyframes(
-        self, video_path: Path, output_dir: Path
+        self,
+        video_path: Path,
+        output_dir: Path,
+        source_color: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Sample a video with OpenCV and save scene-change keyframes.
         使用 OpenCV 采样视频并保存场景变化关键帧。
 
-        This MVP uses normalized grayscale frame difference. It intentionally
-        avoids a second neural model so the extraction process remains usable
-        on integrated graphics.
+        This stage also records bounded CPU-only exposure/white-balance
+        statistics. It intentionally avoids a second neural model so the
+        extraction process remains usable on integrated graphics.
 
-        MVP 使用归一化灰度帧差；有意不加载第二个神经网络，使核显设备也能使用。
+        本阶段同时记录受限的纯 CPU 曝光/白平衡统计；有意不加载第二个神经网络，
+        使核显设备也能使用。
+
+        Parameters / 参数:
+            video_path: Source video. / 源视频。
+            output_dir: JPEG keyframe directory. / JPEG 关键帧目录。
+            source_color: Parsed Sony input profile, when available.
+                已解析的 Sony 输入色彩配置（如存在）。
         """
         try:
             import cv2
@@ -365,11 +413,24 @@ class MediaExtractor:
                             interpolation=cv2.INTER_AREA,
                         )
                     self._write_jpeg_unicode_safe(cv2, preview, destination)
+                    try:
+                        color_metrics = analyze_bgr_frame(preview, cv2)
+                    except (RuntimeError, ValueError) as exc:
+                        self.logger.warning(
+                            "关键帧色彩统计失败 %.3fs：%s / "
+                            "Keyframe color analysis failed at %.3fs: %s",
+                            timestamp,
+                            exc,
+                            timestamp,
+                            exc,
+                        )
+                        color_metrics = {}
                     keyframes.append(
                         {
                             "timestamp_sec": round(timestamp, 3),
                             "file_name": file_name,
                             "scene_score": round(difference, 4),
+                            "color_metrics": color_metrics,
                         }
                     )
                     last_saved_at = timestamp
@@ -382,6 +443,9 @@ class MediaExtractor:
                 "width": width,
                 "height": height,
                 "duration_sec": round(duration, 3),
+                "source_color_profile": str(
+                    (source_color or {}).get("camera_profile") or "unknown"
+                ),
             }
             return keyframes, metadata
         finally:

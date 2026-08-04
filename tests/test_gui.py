@@ -4,11 +4,13 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from src.gui import (
     WorkflowOptions,
     build_runtime_environment,
     console_python_executable,
+    detect_torch_runtime,
     detect_system_theme,
     enable_windows_high_dpi,
     get_primary_work_area,
@@ -29,6 +31,30 @@ class WorkflowOptionsTests(unittest.TestCase):
 
             self.assertEqual(
                 console_python_executable(str(pythonw)), str(python.resolve())
+            )
+
+    def test_torch_detection_uses_console_python_from_gui_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pythonw = root / "pythonw.exe"
+            python = root / "python.exe"
+            pythonw.touch()
+            python.touch()
+            completed = mock.Mock(
+                stdout=(
+                    '{"torch_available":true,"torch_version":"test+cu",'
+                    '"torch_cuda":true,"torch_device":"Test GPU"}\n'
+                )
+            )
+
+            with mock.patch("src.gui.sys.executable", str(pythonw)), mock.patch(
+                "src.gui.subprocess.run", return_value=completed
+            ) as run:
+                runtime = detect_torch_runtime()
+
+            self.assertTrue(runtime["torch_cuda"])
+            self.assertEqual(
+                run.call_args.args[0][0], str(python.resolve())
             )
 
     def test_full_workflow_builds_expected_flags(self) -> None:
@@ -74,6 +100,49 @@ class WorkflowOptionsTests(unittest.TestCase):
             self.assertEqual(command.count("--video"), 2)
             self.assertIn("--input-folder", command)
             self.assertNotIn("--skip-preview", command)
+
+    def test_director_intent_color_and_music_flags_are_forwarded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "source.mp4"
+            music = root / "music"
+            video.touch()
+            music.mkdir()
+            options = WorkflowOptions(
+                video=str(video),
+                creative_brief="A chronological behind-the-scenes short",
+                target_duration_sec=75,
+                camera_profile="sony_pp8_slog3_sgamut3cine",
+                music_folder=str(music),
+            )
+
+            command = options.build_command("python.exe", root)
+
+            self.assertIn("--creative-brief", command)
+            self.assertIn("--target-duration-sec", command)
+            self.assertIn("--camera-profile", command)
+            self.assertIn("--music-folder", command)
+
+    def test_online_music_requires_consent_and_forwards_audit_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "source.mp4"
+            video.touch()
+            blocked = WorkflowOptions(video=str(video), music_provider="yt_dlp")
+            with self.assertRaisesRegex(ValueError, "确认|confirmation"):
+                blocked.build_command("python.exe", root)
+
+            allowed = WorkflowOptions(
+                video=str(video),
+                music_provider="yt_dlp",
+                music_rights_confirmed=True,
+                music_rights_claim="I hold the required rights.",
+            )
+            command = allowed.build_command("python.exe", root)
+
+            self.assertIn("--music-provider", command)
+            self.assertIn("--music-rights-confirmed", command)
+            self.assertIn("I hold the required rights.", command)
 
     def test_resolve_only_requires_timeline_and_enables_resolve(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -164,6 +233,24 @@ class WorkflowOptionsTests(unittest.TestCase):
         self.assertEqual(recommendation["num_ctx"], 16384)
         self.assertEqual(recommendation["ollama_model"], "qwen:32b")
 
+    def test_nominal_64_gib_windows_machine_gets_16k_context(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {
+                "ram_gb": 63.8,
+                "vram_gb": 16,
+                "cpu_threads": 16,
+                "torch_cuda": True,
+            },
+            [
+                {
+                    "name": "qwen3.5:35b-a3b",
+                    "size": 23 * 1024**3,
+                }
+            ],
+        )
+        self.assertEqual(recommendation["profile"], "performance")
+        self.assertEqual(recommendation["num_ctx"], 16384)
+
     def test_auto_profile_prefers_editing_quality_over_file_size(self) -> None:
         recommendation = recommend_automatic_settings(
             {
@@ -185,6 +272,24 @@ class WorkflowOptionsTests(unittest.TestCase):
             recommendation["ollama_model"], "qwen3.5:9b-q8_0"
         )
         self.assertEqual(recommendation["chunk_minutes"], 10.0)
+
+    def test_auto_profile_prefers_qwen36_dense_q8_for_both_roles(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {"ram_gb": 64, "vram_gb": 16, "cpu_threads": 16, "torch_cuda": True},
+            [
+                {"name": "qwen3.5:35b-a3b", "size": 23 * 1024**3},
+                {"name": "qwen2.5:72b-instruct-q5_K_M", "size": 54 * 1024**3},
+                {"name": "qwen3.6:27b-mtp-q8_0", "size": 30 * 1024**3},
+            ],
+        )
+
+        self.assertEqual(
+            recommendation["ollama_model"], "qwen3.6:27b-mtp-q8_0"
+        )
+        self.assertEqual(
+            recommendation["director_model"],
+            "qwen3.6:27b-mtp-q8_0",
+        )
 
     def test_auto_profile_does_not_assume_pytorch_cuda(self) -> None:
         recommendation = recommend_automatic_settings(

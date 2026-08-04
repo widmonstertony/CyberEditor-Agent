@@ -29,6 +29,8 @@ import sys
 import tempfile
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
+from .color_pipeline import ensure_sony_pp8_display_lut
+
 
 LOGGER_NAME = "cybereditor.review"
 
@@ -49,6 +51,8 @@ class RenderClip(NamedTuple):
     color_look: str = "neutral"
     motion: str = "static"
     volume_db: float = 0.0
+    source_color: Optional[Dict[str, Any]] = None
+    color_match: Optional[Dict[str, Any]] = None
 
 
 class ReviewRenderer:
@@ -81,6 +85,9 @@ class ReviewRenderer:
         self.width = int(width)
         self.height = int(height)
         self.logger = logger or logging.getLogger(LOGGER_NAME)
+        self.color_pipeline: Dict[str, Any] = {}
+        self.music_plan: Dict[str, Any] = {}
+        self.technical_lut_path: Optional[Path] = None
         if self.width < 320 or self.height < 180:
             raise ReviewRenderError(
                 "预览分辨率过小 / Review resolution is too small."
@@ -98,10 +105,24 @@ class ReviewRenderer:
                 "生成预览需要 FFmpeg/ffprobe / FFmpeg and ffprobe are required."
             )
         fps, clips = self.load_plan()
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        sources = self.color_pipeline.get("sources", {})
+        has_slog3 = any(
+            str(item.get("resolve_input_gamma") or "").casefold() == "s-log3"
+            for item in (sources.values() if isinstance(sources, dict) else [])
+            if isinstance(item, dict)
+        )
+        legacy_slog3 = str(self.color_pipeline.get("camera_profile", "")).casefold() == "sony_pp8_slog3_sgamut3cine"
+        if bool(self.color_pipeline.get("enabled")) and (has_slog3 or legacy_slog3):
+            self.technical_lut_path = ensure_sony_pp8_display_lut(
+                self.output_path.parent / "technical_luts" / "sony_pp8_to_rec709.cube"
+            )
+            self.logger.info(
+                "预览已启用 Sony PP8 技术还原 / Sony PP8 technical transform enabled for preview"
+            )
         command, filter_text, duration = self.build_command(
             ffmpeg, ffprobe, fps, clips
         )
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
         script_path: Optional[Path] = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -157,6 +178,10 @@ class ReviewRenderer:
             ) from exc
         if not math.isfinite(fps) or fps <= 0 or not isinstance(raw_clips, list):
             raise ReviewRenderError("剪辑计划 FPS/clips 无效 / Invalid FPS/clips.")
+        pipeline = payload.get("color_pipeline")
+        self.color_pipeline = pipeline if isinstance(pipeline, dict) else {}
+        music = payload.get("music_plan")
+        self.music_plan = music if isinstance(music, dict) else {}
 
         result: List[RenderClip] = []
         for index, item in enumerate(raw_clips):
@@ -221,6 +246,14 @@ class ReviewRenderer:
                             ),
                         ),
                     ),
+                    source_color=(
+                        dict(item["source_color"])
+                        if isinstance(item.get("source_color"), dict) else None
+                    ),
+                    color_match=(
+                        dict(item["color_match"])
+                        if isinstance(item.get("color_match"), dict) else None
+                    ),
                 )
             )
         if not result:
@@ -278,7 +311,15 @@ class ReviewRenderer:
                 f"[{video_input}:v:0]setpts=PTS-STARTPTS,"
                 f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
                 f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2,"
-                f"fps={self._number(fps)},format=yuv420p"
+                # ``concat`` emits AVTB (microsecond) timestamps. Normalize every
+                # source to that same time base before a later xfade combines a
+                # hard-cut aggregate with the next source. Without this, mixed
+                # cut/xfade timelines fail at the first xfade on NTSC footage.
+                # ``concat`` 会输出 AVTB（微秒）时间基；在后续 xfade 前统一每段
+                # 素材的时间基，避免 NTSC 素材“先硬切、后转场”时初始化失败。
+                f"fps={self._number(fps)},settb=AVTB,format=yuv420p"
+                f"{self._technical_color_filter(clip)}"
+                f"{self._color_match_filter(clip)}"
                 f"{self._color_filter(clip.color_look)}"
                 f"{self._motion_filter(clip.motion, fps)}[v{index}]"
             )
@@ -339,6 +380,56 @@ class ReviewRenderer:
             current_audio = next_audio
             current_duration += durations[index] - transition_duration
 
+        final_audio = current_audio
+        bed_path_text = str(self.music_plan.get("bed_file") or "").strip()
+        music_path_text = bed_path_text or str(self.music_plan.get("file_name") or "").strip()
+        if music_path_text:
+            music_path = Path(music_path_text).expanduser().resolve()
+            if not music_path.is_file():
+                raise ReviewRenderError(
+                    f"找不到导演选择的配乐 / Selected music not found: {music_path}"
+                )
+            if bed_path_text:
+                command.extend(["-i", str(music_path)])
+            else:
+                command.extend(["-stream_loop", "-1", "-i", str(music_path)])
+            music_input = input_index
+            if bed_path_text:
+                filters.append(
+                    f"[{music_input}:a:0]atrim=0:{self._number(current_duration)},"
+                    "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[musicbed]"
+                )
+                filters.append(
+                    f"[{current_audio}][musicbed]amix=inputs=2:duration=first:normalize=0,"
+                    "alimiter=limit=0.95[programaudio]"
+                )
+                final_audio = "programaudio"
+            else:
+                level = max(-36.0, min(-6.0, self._finite(
+                    self.music_plan.get("target_level_db", -20.0),
+                    "music_plan.target_level_db",
+                )))
+                fade_in = max(0.0, min(10.0, self._finite(
+                    self.music_plan.get("fade_in_sec", 2.0),
+                    "music_plan.fade_in_sec",
+                )))
+                fade_out = max(0.0, min(10.0, self._finite(
+                    self.music_plan.get("fade_out_sec", 3.0),
+                    "music_plan.fade_out_sec",
+                )))
+                fade_out_start = max(0.0, current_duration - fade_out)
+                filters.append(
+                    f"[{music_input}:a:0]atrim=0:{self._number(current_duration)},"
+                    "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"volume={self._number(level)}dB,afade=t=in:st=0:d={self._number(fade_in)},"
+                    f"afade=t=out:st={self._number(fade_out_start)}:d={self._number(fade_out)}[musicbed]"
+                )
+                filters.append(
+                    f"[{current_audio}][musicbed]amix=inputs=2:duration=first:normalize=0,"
+                    "alimiter=limit=0.95[programaudio]"
+                )
+                final_audio = "programaudio"
+
         command.extend(
             [
                 "-filter_complex_script",
@@ -346,7 +437,7 @@ class ReviewRenderer:
                 "-map",
                 f"[{current_video}]",
                 "-map",
-                f"[{current_audio}]",
+                f"[{final_audio}]",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -454,6 +545,39 @@ class ReviewRenderer:
             "cool": ",colorbalance=rs=-.02:bs=.035,eq=saturation=1.03",
             "contrast": ",eq=contrast=1.10:brightness=-.01:saturation=1.06",
         }[look]
+
+    def _technical_color_filter(self, clip: Optional[RenderClip] = None) -> str:
+        """Return a source-specific S-Log3 preview transform. / 返回逐素材 S-Log3 预览变换。"""
+        if self.technical_lut_path is None:
+            return ""
+        if clip is not None and isinstance(clip.source_color, dict):
+            gamma = str(clip.source_color.get("resolve_input_gamma") or "").casefold()
+            if gamma and gamma != "s-log3":
+                # S-Log2 is intentionally left to Resolve's verified native RCM;
+                # applying an S-Log3 LUT would be visibly wrong.
+                return ""
+        escaped = self.technical_lut_path.as_posix().replace("\\", "/")
+        escaped = escaped.replace(":", "\\:").replace("'", "\\'")
+        return f",lut3d=file='{escaped}':interp=tetrahedral"
+
+    def _color_match_filter(self, clip: RenderClip) -> str:
+        """Return bounded per-source exposure/WB matching for FFmpeg preview. / 返回预览用受限曝光/白平衡匹配。"""
+        value = clip.color_match or {}
+        if not isinstance(value, dict) or not value:
+            return ""
+        if str(value.get("analysis_domain") or "") != "display_referred":
+            return ""
+        try:
+            exposure = max(-1.5, min(1.5, float(value.get("exposure_ev", 0))))
+            raw = value.get("rgb_gain", [1.0, 1.0, 1.0])
+            gains = [max(0.667, min(1.5, float(raw[index]))) for index in range(3)]
+        except (IndexError, TypeError, ValueError):
+            return ""
+        return (
+            ",colorchannelmixer="
+            f"rr={self._number(gains[0])}:gg={self._number(gains[1])}:bb={self._number(gains[2])}"
+            f",exposure=exposure={self._number(exposure)}"
+        )
 
     def _motion_filter(self, motion: str, fps: float) -> str:
         if motion != "gentle_push_in":

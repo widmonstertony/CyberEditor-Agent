@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 from src.review_renderer import RenderClip, ReviewRenderer
+from src.color_pipeline import decode_slog3, ensure_sony_pp8_display_lut
 
 
 class ReviewRendererTests(unittest.TestCase):
@@ -41,10 +42,44 @@ class ReviewRendererTests(unittest.TestCase):
 
             self.assertIn("concat=n=2:v=1:a=0", graph)
             self.assertIn("xfade=transition=fade:duration=0.5", graph)
+            self.assertEqual(graph.count("settb=AVTB"), len(clips))
             self.assertIn("afftdn=nr=18:nf=-30", graph)
             self.assertIn("volume=-4.5dB", graph)
             self.assertIn("__FILTER_SCRIPT__", command)
             self.assertAlmostEqual(duration, 11.5)
+
+    def test_sony_pp8_lut_is_generated_without_third_party_packages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = ensure_sony_pp8_display_lut(
+                Path(temporary) / "sony_pp8.cube", size=5
+            )
+            text = path.read_text(encoding="ascii")
+
+            self.assertIn("LUT_3D_SIZE 5", text)
+            self.assertAlmostEqual(decode_slog3(420 / 1023), 0.18, places=4)
+
+    def test_preconformed_music_bed_is_not_looped_or_reprocessed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = root / "a.mp4"
+            bed = root / "music_bed.wav"
+            media.touch()
+            bed.touch()
+            renderer = ReviewRenderer(root / "plan.json", root / "review.mp4")
+            renderer.music_plan = {"bed_file": str(bed)}
+
+            with mock.patch.object(renderer, "_has_audio", return_value=True):
+                command, graph, _ = renderer.build_command(
+                    "ffmpeg",
+                    "ffprobe",
+                    25.0,
+                    [RenderClip(str(media), 0, 4, "cut", 0, "none")],
+                )
+
+            self.assertNotIn("-stream_loop", command)
+            self.assertIn(str(bed.resolve()), command)
+            self.assertIn("[musicbed]", graph)
+            self.assertNotIn("afade=t=in", graph)
 
 
 if __name__ == "__main__":

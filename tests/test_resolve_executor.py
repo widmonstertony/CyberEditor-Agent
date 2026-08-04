@@ -4,10 +4,16 @@ import json
 import logging
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from src.resolve_executor import ClipDecision, DaVinciExecutor, Decimal
+from src.resolve_executor import (
+    ClipDecision,
+    DaVinciExecutor,
+    Decimal,
+    ResolveExecutorError,
+)
 
 
 class FakeItem:
@@ -147,6 +153,251 @@ class ResolveExecutorTests(unittest.TestCase):
 
         executor = DaVinciExecutor("timeline_cuts.json")
         self.assertEqual(executor._media_fps(NativeFpsItem()), Decimal("50"))
+
+    def test_transient_untitled_project_is_replaced_with_named_project(self):
+        transient = FakeProject()
+        transient.name = "Untitled Project"
+
+        class Manager:
+            def __init__(self):
+                self.current = transient
+
+            def GetCurrentProject(self):
+                return self.current
+
+            def GetProjectListInCurrentFolder(self):
+                return []
+
+            def CreateProject(self, name):
+                self.current = FakeProject()
+                self.current.name = name
+                return self.current
+
+        manager = Manager()
+
+        class Resolve:
+            def GetProjectManager(self):
+                return manager
+
+            def GetCurrentPage(self):
+                return None
+
+        executor = DaVinciExecutor(
+            "timeline_cuts.json", project_name="CyberEditor Project"
+        )
+        executor.resolve = Resolve()
+
+        returned_manager, project = executor.ensure_project()
+
+        self.assertIs(returned_manager, manager)
+        self.assertEqual(project.GetName(), "CyberEditor Project")
+        self.assertTrue(executor.created_project)
+
+    def test_ntsc_fps_rounding_is_accepted_in_strict_mode(self):
+        executor = DaVinciExecutor(
+            "timeline_cuts.json", strict_fps=True
+        )
+        executor.compare_fps(Decimal("59.94006"), Decimal("59.94"))
+        with self.assertRaises(ResolveExecutorError):
+            executor.compare_fps(Decimal("60"), Decimal("59.94"))
+
+    def test_new_project_fps_uses_resolve_ntsc_decimal(self):
+        project = FakeProject()
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.project = project
+
+        executor.initialize_new_project_fps(Decimal("59.94006"))
+
+        self.assertEqual(project.fps, "59.94")
+
+    def test_sony_pp8_color_management_is_required_before_import(self):
+        class ColorProject(FakeProject):
+            def __init__(self):
+                super().__init__()
+                self.settings = {}
+
+            def SetSetting(self, key, value):
+                self.settings[key] = value
+                return True
+
+        project = ColorProject()
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.project = project
+        executor.color_pipeline = {
+            "enabled": True,
+            "camera_profile": "sony_pp8_slog3_sgamut3cine",
+        }
+
+        executor.configure_color_pipeline()
+
+        self.assertEqual(project.settings["colorSpaceInput"], "Sony S-Gamut3.Cine")
+        self.assertEqual(project.settings["colorSpaceInputGamma"], "S-Log3")
+        self.assertEqual(project.settings["colorSpaceOutputGamma"], "Gamma 2.4")
+
+    def test_timeline_creation_falls_back_to_documented_overload(self):
+        project = FakeProject()
+
+        class FallbackMediaPool(FakeMediaPool):
+            def CreateEmptyTimeline(self, name):
+                return None
+
+            def CreateTimelineFromClips(self, name, clips):
+                self.project.timeline = FakeTimeline(name, self.project.fps)
+                return self.project.timeline
+
+        project.media_pool = FallbackMediaPool(project)
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.project = project
+        executor.media_pool = project.media_pool
+
+        timeline = executor.ensure_timeline()
+
+        self.assertEqual(timeline.GetName(), "CyberEditor Timeline")
+
+    def test_per_source_slog2_input_transform_is_applied(self):
+        class MediaItem:
+            def __init__(self):
+                self.calls = []
+                self.value = "Project"
+
+            def SetClipProperty(self, key, value):
+                self.calls.append((key, value))
+                if key == "Input Color Space" and value == "Sony S-Gamut":
+                    self.value = "S-Gamut/S-Log"
+                    return True
+                return False
+
+            def GetClipProperty(self, key=None):
+                if key == "Input Color Space":
+                    return self.value
+                return {"Input Color Space": self.value}
+
+        decision = ClipDecision(
+            1,
+            "source.mp4",
+            Decimal("0"),
+            Decimal("2"),
+            "Sony XML test",
+            source_color={
+                "is_log": True,
+                "transform_supported": True,
+                "resolve_input_color_space": "Sony S-Gamut",
+                "resolve_input_gamma": "S-Log2",
+            },
+        )
+        item = MediaItem()
+        executor = DaVinciExecutor("timeline_cuts.json")
+
+        executor._configure_media_input_transform(item, decision)
+
+        self.assertEqual(item.calls[0], ("Input Color Space", "Sony S-Gamut/S-Log2"))
+        self.assertIn(("Input Color Space", "Sony S-Gamut"), item.calls)
+        self.assertNotIn(("Input Gamma", "S-Log2"), item.calls)
+
+    def test_per_source_slog3_accepts_resolve_21_normalized_readback(self):
+        class MediaItem:
+            def __init__(self):
+                self.value = "Project"
+
+            def SetClipProperty(self, key, value):
+                if key == "Input Color Space" and value == "Sony S-Gamut3.Cine":
+                    self.value = "S-Gamut3.Cine/S-Log3"
+                    return True
+                return False
+
+            def GetClipProperty(self, key=None):
+                return self.value if key else {"Input Color Space": self.value}
+
+        decision = ClipDecision(
+            2,
+            "source.mp4",
+            Decimal("0"),
+            Decimal("2"),
+            "Sony XML test",
+            source_color={
+                "is_log": True,
+                "transform_supported": True,
+                "resolve_input_color_space": "Sony S-Gamut3.Cine",
+                "resolve_input_gamma": "S-Log3",
+            },
+        )
+        executor = DaVinciExecutor("timeline_cuts.json")
+
+        executor._configure_media_input_transform(MediaItem(), decision)
+
+    def test_preconformed_music_bed_allows_bounded_frame_rounding_without_loop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bed = Path(temporary) / "music_bed.wav"
+            bed.write_bytes(b"wav")
+
+            class Timeline:
+                def __init__(self):
+                    self.tracks = 1
+
+                def GetTrackCount(self, track_type):
+                    return self.tracks
+
+                def AddTrack(self, track_type, subtype):
+                    self.tracks += 1
+                    return True
+
+                def GetStartFrame(self):
+                    return 0
+
+            class MediaPool:
+                def __init__(self):
+                    self.appended = []
+
+                def AppendToTimeline(self, clip_infos):
+                    self.appended.extend(clip_infos)
+                    return [object()]
+
+            prepared = [
+                (
+                    ClipDecision(
+                        index,
+                        f"source-{index}.mp4",
+                        Decimal("0"),
+                        Decimal("0.02"),
+                        "frame rounding",
+                    ),
+                    {},
+                )
+                for index in range(3)
+            ]
+            executor = DaVinciExecutor("timeline_cuts.json")
+            executor.music_plan = {"bed_file": str(bed)}
+            executor.timeline = Timeline()
+            executor.media_pool = MediaPool()
+
+            with (
+                mock.patch.object(executor, "_import_media", return_value=[object()]),
+                mock.patch.object(executor, "_probe_media_duration", return_value=0.06),
+            ):
+                executor.append_music_bed(Decimal("25"), prepared)
+
+            self.assertEqual(len(executor.media_pool.appended), 1)
+            self.assertEqual(executor.media_pool.appended[0]["startFrame"], 0)
+            self.assertEqual(executor.media_pool.appended[0]["endFrame"], 1)
+
+    def test_resolve_process_detection_ignores_windows_code_page(self):
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=b'"Resolve.exe","1234","Console"\r\n\xd0',
+        )
+        with mock.patch(
+            "src.resolve_executor.subprocess.run", return_value=completed
+        ) as run:
+            self.assertTrue(DaVinciExecutor._is_resolve_running())
+
+        self.assertIs(run.call_args.kwargs["text"], False)
+
+    def test_resolve_process_detection_handles_missing_stdout(self):
+        completed = SimpleNamespace(returncode=0, stdout=None)
+        with mock.patch(
+            "src.resolve_executor.subprocess.run", return_value=completed
+        ):
+            self.assertFalse(DaVinciExecutor._is_resolve_running())
 
     def test_ai_effect_plan_calls_supported_resolve_apis(self):
         class TimelineItem:
@@ -302,7 +553,41 @@ class ResolveExecutorTests(unittest.TestCase):
             self.assertEqual(
                 executor.project.settings["TargetDir"], str(output.resolve())
             )
-            self.assertEqual(executor.project.settings["CustomName"], "documentary")
+            self.assertEqual(
+                executor.project.settings["CustomName"], "documentary"
+            )
+
+    def test_final_render_accepts_localized_complete_status(self):
+        class LocalizedRenderProject:
+            def SetRenderSettings(self, settings):
+                return True
+
+            def AddRenderJob(self):
+                return "job-localized"
+
+            def StartRendering(self, job_ids, interactive):
+                return True
+
+            def GetRenderJobStatus(self, job_id):
+                return {
+                    "JobStatus": "完成",
+                    "CompletionPercentage": 100,
+                }
+
+            def IsRenderingInProgress(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as temporary:
+            executor = DaVinciExecutor(
+                "timeline_cuts.json",
+                render_enabled=True,
+                render_dir=Path(temporary),
+            )
+            executor.project = LocalizedRenderProject()
+
+            status = executor.render_final()
+
+            self.assertEqual(status["JobStatus"], "完成")
 
     def test_mocked_run(self):
         with tempfile.TemporaryDirectory() as temporary:
