@@ -1326,7 +1326,10 @@ class DaVinciExecutor:
         if decision.color_look in color_values and callable(set_cdl):
             cdl = {"NodeIndex": "1", **color_values[decision.color_look]}
             match = decision.color_match or {}
-            if isinstance(match, dict):
+            if (
+                isinstance(match, dict)
+                and str(match.get("analysis_domain") or "") == "display_referred"
+            ):
                 try:
                     exposure_multiplier = 2.0 ** max(
                         -1.5, min(1.5, float(match.get("exposure_ev", 0)))

@@ -203,6 +203,15 @@ class MediaExtractor:
             for item in keyframes
             if isinstance(item, dict)
         )
+        # OpenCV reads the encoded camera samples.  Log footage therefore has
+        # not yet passed through its technical input transform; recording this
+        # domain prevents downstream code from applying mathematically invalid
+        # exposure/WB corrections after Resolve color management.
+        # OpenCV 读取的是相机编码值；Log 素材尚未技术还原，必须标记测量域，避免
+        # 下游把 Log 域统计错误地套到还原后的画面上。
+        color_analysis["analysis_domain"] = (
+            "encoded_log" if bool(source_color.get("is_log")) else "display_referred"
+        )
         duration = max(
             float(video_metadata.get("duration_sec", 0.0)),
             max((float(item["end_sec"]) for item in segments), default=0.0),

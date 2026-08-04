@@ -565,6 +565,8 @@ class ReviewRenderer:
         value = clip.color_match or {}
         if not isinstance(value, dict) or not value:
             return ""
+        if str(value.get("analysis_domain") or "") != "display_referred":
+            return ""
         try:
             exposure = max(-1.5, min(1.5, float(value.get("exposure_ev", 0))))
             raw = value.get("rgb_gain", [1.0, 1.0, 1.0])

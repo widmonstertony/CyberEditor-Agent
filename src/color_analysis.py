@@ -153,6 +153,12 @@ def build_project_color_match(assets: Sequence[Mapping[str, Any]]) -> Dict[str, 
         analysis = asset.get("color_analysis")
         if not isinstance(analysis, Mapping):
             continue
+        # Exposure and neutral balance are only comparable after all sources
+        # are in the same display-referred space.  Legacy/raw S-Log statistics
+        # are intentionally ignored instead of creating visible color drift.
+        # 只有同一显示域内的曝光和白平衡才可比较；旧版/原始 S-Log 统计一律忽略。
+        if str(analysis.get("analysis_domain") or "") != "display_referred":
+            continue
         try:
             luma = float(analysis.get("median_luma", 0))
             confidence = float(analysis.get("confidence", 0))
@@ -201,6 +207,7 @@ def build_project_color_match(assets: Sequence[Mapping[str, Any]]) -> Dict[str, 
             "confidence": round(confidence, 4),
             "reference_asset_id": str(reference[0].get("asset_id") or ""),
             "method": analysis.get("method", "unknown"),
+            "analysis_domain": "display_referred",
         }
     return {
         "enabled": True,

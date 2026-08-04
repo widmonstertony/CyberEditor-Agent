@@ -24,6 +24,7 @@ class ColorAnalysisTests(unittest.TestCase):
                 {
                     "asset_id": "dark",
                     "color_analysis": {
+                        "analysis_domain": "display_referred",
                         "median_luma": 0.1,
                         "rgb_gain": [1.4, 1.0, 0.7],
                         "confidence": 0.8,
@@ -33,6 +34,7 @@ class ColorAnalysisTests(unittest.TestCase):
                 {
                     "asset_id": "bright",
                     "color_analysis": {
+                        "analysis_domain": "display_referred",
                         "median_luma": 0.4,
                         "rgb_gain": [0.9, 1.0, 1.1],
                         "confidence": 0.8,
@@ -45,6 +47,24 @@ class ColorAnalysisTests(unittest.TestCase):
         self.assertEqual(set(match["assets"]), {"dark", "bright"})
         self.assertLessEqual(match["assets"]["dark"]["exposure_ev"], 1.5)
         self.assertGreaterEqual(match["assets"]["bright"]["exposure_ev"], -1.5)
+
+    def test_encoded_log_measurements_are_not_applied_after_color_management(self):
+        match = build_project_color_match(
+            [
+                {
+                    "asset_id": "slog",
+                    "color_analysis": {
+                        "analysis_domain": "encoded_log",
+                        "median_luma": 0.14,
+                        "rgb_gain": [1.4, 1.0, 0.7],
+                        "confidence": 0.9,
+                    },
+                }
+            ]
+        )
+
+        self.assertFalse(match["enabled"])
+        self.assertEqual(match["assets"], {})
 
 
 if __name__ == "__main__":

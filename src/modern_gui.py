@@ -784,20 +784,36 @@ class ModernCyberEditorApp:
                  if v == self.flow_key),
             self._on_flow_change
         )
+        # Put the creative intent before media/settings so the default workflow
+        # reads like a one-click editor: tell the director what the film should
+        # mean, or leave it blank and let the director discover the theme.
+        # 将创作意图放在素材与参数之前：可指定主题，也可留空让 AI 自由导演。
+        self._entry_field(
+            parent, 2, self.t("creative_brief"), self.creative_brief_var
+        )
+        ctk.CTkLabel(
+            parent,
+            text=self.t("creative_brief_hint"),
+            anchor="w",
+            justify="left",
+            wraplength=760,
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=10),
+        ).grid(row=3, column=0, sticky="ew", pady=(0, 7))
         self._path_field(
-            parent, 2, self.t("source_videos"), self.video_var,
+            parent, 4, self.t("source_videos"), self.video_var,
             self._choose_video, self.t("browse"), readonly=True
         )
         self._path_field(
-            parent, 3, self.t("input_folder"), self.input_folder_var,
+            parent, 5, self.t("input_folder"), self.input_folder_var,
             self._choose_input_folder, self.t("select_folder")
         )
         self._path_field(
-            parent, 4, self.t("runtime_data"), self.data_var,
+            parent, 6, self.t("runtime_data"), self.data_var,
             self._choose_data_dir, self.t("select_folder")
         )
         fps_row = ctk.CTkFrame(parent, fg_color="transparent")
-        fps_row.grid(row=5, column=0, sticky="ew", pady=(4, 12))
+        fps_row.grid(row=7, column=0, sticky="ew", pady=(4, 12))
         fps_row.grid_columnconfigure(0, weight=1)
         auto_fps_display = self._fps_auto_display()
         fps_values = [
@@ -822,7 +838,7 @@ class ModernCyberEditorApp:
             self._on_fps_change,
         )
 
-        self._section_title(parent, 6, self.t("ai_hardware"))
+        self._section_title(parent, 8, self.t("ai_hardware"))
         profile_values = [
             self.t("profile_auto"), self.t("profile_conservative"),
             self.t("profile_balanced"), self.t("profile_performance"),
@@ -833,7 +849,7 @@ class ModernCyberEditorApp:
             ("auto", "conservative", "balanced", "performance", "custom")
         ))
         self.profile_menu = self._option_field(
-            parent, 7, self.t("hardware_profile"), profile_values,
+            parent, 9, self.t("hardware_profile"), profile_values,
             next(k for k, v in self._profile_display_to_key.items()
                  if v == self.profile_key),
             self._on_profile_change
@@ -844,9 +860,9 @@ class ModernCyberEditorApp:
             fg_color=COLORS["card_alt"], text_color=COLORS["muted"],
             font=ctk.CTkFont(size=11)
         )
-        self.hardware_label.grid(row=8, column=0, sticky="ew", pady=(3, 9))
+        self.hardware_label.grid(row=10, column=0, sticky="ew", pady=(3, 9))
         ai = ctk.CTkFrame(parent, fg_color="transparent")
-        ai.grid(row=9, column=0, sticky="ew")
+        ai.grid(row=11, column=0, sticky="ew")
         ai.grid_columnconfigure((0, 1), weight=1, uniform="ai")
         self.whisper_menu = self._option_field(
             ai, 0, self.t("whisper_model"),
@@ -881,12 +897,9 @@ class ModernCyberEditorApp:
             ai, 3, self.t("ollama_url"), self.ollama_url_var, column=1
         )
 
-        self._section_title(parent, 10, self.t("director_settings"))
-        self._entry_field(
-            parent, 11, self.t("creative_brief"), self.creative_brief_var
-        )
+        self._section_title(parent, 12, self.t("director_settings"))
         directing = ctk.CTkFrame(parent, fg_color="transparent")
-        directing.grid(row=12, column=0, sticky="ew")
+        directing.grid(row=13, column=0, sticky="ew")
         directing.grid_columnconfigure((0, 1), weight=1, uniform="directing")
         self._entry_field(
             directing, 0, self.t("target_duration"), self.target_duration_var,
@@ -939,11 +952,11 @@ class ModernCyberEditorApp:
             column=1,
         )
         self._path_field(
-            parent, 13, self.t("music_folder"), self.music_folder_var,
+            parent, 14, self.t("music_folder"), self.music_folder_var,
             self._choose_music_folder, self.t("select_folder")
         )
         self._entry_field(
-            parent, 14, self.t("jamendo_client_id"), self.jamendo_client_id_var
+            parent, 15, self.t("jamendo_client_id"), self.jamendo_client_id_var
         )
         self.music_warning_label = ctk.CTkLabel(
             parent,
@@ -958,11 +971,11 @@ class ModernCyberEditorApp:
             text_color=COLORS["error"],
             font=ctk.CTkFont(size=10),
         )
-        self.music_warning_label.grid(row=15, column=0, sticky="ew", pady=(2, 8))
+        self.music_warning_label.grid(row=16, column=0, sticky="ew", pady=(2, 8))
 
-        self._section_title(parent, 16, self.t("resolve_settings"))
+        self._section_title(parent, 17, self.t("resolve_settings"))
         resolve = ctk.CTkFrame(parent, fg_color="transparent")
-        resolve.grid(row=17, column=0, sticky="ew")
+        resolve.grid(row=18, column=0, sticky="ew")
         resolve.grid_columnconfigure((0, 1), weight=1, uniform="resolve")
         self._entry_field(
             resolve, 0, self.t("timeline_name"), self.timeline_var, column=0
@@ -992,7 +1005,7 @@ class ModernCyberEditorApp:
             self.macro_profile_var, column=0, columnspan=2
         )
         switches = ctk.CTkFrame(parent, fg_color="transparent")
-        switches.grid(row=18, column=0, sticky="ew", pady=(7, 14))
+        switches.grid(row=19, column=0, sticky="ew", pady=(7, 14))
         switches.grid_columnconfigure((0, 1), weight=1)
         self.run_resolve_switch = ctk.CTkSwitch(
             switches, text=self.t("run_resolve"),

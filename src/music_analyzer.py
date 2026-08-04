@@ -33,6 +33,23 @@ from urllib import request as urllib_request
 LOGGER_NAME = "cybereditor.music"
 AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus"}
 
+# Search providers return every kind of video, not only music.  Keep this
+# deliberately conservative: a false negative merely removes one candidate,
+# while a false positive can put spoken English under the finished film.
+# 搜索平台返回的不只有音乐。这里宁可少一个候选，也不能把访谈/解说混进成片。
+SPEECH_RISK_TERMS = (
+    "interview", "podcast", "conversation", "spoken word", "speech",
+    "audiobook", "news", "tutorial", "reaction", "review", "vlog",
+    "shows off", "collected |", "explains", "talks about", "q&a",
+    "访谈", "采访", "播客", "解说", "教程", "评测", "新闻", "有声书",
+)
+MUSIC_SIGNAL_TERMS = (
+    "instrumental", "music", "score", "soundtrack", "bgm", "background music",
+    "cinematic", "ambient", "beat", "track", "synthwave", "orchestral",
+    "royalty free", "no copyright", "underscore", "theme", "ost",
+    "纯音乐", "配乐", "原声", "音乐", "伴奏", "氛围音乐", "电影音乐",
+)
+
 
 class MusicAnalysisError(RuntimeError):
     """Expected music-pipeline failure. / 可预期的配乐流水线错误。"""
@@ -100,12 +117,37 @@ class MusicCandidateAcquirer:
             queries = ["cinematic documentary instrumental emotional arc"]
         result: List[str] = []
         seen = set()
+        instrumental_only = (
+            str(brief.get("vocal_policy") or "").casefold() == "instrumental_only"
+        )
         for query in queries:
+            if instrumental_only and not any(
+                token in query.casefold() for token in ("instrumental", "纯音乐", "no vocal")
+            ):
+                query = f"{query} instrumental background music no vocals"
             key = query.casefold()
             if key not in seen:
                 seen.add(key)
                 result.append(query)
         return result[:6]
+
+    @staticmethod
+    def _classify_search_entry(entry: Dict[str, Any]) -> Dict[str, bool]:
+        """Classify obvious speech/video results before download. / 下载前识别明显的人声节目结果。"""
+        categories = entry.get("categories") if isinstance(entry.get("categories"), list) else []
+        tags = entry.get("tags") if isinstance(entry.get("tags"), list) else []
+        haystack = " ".join(
+            str(value or "")
+            for value in (
+                entry.get("title"), entry.get("description"), entry.get("uploader"),
+                entry.get("channel"), " ".join(map(str, categories)),
+                " ".join(map(str, tags)),
+            )
+        ).casefold()
+        return {
+            "speech_risk": any(term in haystack for term in SPEECH_RISK_TERMS),
+            "instrumental_match": any(term in haystack for term in MUSIC_SIGNAL_TERMS),
+        }
 
     def acquire_ytdlp(
         self,
@@ -194,10 +236,27 @@ class MusicCandidateAcquirer:
                 # 避免把数小时合集当作单条候选下载。
                 if duration and not 45.0 <= duration <= 1200.0:
                     continue
+                classification = self._classify_search_entry(entry)
+                if classification["speech_risk"]:
+                    self.logger.info(
+                        "跳过疑似访谈/解说：%s / Skipping likely spoken-word result",
+                        entry.get("title") or url,
+                    )
+                    continue
+                if (
+                    str(brief.get("vocal_policy") or "").casefold() == "instrumental_only"
+                    and not classification["instrumental_match"]
+                ):
+                    self.logger.info(
+                        "跳过无法确认是纯音乐的结果：%s / Skipping result without a music signal",
+                        entry.get("title") or url,
+                    )
+                    continue
                 seen_urls.add(url)
                 item = dict(entry)
                 item["source_url"] = url
                 item["search_query"] = query
+                item.update(classification)
                 metadata.append(item)
 
         if not metadata:
@@ -265,6 +324,8 @@ class MusicCandidateAcquirer:
                 "license_provenance": "user_confirmation",
                 "source_url": url,
                 "provider": "yt_dlp_unverified",
+                "speech_risk": bool(item.get("speech_risk")),
+                "instrumental_match": bool(item.get("instrumental_match")),
                 "sha256": sha256_file(downloaded),
                 "rights_claim": rights_claim.strip(),
             })
@@ -272,7 +333,10 @@ class MusicCandidateAcquirer:
             raise MusicAnalysisError(
                 "候选音频均下载失败 / Every candidate audio download failed."
             )
-        atomic_write_json({"tracks": manifest_tracks}, self.cache_dir / "library.json")
+        atomic_write_json(
+            {"managed_provider_cache": True, "tracks": manifest_tracks},
+            self.cache_dir / "library.json",
+        )
         audit = {
             "schema_version": "1.0",
             "provider": "yt_dlp_unverified",
@@ -425,11 +489,31 @@ class LicensedMusicAnalyzer:
     def discover(self) -> List[Dict[str, Any]]:
         """Discover files and attach honest rights provenance. / 查找音频并附加真实权利来源。"""
         tracks: List[Dict[str, Any]] = []
+        manifest_exists = (self.library / "library.json").is_file()
         for path in sorted(self.library.rglob("*"), key=lambda p: str(p).casefold()):
             if not path.is_file() or path.suffix.casefold() not in AUDIO_SUFFIXES:
                 continue
             relative = path.relative_to(self.library)
-            metadata = self._manifest.get(str(relative).replace("\\", "/").casefold(), {})
+            relative_key = str(relative).replace("\\", "/").casefold()
+            # A manifest makes this a managed candidate cache.  Files left by
+            # older searches are not user-supplied music and must not silently
+            # bypass the current candidate list.
+            # 有清单时即视为受管缓存；旧搜索残留文件不能冒充用户本地音乐。
+            if manifest_exists and relative_key not in self._manifest:
+                self.logger.info(
+                    "忽略未登记的旧配乐缓存：%s / Ignoring unmanifested stale audio cache",
+                    relative,
+                )
+                continue
+            metadata = self._manifest.get(relative_key, {})
+            classification = MusicCandidateAcquirer._classify_search_entry(metadata)
+            speech_risk = bool(metadata.get("speech_risk", classification["speech_risk"]))
+            if speech_risk:
+                self.logger.warning(
+                    "拒绝疑似访谈/解说候选：%s / Rejecting likely spoken-word candidate",
+                    metadata.get("title") or relative,
+                )
+                continue
             explicitly_licensed = bool(metadata.get("licensed"))
             tracks.append({
                 "file_name": str(path),
@@ -448,6 +532,10 @@ class LicensedMusicAnalyzer:
                 )),
                 "source_url": str(metadata.get("source_url") or ""),
                 "provider": str(metadata.get("provider") or "local"),
+                "speech_risk": speech_risk,
+                "instrumental_match": bool(
+                    metadata.get("instrumental_match", classification["instrumental_match"])
+                ),
                 "sha256": str(metadata.get("sha256") or sha256_file(path)),
                 "rights_claim": str(metadata.get("rights_claim") or ""),
             })

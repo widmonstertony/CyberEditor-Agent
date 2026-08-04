@@ -289,6 +289,93 @@ class AIDirectorTests(unittest.TestCase):
 
         self.assertEqual(len(merged), 2)
 
+    def test_story_coverage_does_not_force_every_source_into_the_film(self):
+        director = self.make_director()
+        candidates = []
+        roles = ["opening", "context", "climax", "closing", "context", "context"]
+        summaries = [
+            "An empty road establishes the location",
+            "Friends unload motorcycles and prepare helmets",
+            "The engines start and the group launches",
+            "Tail lights disappear into the night",
+            "A rider tightens a glove before departure",
+            "Wide skyline reveals the scale of the route",
+        ]
+        for index, role in enumerate(roles):
+            candidates.append(
+                {
+                    "candidate_id": f"C{index + 1:04d}",
+                    "source_order": index,
+                    "file_name": f"source-{index}.mp4",
+                    "cut_in_sec": 0.0,
+                    "cut_out_sec": 3.0,
+                    "story_role": role,
+                    "visual_summary": summaries[index],
+                    "reason_for_cut": summaries[index],
+                    "quality_score": 0.8,
+                    "confidence": 0.8,
+                }
+            )
+
+        result = director._complete_story_coverage(
+            [candidates[0], candidates[2], candidates[3]],
+            candidates,
+            {"target_duration_sec": 10.0, "chronology_policy": "strict_chronological"},
+        )
+
+        self.assertLess(len({item["source_order"] for item in result}), len(candidates))
+        self.assertEqual(
+            {director._canonical_story_beat(item) for item in result},
+            {"opening", "development", "payoff", "ending"},
+        )
+
+    def test_semantically_repeated_countdowns_are_collapsed(self):
+        director = self.make_director()
+        clips = [
+            {
+                "candidate_id": "C0001",
+                "visual_summary": "Riders are geared up; a voice counts 3 2 1 before engines rev",
+                "reason_for_cut": "The group prepares to launch", "source_order": 1,
+            },
+            {
+                "candidate_id": "C0002", "visual_summary": "The final cue is 3 2 1 Start",
+                "reason_for_cut": "Definitive action ending", "source_order": 2,
+            },
+        ]
+
+        self.assertEqual(len(director._remove_semantic_redundancy(clips)), 1)
+
+    def test_global_creative_look_is_uniform_across_selected_clips(self):
+        director = self.make_director()
+        candidates = [
+            {
+                "candidate_id": "C0001", "asset_id": "a", "source_order": 0,
+                "file_name": "a.mp4", "cut_in_sec": 0.0, "cut_out_sec": 3.0,
+                "story_role": "opening", "visual_summary": "The group gathers",
+                "reason_for_cut": "Opening", "color_look": "cool",
+            },
+            {
+                "candidate_id": "C0002", "asset_id": "b", "source_order": 1,
+                "file_name": "b.mp4", "cut_in_sec": 0.0, "cut_out_sec": 3.0,
+                "story_role": "closing", "visual_summary": "The group leaves",
+                "reason_for_cut": "Ending", "color_look": "contrast",
+            },
+        ]
+        sequence = {
+            "sequence": [
+                {"candidate_id": "C0001", "reason_for_position": "start"},
+                {"candidate_id": "C0002", "reason_for_position": "finish"},
+            ]
+        }
+        treatment = {
+            "creative_look": "cinematic_warm", "target_duration_sec": 6.0,
+            "chronology_policy": "strict_chronological",
+        }
+
+        result = director.validate_sequence(sequence, candidates, treatment)
+
+        self.assertEqual({item["color_look"] for item in result}, {"warm"})
+
     def test_parse_fenced_json(self):
         parsed = AIDirector.parse_generated_json(
             '```json\n{"decisions": []}\n```'

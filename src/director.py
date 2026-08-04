@@ -16,6 +16,7 @@ import argparse
 import base64
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from difflib import SequenceMatcher
 import hashlib
 import json
 import logging
@@ -29,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 LOGGER_NAME = "cybereditor.director"
 DIRECTOR_CHECKPOINT_VERSION = 1
-DIRECTOR_PROMPT_VERSION = "2026-08-03.2-two-pass-music-director"
+DIRECTOR_PROMPT_VERSION = "2026-08-03.3-story-first-one-click"
 
 TREATMENT_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -822,14 +823,18 @@ class AIDirector:
         candidates = self.merge_decisions(candidates)
         for index, candidate in enumerate(candidates, start=1):
             candidate["candidate_id"] = f"C{index:04d}"
-        final_clips = self._remove_overlaps(candidates)
+        final_clips = self._complete_story_coverage([], candidates, treatment)
+        final_clips = self._remove_overlaps(final_clips)
         global_look = {
             "clean_neutral": "neutral", "cinematic_warm": "warm",
             "cool_steel": "cool", "high_contrast": "contrast",
         }.get(str(treatment.get("creative_look") or ""), "neutral")
         for clip in final_clips:
-            if str(clip.get("color_look") or "neutral") in {"source", "neutral"}:
-                clip["color_look"] = global_look
+            # One film gets one creative baseline.  Per-shot look changes made
+            # matching Sony Log sources appear inconsistent and are never a
+            # safe substitute for a deliberate scene-level grade.
+            # 一部成片只使用一个创意基线，禁止逐镜头随机冷暖漂移。
+            clip["color_look"] = global_look
         final_clips = self._fit_target_duration(final_clips, treatment)
         for index, clip in enumerate(final_clips, start=1):
             clip["clip_id"] = index
@@ -1795,8 +1800,9 @@ class AIDirector:
             "search queries, instrumentation, a useful tempo range, vocal policy, "
             "one to three cues, and intentional silence. Prefer instrumental music "
             "under dialogue. Search terms must describe emotion, genre, pacing, and "
-            "instrumentation rather than copyrighted song titles. Use the exact "
-            "requested target duration (within one second). The camera "
+            "instrumentation rather than copyrighted song titles. Treat the requested "
+            "duration as an editorial target, never as permission to pad with repeated "
+            "or weak footage. The camera "
             "profile is technical input metadata, not a creative look. Return JSON only.\n"
             f"USER CREATIVE BRIEF: {brief}\n"
             f"REQUESTED TARGET DURATION: {self._active_target_duration_sec:.1f} seconds\n"
@@ -2534,9 +2540,10 @@ class AIDirector:
             "finish deliberately. Preserve complete thoughts. Choose restrained "
             "transitions and effects from the schema; default to hard cuts, use "
             "cross dissolves for genuine time/mood changes, and fade_black only "
-            "for major chapter endings. Keep the sum of selected clip durations "
-            f"between {self._active_target_duration_sec * 0.85:.1f} and "
-            f"{self._active_target_duration_sec * 1.10:.1f} seconds. Select only "
+            "for major chapter endings. Keep the sum of selected clip durations at "
+            f"or below {self._active_target_duration_sec * 1.10:.1f} seconds. A shorter "
+            "complete film is better than padding to the target: never repeat an action, "
+            "idea, lineup, countdown, or setup merely to reach runtime. Select only "
             "the strongest minority of candidates; never include everything. "
             "Return project_summary and sequence only; the next constrained call "
             "will score music against this exact edit. Return JSON only.\n"
@@ -2801,9 +2808,9 @@ class AIDirector:
                 smart_reframe if isinstance(smart_reframe, bool) else False
             )
             final.append(clip)
-        # The executor receives a real time-flow edit. Model ordering is advisory;
-        # local validation prevents a visually plausible response from jumping from
-        # the last take back to early setup footage.
+        # Preserve the director's sequence for explicitly non-linear treatments;
+        # otherwise enforce real shooting chronology as promised by the treatment.
+        # 非线性方案保留导演排序；严格时间流方案才按拍摄顺序排序。
         active_treatment = treatment or self._active_treatment
         global_look = {
             "clean_neutral": "neutral",
@@ -2811,18 +2818,12 @@ class AIDirector:
             "cool_steel": "cool",
             "high_contrast": "contrast",
         }.get(str(active_treatment.get("creative_look") or ""), "neutral")
-        final.sort(
-            key=lambda item: (
-                int(item.get("source_order", 0)),
-                float(item.get("cut_in_sec", 0)),
-                float(item.get("cut_out_sec", 0)),
-            )
-        )
+        final = self._order_story_clips(final, active_treatment)
+        final = self._remove_semantic_redundancy(final)
         final = self._complete_story_coverage(final, candidates, active_treatment)
         final = self._remove_overlaps(final)
         for clip in final:
-            if str(clip.get("color_look") or "neutral") in {"source", "neutral"}:
-                clip["color_look"] = global_look
+            clip["color_look"] = global_look
         return self._fit_target_duration(final, active_treatment)
 
     def _remove_overlaps(
@@ -2853,29 +2854,25 @@ class AIDirector:
         treatment: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """
-        Fill missing treatment beats and minimum runtime from inspected candidates.
-        从已审片候选中补齐缺失叙事节拍与最低时长。
+        Fill only missing treatment beats from inspected candidates.
+        仅从已审片候选中补齐缺失叙事节拍，不为凑时长填充镜头。
         """
-        result = [dict(item) for item in selected]
+        result = self._remove_semantic_redundancy(selected)
         used = {str(item.get("candidate_id") or "") for item in result}
-        target = float(treatment.get("target_duration_sec") or 90.0)
-        minimum = target * 0.85
-
-        def duration(item: Dict[str, Any]) -> float:
-            return float(item["cut_out_sec"]) - float(item["cut_in_sec"])
-
-        available_sources = {
-            int(item.get("source_order", 0)) for item in candidates
-        }
-        selected_sources = {
-            int(item.get("source_order", 0)) for item in result
-        }
-        missing_sources = sorted(available_sources - selected_sources)
-        for source_order in missing_sources:
+        # Coverage means a complete story, not one obligatory shot from every
+        # source file.  The previous all-source rule was the direct cause of
+        # repeated countdowns, setup takes, and edits without a central idea.
+        # “覆盖”指覆盖叙事节拍，而不是强制每个源文件都出镜。
+        required_beats = ("opening", "development", "payoff", "ending")
+        selected_beats = {self._canonical_story_beat(item) for item in result}
+        for beat in required_beats:
+            if beat in selected_beats:
+                continue
             options = [
                 item for item in candidates
-                if int(item.get("source_order", 0)) == source_order
+                if self._canonical_story_beat(item) == beat
                 and str(item.get("candidate_id") or "") not in used
+                and not self._is_semantically_redundant(item, result)
             ]
             if not options:
                 continue
@@ -2889,29 +2886,90 @@ class AIDirector:
             )
             result.append(dict(choice))
             used.add(str(choice.get("candidate_id") or ""))
+            selected_beats.add(beat)
 
-        ranked = sorted(
-            (
-                item for item in candidates
-                if str(item.get("candidate_id") or "") not in used
-            ),
-            key=lambda item: (
-                bool(item.get("protected_story_anchor")),
-                float(item.get("quality_score", 0.5))
-                + float(item.get("confidence", 0.5)),
-            ),
-            reverse=True,
+        return self._order_story_clips(result, treatment)
+
+    @staticmethod
+    def _canonical_story_beat(item: Dict[str, Any]) -> str:
+        """Map model labels to four film-level beats. / 将模型标签归并为四个成片叙事节拍。"""
+        text = " ".join(
+            str(item.get(key) or "")
+            for key in ("treatment_beat", "story_role")
+        ).casefold()
+        if any(token in text for token in ("opening", "intro", "setup", "开场", "引入")):
+            return "opening"
+        if any(token in text for token in ("closing", "ending", "resolution", "结尾", "收束")):
+            return "ending"
+        if any(token in text for token in ("payoff", "climax", "高潮", "兑现")):
+            return "payoff"
+        return "development"
+
+    @staticmethod
+    def _story_text(item: Dict[str, Any]) -> str:
+        """Return normalized semantic text for repetition checks. / 返回用于查重的规范化语义文本。"""
+        return " ".join(
+            " ".join(str(item.get(key) or "").casefold().split())
+            for key in ("visual_summary", "reason_for_cut", "transcript_excerpt")
+        ).strip()
+
+    @classmethod
+    def _is_semantically_redundant(
+        cls, candidate: Dict[str, Any], selected: Sequence[Dict[str, Any]]
+    ) -> bool:
+        """Reject near-identical visual/story statements. / 拒绝语义近乎相同的重复镜头。"""
+        candidate_text = cls._story_text(candidate)
+        if len(candidate_text) < 5:
+            return False
+        candidate_tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", candidate_text))
+        candidate_is_countdown = (
+            all(value in candidate_tokens for value in ("1", "2", "3"))
+            and any(token in candidate_text for token in ("count", "start", "倒计时", "开始"))
         )
-        while sum(duration(item) for item in result) < minimum and ranked:
-            choice = ranked.pop(0)
-            result.append(dict(choice))
-            used.add(str(choice.get("candidate_id") or ""))
-        result.sort(
-            key=lambda item: (
-                int(item.get("source_order", 0)),
-                float(item.get("cut_in_sec", 0)),
+        for existing in selected:
+            existing_text = cls._story_text(existing)
+            if len(existing_text) < 5:
+                continue
+            existing_tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", existing_text))
+            existing_is_countdown = (
+                all(value in existing_tokens for value in ("1", "2", "3"))
+                and any(token in existing_text for token in ("count", "start", "倒计时", "开始"))
             )
-        )
+            if candidate_is_countdown and existing_is_countdown:
+                return True
+            union = candidate_tokens | existing_tokens
+            jaccard = len(candidate_tokens & existing_tokens) / len(union) if union else 0.0
+            similarity = SequenceMatcher(None, candidate_text, existing_text).ratio()
+            if jaccard >= 0.72 or similarity >= 0.82:
+                return True
+        return False
+
+    @classmethod
+    def _remove_semantic_redundancy(
+        cls, clips: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Keep the first editorially distinct instance of each idea. / 每个叙事信息只保留首个有效镜头。"""
+        result: List[Dict[str, Any]] = []
+        for item in clips:
+            candidate = dict(item)
+            if not cls._is_semantically_redundant(candidate, result):
+                result.append(candidate)
+        return result
+
+    @staticmethod
+    def _order_story_clips(
+        clips: Sequence[Dict[str, Any]], treatment: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Apply the treatment's chronology promise. / 应用导演阐述中的时间结构承诺。"""
+        result = [dict(item) for item in clips]
+        if str(treatment.get("chronology_policy") or "") == "strict_chronological":
+            result.sort(
+                key=lambda item: (
+                    int(item.get("source_order", 0)),
+                    float(item.get("cut_in_sec", 0)),
+                    float(item.get("cut_out_sec", 0)),
+                )
+            )
         return result
 
     def _fit_target_duration(
@@ -2980,12 +3038,7 @@ class AIDirector:
         if len(selected) < 3 and len(copied) >= 3:
             middle = len(copied) // 2
             selected.append(copied[middle])
-        selected.sort(
-            key=lambda item: (
-                int(item.get("source_order", 0)),
-                float(item.get("cut_in_sec", 0)),
-            )
-        )
+        selected = self._order_story_clips(selected, treatment)
         self.logger.info(
             "时长守门：%d 个模型片段压缩为 %d 个，目标 %.1fs / Runtime guard: %d clips -> %d, target %.1fs",
             len(copied), len(selected), target, len(copied), len(selected), target,

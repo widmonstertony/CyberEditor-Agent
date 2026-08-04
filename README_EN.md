@@ -28,6 +28,13 @@ load a media folder. It also includes Whisper and Ollama settings, resumable
 workflow modes, Resolve controls, a watchable preview render, live logs, stage
 progress, safe cancellation, environment checks, and output shortcuts.
 
+A prominent `Film theme / AI director brief` field accepts the intended theme,
+audience, pace, or ending (for example, “an energetic night-ride short from
+meeting up to riding out”). Leave it blank for AI free direction across all
+footage. Target runtime is an editorial ceiling and goal, not a padding quota:
+the local gate completes setup, development, payoff, and ending without forcing
+every source file into the movie or repeating an action/countdown to fill time.
+
 The full workflow does not merely concatenate every file. Each source is
 transcribed and sampled into time-distributed real frames. A vision model
 first writes a project-wide treatment with theme, four story beats, target
@@ -40,6 +47,13 @@ gain, stabilization, tracking, and a one-to-three-cue pre-mixed score chosen by
 the two-director pipeline. The result can include an editable
 Resolve timeline, an immediately watchable FFmpeg 1080p review, and a final
 movie rendered by Resolve's Deliver pipeline.
+
+Online music uses an authoritative manifest: stale downloads cannot masquerade
+as user-supplied tracks, and interview, podcast, narration, and show-like results
+are rejected before download and again before analysis. One global creative
+grade is applied across the film. Exposure/white-balance measurements made in
+encoded S-Log space are never incorrectly applied after the technical input
+transform, preventing per-shot brightness and color drift.
 
 The modern UI uses lightweight CustomTkinter and launches the existing
 `main.py` orchestrator as a child process. The resident UI never imports
