@@ -182,6 +182,46 @@ class WorkflowOrchestrator:
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         self.active_process: Optional[subprocess.Popen] = None
 
+    @staticmethod
+    def _has_continuous_visual_review(raw_data: Path) -> bool:
+        """
+        Validate full-span visual review metadata for every source asset.
+        验证每条源素材都包含覆盖完整时长的连续视觉审片元数据。
+
+        Legacy extraction stored only occasional scene thumbnails. It remains
+        a valid archive, but is insufficient for the current director, which
+        reviews every one-second temporal sample in sequence.
+        """
+        try:
+            payload = json.loads(raw_data.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        assets = payload.get("assets") if isinstance(payload, dict) else None
+        if not isinstance(assets, list) or not assets:
+            return False
+        for asset in assets:
+            if not isinstance(asset, dict):
+                return False
+            sampling = asset.get("visual_sampling")
+            keyframes = asset.get("keyframes")
+            if not isinstance(sampling, dict) or not isinstance(keyframes, list):
+                return False
+            try:
+                interval = float(sampling.get("requested_interval_sec"))
+                saved = int(sampling.get("saved_frame_count"))
+            except (TypeError, ValueError):
+                return False
+            if (
+                sampling.get("mode") != "continuous_temporal_coverage"
+                or sampling.get("complete_source_span") is not True
+                or interval <= 0
+                or interval > 1.05
+                or saved <= 0
+                or saved != len(keyframes)
+            ):
+                return False
+        return True
+
     def run(self, args: argparse.Namespace) -> None:
         """
         Execute selected stages and verify every handoff artifact.
@@ -194,6 +234,24 @@ class WorkflowOrchestrator:
 
         explicit_videos = self._argument_list(getattr(args, "video", None))
         explicit_proxies = self._argument_list(getattr(args, "proxy", None))
+        if args.skip_extraction and not args.skip_director:
+            self._require_file(raw_data, "跳过提取时需要现有 raw_data.json")
+            if not self._has_continuous_visual_review(raw_data):
+                has_sources = bool(
+                    explicit_videos or getattr(args, "input_folder", None)
+                )
+                if not has_sources:
+                    raise WorkflowError(
+                        "现有 raw_data.json 来自旧版稀疏审片，且没有提供源素材，无法自动升级。"
+                        "请重新选择素材并运行完整流程。 / Existing extraction uses legacy sparse "
+                        "review data and no source media was supplied; select the media and run again."
+                    )
+                args.skip_extraction = False
+                self.logger.warning(
+                    "检测到旧版稀疏审片数据；已自动取消 --skip-extraction，将按完整时长每秒重新审片。"
+                    " / Legacy sparse visual data detected; extraction will rerun automatically "
+                    "with full-span one-second coverage."
+                )
         sources: List[Path] = []
         proxy_map: Dict[Path, Path] = {}
         if not args.skip_extraction:

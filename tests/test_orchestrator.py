@@ -1,6 +1,7 @@
 """Tests for process serialization and workflow locking."""
 
 import argparse
+import json
 import logging
 import os
 from pathlib import Path
@@ -118,6 +119,43 @@ class OrchestratorTests(unittest.TestCase):
                 logger=logging.getLogger("test.orchestrator"),
             )
             orchestrator.run(args)
+
+    def test_continuous_visual_review_rejects_legacy_sparse_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw_data = Path(temporary) / "raw_data.json"
+            raw_data.write_text(
+                json.dumps({"assets": [{"keyframes": [{"timestamp_sec": 0}]}]}),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(
+                WorkflowOrchestrator._has_continuous_visual_review(raw_data)
+            )
+
+    def test_continuous_visual_review_accepts_full_span_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw_data = Path(temporary) / "raw_data.json"
+            raw_data.write_text(
+                json.dumps({
+                    "assets": [{
+                        "visual_sampling": {
+                            "mode": "continuous_temporal_coverage",
+                            "requested_interval_sec": 1.0,
+                            "saved_frame_count": 2,
+                            "complete_source_span": True,
+                        },
+                        "keyframes": [
+                            {"timestamp_sec": 0},
+                            {"timestamp_sec": 1},
+                        ],
+                    }],
+                }),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                WorkflowOrchestrator._has_continuous_visual_review(raw_data)
+            )
 
 
 if __name__ == "__main__":

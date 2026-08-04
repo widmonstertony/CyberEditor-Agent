@@ -120,9 +120,6 @@ class MusicCandidateAcquirer:
         instrumental_only = (
             str(brief.get("vocal_policy") or "").casefold() == "instrumental_only"
         )
-        tempo = brief.get("tempo_bpm") if isinstance(brief.get("tempo_bpm"), dict) else {}
-        tempo_min = int(float(tempo.get("min", 0) or 0))
-        tempo_max = int(float(tempo.get("max", 0) or 0))
         emotion_arc = " ".join(str(brief.get("emotion_arc") or "").split())
         arc_text = emotion_arc.casefold()
         needs_build = any(
@@ -133,21 +130,82 @@ class MusicCandidateAcquirer:
             )
         )
         for query in queries:
+            # Discovery engines work best with compact genre, mood, and usage
+            # terms. Exact BPM and the director's prose arc belong in ranking;
+            # appending them here can make a healthy search return no entries.
+            query = " ".join(query.split()[:14])
             if instrumental_only and not any(
                 token in query.casefold() for token in ("instrumental", "纯音乐", "no vocal")
             ):
-                query = f"{query} instrumental background music no vocals"
-            if tempo_min and tempo_max and "bpm" not in query.casefold():
-                query = f"{query} {tempo_min}-{tempo_max} BPM"
-            if emotion_arc and emotion_arc.casefold() not in query.casefold():
-                query = f"{query} {emotion_arc}"
-            if needs_build and "dynamic sections" not in query.casefold():
-                query = f"{query} gradual build crescendo dynamic sections"
+                query = f"{query} instrumental no vocals"
+            if needs_build and "build" not in query.casefold():
+                query = f"{query} gradual build"
+            if len(query) > 110:
+                query = query[:110].rsplit(" ", 1)[0]
             key = query.casefold()
             if key not in seen:
                 seen.add(key)
                 result.append(query)
+        mood = " ".join(str(brief.get("mood") or "").split()[:6])
+        broad = (
+            f"{mood} cinematic instrumental"
+            if mood
+            else "cinematic documentary instrumental"
+        )
+        if broad.casefold() not in seen:
+            result.append(broad)
         return result[:6]
+
+    def _audited_cache_track_count(self) -> int:
+        """
+        Count reusable files from a previous explicitly audited yt-dlp run.
+        统计此前已有用户权利审计记录、可以安全复用的项目本地候选音乐。
+
+        A transient search failure must not erase or overwrite a valid local
+        library. Both the managed manifest and its rights audit are required,
+        and accepted paths must remain inside the cache directory.
+        """
+        library_path = self.cache_dir / "library.json"
+        audit_path = self.cache_dir / "rights_audit.json"
+        try:
+            library = json.loads(library_path.read_text(encoding="utf-8-sig"))
+            audit = json.loads(audit_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if not isinstance(library, dict) or not library.get("managed_provider_cache"):
+            return 0
+        if not isinstance(audit, dict) or audit.get("provider") != "yt_dlp_unverified":
+            return 0
+        tracks = library.get("tracks")
+        if not isinstance(tracks, list):
+            return 0
+        count = 0
+        for item in tracks:
+            if not isinstance(item, dict) or item.get("provider") != "yt_dlp_unverified":
+                continue
+            file_name = str(item.get("file") or "").strip()
+            if not file_name:
+                continue
+            candidate = (self.cache_dir / file_name).resolve()
+            try:
+                candidate.relative_to(self.cache_dir)
+            except ValueError:
+                continue
+            if candidate.is_file() and candidate.suffix.casefold() in AUDIO_SUFFIXES:
+                count += 1
+        return count
+
+    def _reuse_audited_cache(self, reason: str) -> Optional[Path]:
+        """Reuse an audited cache after provider failure. / 来源暂时失败时复用已审计缓存。"""
+        count = self._audited_cache_track_count()
+        if not count:
+            return None
+        self.logger.warning(
+            "%s; reusing %d previously audited project tracks",
+            reason,
+            count,
+        )
+        return self.cache_dir
 
     @staticmethod
     def _summarize_energy_arc(energy_curve: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -349,6 +407,11 @@ class MusicCandidateAcquirer:
                 metadata.append(item)
 
         if not metadata:
+            cached = self._reuse_audited_cache(
+                "online search returned no candidates"
+            )
+            if cached is not None:
+                return cached
             raise MusicAnalysisError(
                 "在线检索没有返回候选。请检查网络与 yt-dlp。 / Online search returned no candidates."
             )
@@ -419,6 +482,11 @@ class MusicCandidateAcquirer:
                 "rights_claim": rights_claim.strip(),
             })
         if not manifest_tracks:
+            cached = self._reuse_audited_cache(
+                "every new candidate download failed"
+            )
+            if cached is not None:
+                return cached
             raise MusicAnalysisError(
                 "候选音频均下载失败 / Every candidate audio download failed."
             )

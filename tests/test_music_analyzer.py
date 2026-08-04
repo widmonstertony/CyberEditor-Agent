@@ -69,9 +69,9 @@ class LicensedMusicAnalyzerTests(unittest.TestCase):
             "",
         )
 
-        self.assertIn("instrumental background music no vocals", queries[0])
+        self.assertIn("instrumental no vocals", queries[0])
 
-    def test_search_query_carries_tempo_and_energy_arc(self):
+    def test_search_query_stays_compact_while_preserving_build_intent(self):
         queries = MusicCandidateAcquirer._queries(
             {
                 "search_queries": ["night documentary score"],
@@ -82,9 +82,37 @@ class LicensedMusicAnalyzerTests(unittest.TestCase):
             "",
         )
 
-        self.assertIn("78-96 BPM", queries[0])
-        self.assertIn("quiet build to a late peak", queries[0])
-        self.assertIn("crescendo dynamic sections", queries[0])
+        self.assertIn("instrumental no vocals", queries[0])
+        self.assertIn("gradual build", queries[0])
+        self.assertNotIn("78-96 BPM", queries[0])
+        self.assertNotIn("quiet build to a late peak", queries[0])
+        self.assertLessEqual(len(queries[0]), 110)
+
+    def test_search_failure_reuses_only_audited_managed_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "cached.wav").write_bytes(b"cached")
+            (root / "library.json").write_text(
+                json.dumps({
+                    "managed_provider_cache": True,
+                    "tracks": [{
+                        "file": "cached.wav",
+                        "provider": "yt_dlp_unverified",
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            (root / "rights_audit.json").write_text(
+                json.dumps({"provider": "yt_dlp_unverified", "sources": []}),
+                encoding="utf-8",
+            )
+
+            acquirer = MusicCandidateAcquirer(root)
+
+            self.assertEqual(acquirer._audited_cache_track_count(), 1)
+            self.assertEqual(
+                acquirer._reuse_audited_cache("offline"), root.resolve()
+            )
 
     def test_energy_arc_detects_a_late_rise(self):
         profile = MusicCandidateAcquirer._summarize_energy_arc(
