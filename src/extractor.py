@@ -365,6 +365,18 @@ class MediaExtractor:
             effective_min_gap = max(
                 self.min_keyframe_gap_sec, coverage_gap
             )
+            # A 30-second fallback was far too sparse for action continuity:
+            # many short clips produced only their first frame, so the vision
+            # director could identify objects but not understand what changed.
+            # Keep a bounded 5-8 second temporal sampling cadence.  The later
+            # vision request still selects only a small, distributed subset, so
+            # denser extraction improves evidence without inflating VRAM use.
+            # 旧版 30 秒保底采样无法理解动作过程。这里改为 5-8 秒的有界时间采样；
+            # 导演请求仍会二次筛选少量代表帧，因此不会破坏严格串行显存策略。
+            temporal_sampling_interval = max(
+                effective_min_gap,
+                min(8.0, max(5.0, duration / 18.0)),
+            )
 
             while timestamp <= duration and len(keyframes) < self.max_keyframes:
                 capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
@@ -382,15 +394,10 @@ class MediaExtractor:
                     else float(cv2.mean(cv2.absdiff(gray, previous_gray))[0])
                     / 255.0
                 )
-                # Scene changes capture visual events; a periodic 30-second
-                # floor also guarantees coverage of static interviews and
-                # long takes whose pixels do not change enough to cross the
-                # threshold. The director later selects a bounded, evenly
-                # distributed subset for each 10–15 minute request.
+                # Scene changes capture visual events; periodic temporal samples
+                # preserve action progression in static interviews and long takes.
                 since_last = timestamp - last_saved_at
-                periodic_due = since_last >= max(
-                    30.0, effective_min_gap
-                )
+                periodic_due = since_last >= temporal_sampling_interval
                 should_save = (
                     previous_gray is None
                     or periodic_due

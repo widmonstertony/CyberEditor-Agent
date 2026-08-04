@@ -61,6 +61,7 @@ class ClipDecision(NamedTuple):
     asset_id: str = ""
     source_color: Optional[Dict[str, Any]] = None
     color_match: Optional[Dict[str, Any]] = None
+    creative_grade: Optional[Dict[str, Any]] = None
 
 
 class MediaRecord(NamedTuple):
@@ -351,6 +352,10 @@ class DaVinciExecutor:
                     color_match=(
                         dict(item["color_match"])
                         if isinstance(item.get("color_match"), dict) else None
+                    ),
+                    creative_grade=(
+                        dict(item["creative_grade"])
+                        if isinstance(item.get("creative_grade"), dict) else None
                     ),
                 )
             )
@@ -1348,6 +1353,48 @@ class DaVinciExecutor:
                         "忽略无效曝光/白平衡匹配 clip_id=%r / Invalid color match ignored",
                         decision.clip_id,
                     )
+            creative = decision.creative_grade or {}
+            if isinstance(creative, dict) and creative:
+                try:
+                    exposure_multiplier = 2.0 ** max(
+                        -0.5, min(0.5, float(creative.get("exposure_ev", 0)))
+                    )
+                    warmth = max(-1.0, min(1.0, float(creative.get("warmth", 0))))
+                    contrast = max(0.8, min(1.35, float(creative.get("contrast", 1))))
+                    saturation = max(0.65, min(1.35, float(creative.get("saturation", 1))))
+                    palette = str(creative.get("palette") or "natural").casefold()
+                    palette_gains = {
+                        "natural": (1.0, 1.0, 1.0),
+                        "teal_amber": (1.01, 1.0, 1.018),
+                        "cool_moonlight": (0.975, 1.0, 1.045),
+                        "warm_memory": (1.045, 1.0, 0.965),
+                        "desaturated_grit": (0.995, 1.0, 1.008),
+                        "neon_night": (1.018, 0.995, 1.04),
+                    }.get(palette, (1.0, 1.0, 1.0))
+                    slopes = [float(value) for value in str(cdl["Slope"]).split()]
+                    warmth_gains = [1.0 + 0.06 * warmth, 1.0, 1.0 - 0.06 * warmth]
+                    slopes = [
+                        max(
+                            0.25,
+                            min(
+                                4.0,
+                                slopes[index] * exposure_multiplier
+                                * warmth_gains[index] * palette_gains[index],
+                            ),
+                        )
+                        for index in range(3)
+                    ]
+                    cdl["Slope"] = " ".join(f"{value:.6f}" for value in slopes)
+                    cdl["Power"] = " ".join(
+                        f"{(1.0 / contrast):.6f}" for _ in range(3)
+                    )
+                    base_saturation = float(cdl.get("Saturation", "1"))
+                    cdl["Saturation"] = f"{max(0.5, min(2.0, base_saturation * saturation)):.6f}"
+                except (IndexError, TypeError, ValueError):
+                    self.logger.warning(
+                        "忽略无效导演创意调色 clip_id=%r / Invalid creative grade ignored",
+                        decision.clip_id,
+                    )
             try:
                 if set_cdl(cdl) is False:
                     self.logger.warning(
@@ -1403,6 +1450,7 @@ class DaVinciExecutor:
                 ),
                 "audio_cleanup": decision.audio_cleanup,
                 "color_look": decision.color_look,
+                "creative_grade": decision.creative_grade or {},
                 "motion": decision.motion,
                 "volume_db": self._decimal_text(decision.volume_db),
                 "drx_preset": decision.drx_preset,

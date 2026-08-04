@@ -233,6 +233,16 @@ class AIDirectorTests(unittest.TestCase):
         ]
         self.assertEqual(texts, ["a", "b", "c"])
 
+    def test_visual_micro_scene_window_can_be_shorter_than_text_chunk(self):
+        chunks = self.make_director().chunk_raw_data(
+            self.raw_data(), window_sec=180
+        )
+
+        self.assertEqual(len(chunks), 3)
+        self.assertTrue(
+            all(chunk["end_sec"] - chunk["start_sec"] <= 180 for chunk in chunks)
+        )
+
     def test_treatment_excerpt_samples_start_middle_and_end_within_budget(self):
         segments = [
             {"start_sec": index * 10, "end_sec": index * 10 + 5, "text": f"line-{index} " + "x" * 40}
@@ -375,6 +385,40 @@ class AIDirectorTests(unittest.TestCase):
         result = director.validate_sequence(sequence, candidates, treatment)
 
         self.assertEqual({item["color_look"] for item in result}, {"warm"})
+        self.assertEqual(result[0]["creative_grade"]["story_beat"], "opening")
+        self.assertEqual(result[-1]["creative_grade"]["story_beat"], "ending")
+
+    def test_color_bible_is_clamped_and_applied_by_story_beat(self):
+        director = self.make_director()
+        bible = director._validate_color_bible(
+            {
+                "global_palette": "neon_night",
+                "contrast": 99,
+                "saturation": 0,
+                "warmth": -9,
+                "highlight_rolloff": 2,
+                "chapter_grades": [
+                    {
+                        "beat": "payoff", "exposure_ev": 2,
+                        "contrast": 2, "saturation": 2, "warmth": 2,
+                        "reason": "Release the energy",
+                    }
+                ],
+            },
+            "cool_steel",
+        )
+
+        self.assertEqual(bible["global_palette"], "neon_night")
+        self.assertEqual(bible["contrast"], 1.25)
+        self.assertEqual(bible["saturation"], 0.75)
+        self.assertEqual(bible["warmth"], -1.0)
+        self.assertEqual(len(bible["chapter_grades"]), 4)
+        graded = director._apply_creative_grade_plan(
+            [{"story_role": "climax"}],
+            {"creative_look": "cool_steel", "color_bible": bible},
+        )
+        self.assertEqual(graded[0]["creative_grade"]["story_beat"], "payoff")
+        self.assertLessEqual(graded[0]["creative_grade"]["contrast"], 1.35)
 
     def test_parse_fenced_json(self):
         parsed = AIDirector.parse_generated_json(
@@ -404,6 +448,31 @@ class AIDirectorTests(unittest.TestCase):
         self.assertIn("beat_snap", result[0])
         self.assertEqual(result[1]["cut_out_sec"], 6.0)
         self.assertNotIn("beat_snap", result[1])
+
+    def test_sparse_music_sync_points_are_grounded_from_picture_roles(self):
+        director = self.make_director()
+        clips = [
+            {"cut_in_sec": 0, "cut_out_sec": 3.1, "music_edit_role": "phrase_start"},
+            {"cut_in_sec": 0, "cut_out_sec": 3.0, "music_edit_role": "payoff_hit"},
+            {"cut_in_sec": 0, "cut_out_sec": 2.0, "music_edit_role": "release"},
+        ]
+        plan = director.enrich_music_sync_points(
+            clips,
+            {
+                "cues": [
+                    {
+                        "timeline_in_sec": 0, "timeline_out_sec": 8,
+                        "track_in_sec": 0, "track_out_sec": 8,
+                        "downbeats_sec": [0, 3, 6],
+                        "strong_beats_sec": [1, 2, 4, 5, 7],
+                        "sync_points": [],
+                    }
+                ]
+            },
+        )
+
+        self.assertGreaterEqual(len(plan["cues"][0]["sync_points"]), 2)
+        self.assertGreaterEqual(plan["rhythm_audit"]["grounded_sync_points_added"], 2)
 
     def test_multi_cue_music_plan_is_bounded_to_analyzed_candidates(self):
         director = self.make_director()

@@ -53,6 +53,7 @@ class RenderClip(NamedTuple):
     volume_db: float = 0.0
     source_color: Optional[Dict[str, Any]] = None
     color_match: Optional[Dict[str, Any]] = None
+    creative_grade: Optional[Dict[str, Any]] = None
 
 
 class ReviewRenderer:
@@ -254,6 +255,10 @@ class ReviewRenderer:
                         dict(item["color_match"])
                         if isinstance(item.get("color_match"), dict) else None
                     ),
+                    creative_grade=(
+                        dict(item["creative_grade"])
+                        if isinstance(item.get("creative_grade"), dict) else None
+                    ),
                 )
             )
         if not result:
@@ -321,6 +326,7 @@ class ReviewRenderer:
                 f"{self._technical_color_filter(clip)}"
                 f"{self._color_match_filter(clip)}"
                 f"{self._color_filter(clip.color_look)}"
+                f"{self._creative_grade_filter(clip)}"
                 f"{self._motion_filter(clip.motion, fps)}[v{index}]"
             )
             audio_chain = (
@@ -576,6 +582,46 @@ class ReviewRenderer:
         return (
             ",colorchannelmixer="
             f"rr={self._number(gains[0])}:gg={self._number(gains[1])}:bb={self._number(gains[2])}"
+            f",exposure=exposure={self._number(exposure)}"
+        )
+
+    def _creative_grade_filter(self, clip: RenderClip) -> str:
+        """
+        Translate the director's color bible into bounded FFmpeg filters.
+        将导演调色圣经转换为受限的 FFmpeg 创意调色滤镜。
+
+        Technical log conversion and source matching are intentionally applied
+        before this creative layer. / 技术还原与素材匹配始终先于本创意层。
+        """
+        value = clip.creative_grade or {}
+        if not isinstance(value, dict) or not value:
+            return ""
+        try:
+            exposure = max(-0.5, min(0.5, float(value.get("exposure_ev", 0))))
+            contrast = max(0.8, min(1.35, float(value.get("contrast", 1))))
+            saturation = max(0.65, min(1.35, float(value.get("saturation", 1))))
+            warmth = max(-1.0, min(1.0, float(value.get("warmth", 0))))
+        except (TypeError, ValueError):
+            return ""
+        palette = str(value.get("palette") or "natural").casefold()
+        palette_balance = {
+            "natural": (0.0, 0.0, 0.0, 0.0),
+            "teal_amber": (-0.012, 0.022, 0.028, -0.018),
+            "cool_moonlight": (-0.025, 0.040, -0.010, 0.018),
+            "warm_memory": (0.035, -0.030, 0.018, -0.012),
+            "desaturated_grit": (-0.008, 0.010, 0.008, -0.006),
+            "neon_night": (0.010, 0.035, 0.020, 0.018),
+        }.get(palette, (0.0, 0.0, 0.0, 0.0))
+        shadow_red, shadow_blue, highlight_red, highlight_blue = palette_balance
+        shadow_red += 0.035 * warmth
+        shadow_blue -= 0.035 * warmth
+        highlight_red += 0.025 * warmth
+        highlight_blue -= 0.025 * warmth
+        return (
+            ",colorbalance="
+            f"rs={self._number(shadow_red)}:bs={self._number(shadow_blue)}:"
+            f"rh={self._number(highlight_red)}:bh={self._number(highlight_blue)}"
+            f",eq=contrast={self._number(contrast)}:saturation={self._number(saturation)}"
             f",exposure=exposure={self._number(exposure)}"
         )
 

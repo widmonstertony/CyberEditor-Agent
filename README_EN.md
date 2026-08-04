@@ -36,10 +36,13 @@ the local gate completes setup, development, payoff, and ending without forcing
 every source file into the movie or repeating an action/countdown to fill time.
 
 The full workflow does not merely concatenate every file. Each source is
-transcribed and sampled into time-distributed real frames. A vision model
-first writes a project-wide treatment with theme, four story beats, target
-runtime, color intent, and music mood. It then reviews each 10–15 minute window
-with both images and speech. A second global-director pass keeps only the
+transcribed and sampled from scene changes plus bounded 5–8 second temporal
+evidence, allowing the vision model to understand setup, action, reaction, and
+payoff rather than merely naming objects. A vision model first writes a
+project-wide treatment with theme, four story beats, target runtime, an
+executable color bible, and music mood. It then reviews long sources as sequential
+visual micro-scenes of no more than three minutes with both images and speech.
+A second global-director pass keeps only the
 minority of shots that serve that treatment. Local validation enforces actual
 source order and in-file timecode, plus per-shot and total-runtime limits. It
 plans cuts/dissolves/fades, audio cleanup, creative looks, gentle push-ins,
@@ -50,8 +53,9 @@ movie rendered by Resolve's Deliver pipeline.
 
 Online music uses an authoritative manifest: stale downloads cannot masquerade
 as user-supplied tracks, and interview, podcast, narration, and show-like results
-are rejected before download and again before analysis. One global creative
-grade is applied across the film. Exposure/white-balance measurements made in
+are rejected before download and again before analysis. One global palette is
+applied across the film, with bounded exposure, contrast, saturation, and warmth
+progression for opening, development, payoff, and ending. Exposure/white-balance measurements made in
 encoded S-Log space are never incorrectly applied after the technical input
 transform, preventing per-shot brightness and color drift.
 
@@ -209,12 +213,17 @@ The implementation now follows this strict serial chain:
 3. **Retrieval and analysis (CPU)**: choose a local licensed library, Jamendo with
    verifiable license URLs, or the explicitly confirmed yt-dlp any-online mode.
    Librosa/FFmpeg extracts BPM, beats, strong beats, approximate downbeats, energy
-   sections, key, dynamic range, and EBU R128 LUFS into `music_analysis.json`.
-4. **Final direction**: Qwen3.6 reloads, reviews 10–15 minute image/speech windows,
-   and performs cross-source story and multi-cue assembly against analyzed tracks.
+   sections, whole-track energy trend, peak position, key, dynamic range, and EBU
+   R128 LUFS into `music_analysis.json`. Ranking combines BPM, semantic relevance,
+   and whether the measured curve can deliver the requested build or climax.
+4. **Final direction**: Qwen3.6 reloads, reviews image/speech micro-scenes of no more
+   than three minutes, and performs cross-source story and multi-cue assembly against
+   analyzed tracks.
    Dynamic shot limits range from 10-second B-roll to complete 45-second interview
-   thoughts. Visual-only out-points may snap ±0.25 seconds to a beat; dialogue and
-   closing thoughts are never truncated for rhythm.
+   thoughts. Picture selection assigns natural-sound, on-beat, phrase-start, build,
+   payoff-hit, or release roles; local validation grounds two to six sync points in
+   measured strong beats/downbeats. Normal visual shifts are bounded to ±0.45 seconds
+   and payoff hits to ±0.75 seconds; interview dialogue is never truncated for rhythm.
 5. **Music-bed conform and Resolve execution**: after Qwen unloads, FFmpeg trims
    one to three cues, applies fades, loudness matching and dialogue ducking, and
    writes deterministic `music_bed.wav`. Resolve imports this one file on A2, then

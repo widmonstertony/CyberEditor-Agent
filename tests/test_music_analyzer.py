@@ -71,6 +71,37 @@ class LicensedMusicAnalyzerTests(unittest.TestCase):
 
         self.assertIn("instrumental background music no vocals", queries[0])
 
+    def test_search_query_carries_tempo_and_energy_arc(self):
+        queries = MusicCandidateAcquirer._queries(
+            {
+                "search_queries": ["night documentary score"],
+                "vocal_policy": "instrumental_only",
+                "tempo_bpm": {"min": 78, "max": 96},
+                "emotion_arc": "quiet build to a late peak",
+            },
+            "",
+        )
+
+        self.assertIn("78-96 BPM", queries[0])
+        self.assertIn("quiet build to a late peak", queries[0])
+        self.assertIn("crescendo dynamic sections", queries[0])
+
+    def test_energy_arc_detects_a_late_rise(self):
+        profile = MusicCandidateAcquirer._summarize_energy_arc(
+            [
+                {"time_sec": 0, "dbfs": -28},
+                {"time_sec": 10, "dbfs": -27},
+                {"time_sec": 20, "dbfs": -23},
+                {"time_sec": 30, "dbfs": -20},
+                {"time_sec": 40, "dbfs": -15},
+                {"time_sec": 50, "dbfs": -12},
+            ]
+        )
+
+        self.assertEqual(profile["trend"], "rising")
+        self.assertGreater(profile["build_score"], 0.55)
+        self.assertGreater(profile["peak_time_ratio"], 0.8)
+
     def test_arbitrary_online_audio_fails_closed_without_per_run_consent(self):
         with tempfile.TemporaryDirectory() as temporary:
             acquirer = MusicCandidateAcquirer(temporary)

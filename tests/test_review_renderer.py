@@ -81,6 +81,22 @@ class ReviewRendererTests(unittest.TestCase):
             self.assertIn("[musicbed]", graph)
             self.assertNotIn("afade=t=in", graph)
 
+    def test_director_color_bible_becomes_executable_filter(self):
+        renderer = ReviewRenderer("plan.json", "review.mp4")
+        clip = RenderClip(
+            "a.mp4", 0, 3,
+            creative_grade={
+                "palette": "cool_moonlight", "exposure_ev": -0.1,
+                "contrast": 1.08, "saturation": 0.92, "warmth": -0.25,
+            },
+        )
+
+        value = renderer._creative_grade_filter(clip)
+
+        self.assertIn("colorbalance=", value)
+        self.assertIn("eq=contrast=1.08:saturation=0.92", value)
+        self.assertIn("exposure=exposure=-0.1", value)
+
 
 if __name__ == "__main__":
     unittest.main()

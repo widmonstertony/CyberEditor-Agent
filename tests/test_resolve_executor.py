@@ -445,6 +445,37 @@ class ResolveExecutorTests(unittest.TestCase):
         self.assertEqual(item.cdl["NodeIndex"], "1")
         self.assertIn("cross_dissolve", item.marker[-1])
 
+    def test_director_creative_grade_modifies_resolve_cdl(self):
+        class TimelineItem:
+            def __init__(self):
+                self.cdl = None
+
+            def SetCDL(self, value):
+                self.cdl = value
+                return True
+
+        item = TimelineItem()
+        decision = ClipDecision(
+            1,
+            "source.mp4",
+            Decimal("0"),
+            Decimal("3"),
+            "Payoff",
+            color_look="neutral",
+            creative_grade={
+                "palette": "warm_memory", "exposure_ev": 0.2,
+                "contrast": 1.12, "saturation": 1.08, "warmth": 0.3,
+            },
+        )
+
+        DaVinciExecutor("timeline_cuts.json").apply_clip_effects(item, decision)
+
+        self.assertIsNotNone(item.cdl)
+        red, _, blue = [float(value) for value in item.cdl["Slope"].split()]
+        self.assertGreater(red, blue)
+        self.assertAlmostEqual(float(item.cdl["Saturation"]), 1.02 * 1.08, places=4)
+        self.assertLess(float(item.cdl["Power"].split()[0]), 1.0)
+
     def test_native_ai_apis_and_drx_are_applied(self):
         class Graph:
             def __init__(self):

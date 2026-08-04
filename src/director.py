@@ -30,7 +30,52 @@ from typing import Any, Dict, List, Optional, Sequence
 
 LOGGER_NAME = "cybereditor.director"
 DIRECTOR_CHECKPOINT_VERSION = 1
-DIRECTOR_PROMPT_VERSION = "2026-08-03.3-story-first-one-click"
+DIRECTOR_PROMPT_VERSION = "2026-08-03.4-deep-visual-color-music"
+
+COLOR_BIBLE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "global_palette": {
+            "type": "string",
+            "enum": [
+                "natural", "teal_amber", "cool_moonlight", "warm_memory",
+                "desaturated_grit", "neon_night",
+            ],
+        },
+        "contrast": {"type": "number", "minimum": 0.85, "maximum": 1.25},
+        "saturation": {"type": "number", "minimum": 0.75, "maximum": 1.25},
+        "warmth": {"type": "number", "minimum": -1, "maximum": 1},
+        "highlight_rolloff": {"type": "number", "minimum": 0, "maximum": 1},
+        "chapter_grades": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "beat": {
+                        "type": "string",
+                        "enum": ["opening", "development", "payoff", "ending"],
+                    },
+                    "exposure_ev": {"type": "number", "minimum": -0.5, "maximum": 0.5},
+                    "contrast": {"type": "number", "minimum": 0.9, "maximum": 1.2},
+                    "saturation": {"type": "number", "minimum": 0.8, "maximum": 1.2},
+                    "warmth": {"type": "number", "minimum": -0.5, "maximum": 0.5},
+                    "reason": {"type": "string", "minLength": 1},
+                },
+                "required": [
+                    "beat", "exposure_ev", "contrast", "saturation", "warmth", "reason"
+                ],
+                "additionalProperties": False,
+            },
+            "minItems": 4,
+            "maxItems": 4,
+        },
+    },
+    "required": [
+        "global_palette", "contrast", "saturation", "warmth",
+        "highlight_rolloff", "chapter_grades",
+    ],
+    "additionalProperties": False,
+}
 
 TREATMENT_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -52,6 +97,7 @@ TREATMENT_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "enum": ["clean_neutral", "cinematic_warm", "cool_steel", "high_contrast"],
         },
+        "color_bible": COLOR_BIBLE_SCHEMA,
         "music_mood": {"type": "string", "minLength": 1},
         "music_energy_arc": {"type": "string", "minLength": 1},
         "music_search_queries": {
@@ -110,7 +156,7 @@ TREATMENT_SCHEMA: Dict[str, Any] = {
     "required": [
         "title", "logline", "central_theme", "chronology_policy",
         "target_duration_sec", "opening_beat", "development_beat",
-        "payoff_beat", "ending_beat", "color_intent", "creative_look",
+        "payoff_beat", "ending_beat", "color_intent", "creative_look", "color_bible",
         "music_mood", "music_energy_arc", "music_search_queries",
         "music_instrumentation", "music_tempo_min_bpm",
         "music_tempo_max_bpm", "music_vocal_policy", "music_cue_count",
@@ -186,6 +232,26 @@ CANDIDATE_SCHEMA: Dict[str, Any] = {
                     "cut_out_sec": {"type": "number", "minimum": 0},
                     "reason_for_cut": {"type": "string", "minLength": 1},
                     "visual_summary": {"type": "string", "minLength": 1},
+                    "subject_action": {"type": "string", "minLength": 1},
+                    "emotion": {"type": "string", "minLength": 1},
+                    "action_phase": {
+                        "type": "string",
+                        "enum": ["setup", "build", "action", "reaction", "payoff", "aftermath"],
+                    },
+                    "shot_scale": {
+                        "type": "string",
+                        "enum": ["extreme_wide", "wide", "medium", "closeup", "detail"],
+                    },
+                    "camera_motion": {
+                        "type": "string",
+                        "enum": ["static", "pan", "tilt", "handheld", "tracking"],
+                    },
+                    "continuity_tags": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 6,
+                    },
+                    "rhythmic_potential": {"type": "number", "minimum": 0, "maximum": 1},
                     "story_role": {
                         "type": "string",
                         "enum": [
@@ -251,6 +317,13 @@ CANDIDATE_SCHEMA: Dict[str, Any] = {
                     "cut_out_sec",
                     "reason_for_cut",
                     "visual_summary",
+                    "subject_action",
+                    "emotion",
+                    "action_phase",
+                    "shot_scale",
+                    "camera_motion",
+                    "continuity_tags",
+                    "rhythmic_potential",
                     "story_role",
                 ],
                 "additionalProperties": False,
@@ -345,6 +418,13 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
                 "properties": {
                     "candidate_id": {"type": "string", "minLength": 1},
                     "reason_for_position": {"type": "string"},
+                    "music_edit_role": {
+                        "type": "string",
+                        "enum": [
+                            "natural_sound", "on_beat", "phrase_start",
+                            "build", "payoff_hit", "release",
+                        ],
+                    },
                     "transition_to_next": {
                         "type": "string",
                         "enum": ["cut", "cross_dissolve", "fade_black"],
@@ -391,7 +471,7 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
                     },
                     "smart_reframe": {"type": "boolean"},
                 },
-                "required": ["candidate_id"],
+                "required": ["candidate_id", "music_edit_role"],
                 "additionalProperties": False,
             },
         },
@@ -836,6 +916,7 @@ class AIDirector:
             # 一部成片只使用一个创意基线，禁止逐镜头随机冷暖漂移。
             clip["color_look"] = global_look
         final_clips = self._fit_target_duration(final_clips, treatment)
+        final_clips = self._apply_creative_grade_plan(final_clips, treatment)
         for index, clip in enumerate(final_clips, start=1):
             clip["clip_id"] = index
         payload.update(
@@ -878,7 +959,17 @@ class AIDirector:
         assets = raw_data["assets"]
         chunks: List[Dict[str, Any]] = []
         for asset_order, asset in enumerate(assets):
-            asset_chunks = self.chunk_raw_data(asset)
+            # The 10-15 minute setting is appropriate for text reasoning, but
+            # twelve images across that span are too sparse for action-level
+            # understanding. Review long sources as sequential three-minute
+            # micro-scenes while keeping one vision request/model resident at a
+            # time. This trades time for comprehension without increasing peak
+            # VRAM usage.
+            # 10-15 分钟适合文本推理，却不足以用 12 张图理解动作。长素材按最多
+            # 3 分钟微场景串行审片，只增加耗时，不增加峰值显存。
+            asset_chunks = self.chunk_raw_data(
+                asset, window_sec=min(self.chunk_duration_sec, 180.0)
+            )
             source_name = str(
                 asset.get("proxy_file_name")
                 or asset.get("source_video")
@@ -1021,6 +1112,7 @@ class AIDirector:
         music_plan = self.validate_music_plan(
             sequence_payload.get("music_plan"), program_duration
         )
+        music_plan = self.enrich_music_sync_points(final_clips, music_plan)
         final_clips = self.snap_visual_cuts_to_beats(final_clips, music_plan, assets)
         music_plan["program_duration_sec"] = round(
             sum(
@@ -1238,7 +1330,11 @@ class AIDirector:
             previous_start = start
         asset["duration_sec"] = duration
 
-    def chunk_raw_data(self, raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def chunk_raw_data(
+        self,
+        raw_data: Dict[str, Any],
+        window_sec: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Partition transcript/keyframes into non-overlapping time windows.
         将台词和关键帧划分为互不重叠的时间窗口。
@@ -1247,6 +1343,11 @@ class AIDirector:
         sent exactly once and avoiding duplicated cuts at chunk boundaries.
 
         台词片段按中点归属，保证每条台词只发送一次，避免分块边界的重复剪辑。
+
+        Parameters / 参数:
+            raw_data: One extracted source record. / 一条已提取的素材记录。
+            window_sec: Optional local visual-review window override. /
+                可选的局部视觉审片窗口秒数。
         """
         duration = float(raw_data["duration_sec"])
         transcript = raw_data["transcript"]
@@ -1255,10 +1356,13 @@ class AIDirector:
             keyframes = []
 
         chunks: List[Dict[str, Any]] = []
+        effective_window = float(window_sec or self.chunk_duration_sec)
+        if not math.isfinite(effective_window) or effective_window <= 0:
+            raise DirectorError("window_sec 必须大于 0 / must be positive.")
         start = 0.0
         index = 0
         while start < duration:
-            end = min(duration, start + self.chunk_duration_sec)
+            end = min(duration, start + effective_window)
             is_last = end >= duration
             chunk_segments = []
             for segment in transcript:
@@ -1684,6 +1788,11 @@ class AIDirector:
             "ranges that actively serve its theme and beats. Use "
             "absolute seconds in this source, not time relative to the chunk. "
             "Inspect every attached image in the listed IMAGE order. Prefer complete "
+            "The images are time-ordered evidence, not independent thumbnails: compare "
+            "adjacent timestamps and describe how subject action, camera motion, emotion, "
+            "and shot scale progress. Infer continuity only from adjacent supplied frames; "
+            "never invent an unseen action. Fill subject_action, action_phase, continuity_tags, "
+            "and rhythmic_potential so the final director can match action to music. Prefer complete "
             "sentences, expressive visuals, stable/focused shots, meaningful B-roll, "
             "and authentic moments; reject dead air, repetition, camera setup, severe "
             "shake, accidental frames, and unusable audio. Suggest restrained effects "
@@ -1802,8 +1911,11 @@ class AIDirector:
             "under dialogue. Search terms must describe emotion, genre, pacing, and "
             "instrumentation rather than copyrighted song titles. Treat the requested "
             "duration as an editorial target, never as permission to pad with repeated "
-            "or weak footage. The camera "
-            "profile is technical input metadata, not a creative look. Return JSON only.\n"
+            "or weak footage. Create an executable color_bible that supports the theme: "
+            "choose one coherent palette and subtle opening/development/payoff/ending grade "
+            "changes. Base it on the real lighting and emotional arc, preserve skin and practical "
+            "light color, and avoid random shot-by-shot tint changes. The camera profile is only "
+            "a technical input transform; the color_bible is the creative grade. Return JSON only.\n"
             f"USER CREATIVE BRIEF: {brief}\n"
             f"REQUESTED TARGET DURATION: {self._active_target_duration_sec:.1f} seconds\n"
             f"CAMERA PROFILE: {self.camera_profile}\n"
@@ -1909,6 +2021,9 @@ class AIDirector:
         elif any(token in color_language for token in ("high contrast", "高对比")):
             look = "high_contrast"
         treatment["creative_look"] = look
+        treatment["color_bible"] = self._validate_color_bible(
+            payload.get("color_bible"), look
+        )
         queries = payload.get("music_search_queries")
         treatment["music_search_queries"] = [
             " ".join(str(value).split())
@@ -2029,6 +2144,85 @@ class AIDirector:
         treatment["story_anchors"] = anchors[:12]
         return treatment
 
+    @staticmethod
+    def _validate_color_bible(payload: Any, creative_look: str) -> Dict[str, Any]:
+        """
+        Clamp an AI-authored creative grade into a coherent executable plan.
+        将 AI 编写的创意调色方案限制为连贯、可执行的安全参数。
+
+        Parameters / 参数:
+            payload: Model ``color_bible`` object. / 模型返回的调色圣经对象。
+            creative_look: Validated legacy look used as fallback. / 已校验的旧版风格回退值。
+        """
+        value = payload if isinstance(payload, dict) else {}
+        palette_fallback = {
+            "clean_neutral": "natural",
+            "cinematic_warm": "warm_memory",
+            "cool_steel": "cool_moonlight",
+            "high_contrast": "desaturated_grit",
+        }.get(creative_look, "natural")
+        palettes = {
+            "natural", "teal_amber", "cool_moonlight", "warm_memory",
+            "desaturated_grit", "neon_night",
+        }
+        look_defaults = {
+            "clean_neutral": (1.0, 1.0, 0.0),
+            "cinematic_warm": (1.03, 1.04, 0.28),
+            "cool_steel": (1.04, 1.01, -0.28),
+            "high_contrast": (1.10, 0.94, 0.0),
+        }.get(creative_look, (1.0, 1.0, 0.0))
+
+        def number(key: str, default: float, low: float, high: float) -> float:
+            try:
+                result = float(value.get(key, default))
+            except (TypeError, ValueError):
+                result = default
+            return round(min(high, max(low, result)), 3)
+
+        result: Dict[str, Any] = {
+            "global_palette": str(value.get("global_palette") or palette_fallback)
+            if str(value.get("global_palette") or palette_fallback) in palettes
+            else palette_fallback,
+            "contrast": number("contrast", look_defaults[0], 0.85, 1.25),
+            "saturation": number("saturation", look_defaults[1], 0.75, 1.25),
+            "warmth": number("warmth", look_defaults[2], -1.0, 1.0),
+            "highlight_rolloff": number("highlight_rolloff", 0.45, 0.0, 1.0),
+        }
+        defaults = {
+            "opening": (0.0, 0.98, 0.95, -0.05),
+            "development": (0.0, 1.0, 1.0, 0.0),
+            "payoff": (0.08, 1.06, 1.04, 0.05),
+            "ending": (-0.03, 0.98, 0.96, 0.02),
+        }
+        supplied = {
+            str(item.get("beat") or "").casefold(): item
+            for item in value.get("chapter_grades", [])
+            if isinstance(item, dict)
+        }
+        chapters: List[Dict[str, Any]] = []
+        for beat, fallback in defaults.items():
+            raw = supplied.get(beat, {})
+
+            def chapter_number(key: str, default: float, low: float, high: float) -> float:
+                try:
+                    parsed = float(raw.get(key, default))
+                except (TypeError, ValueError):
+                    parsed = default
+                return round(min(high, max(low, parsed)), 3)
+
+            chapters.append({
+                "beat": beat,
+                "exposure_ev": chapter_number("exposure_ev", fallback[0], -0.5, 0.5),
+                "contrast": chapter_number("contrast", fallback[1], 0.9, 1.2),
+                "saturation": chapter_number("saturation", fallback[2], 0.8, 1.2),
+                "warmth": chapter_number("warmth", fallback[3], -0.5, 0.5),
+                "reason": " ".join(
+                    str(raw.get("reason") or f"Subtle {beat} emotional progression.").split()
+                ),
+            })
+        result["chapter_grades"] = chapters
+        return result
+
     def _fallback_story_anchors(
         self, assets: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -2087,6 +2281,15 @@ class AIDirector:
                 "cut_out_sec": float(anchor["cut_out_sec"]),
                 "reason_for_cut": str(anchor.get("reason") or "Treatment anchor"),
                 "visual_summary": str(anchor.get("reason") or "Treatment anchor"),
+                "subject_action": str(anchor.get("reason") or "Treatment anchor"),
+                "emotion": "treatment-led",
+                "action_phase": beat if beat in {"setup", "build", "payoff"} else (
+                    "setup" if beat == "opening" else "aftermath" if beat == "ending" else "build"
+                ),
+                "shot_scale": "medium",
+                "camera_motion": "static",
+                "continuity_tags": [beat],
+                "rhythmic_potential": 0.5,
                 "story_role": role_map.get(beat, "context"),
                 "confidence": 0.78,
                 "quality_score": 0.78,
@@ -2189,6 +2392,7 @@ class AIDirector:
             "output_gamma": "Gamma 2.4",
             "creative_look": treatment.get("creative_look", "clean_neutral"),
             "color_intent": treatment.get("color_intent", ""),
+            "color_bible": treatment.get("color_bible", {}),
             "matching": matches,
             "sources": source_map,
         }
@@ -2384,7 +2588,7 @@ class AIDirector:
         clips: Sequence[Dict[str, Any]],
         music_plan: Dict[str, Any],
         assets: Sequence[Dict[str, Any]],
-        max_shift_sec: float = 0.25,
+        max_shift_sec: float = 0.45,
     ) -> List[Dict[str, Any]]:
         """
         Nudge visual-only out-points to nearby beats while preserving source bounds.
@@ -2394,6 +2598,7 @@ class AIDirector:
         对话与结尾语义绝不会为了卡点被截断或变速。
         """
         absolute_beats: List[float] = []
+        absolute_priority: List[float] = []
         cues = music_plan.get("cues")
         if isinstance(cues, list):
             for cue in cues:
@@ -2417,6 +2622,13 @@ class AIDirector:
                     for beat in source_beats
                     if isinstance(beat, (int, float)) and track_in <= float(beat) <= track_out
                 )
+                absolute_priority.extend(
+                    float(point.get("timeline_sec", 0))
+                    for point in cue.get("sync_points", [])
+                    if isinstance(point, dict)
+                    and str(point.get("type") or "") in {"downbeat", "section", "energy_peak"}
+                    and isinstance(point.get("timeline_sec"), (int, float))
+                )
         else:
             # Legacy schema fallback.
             beats = music_plan.get("beats_sec", [])
@@ -2429,20 +2641,49 @@ class AIDirector:
             str(asset.get("asset_id") or ""): float(asset.get("duration_sec", 0) or 0)
             for asset in assets
         }
+        transcript_by_asset = {
+            str(asset.get("asset_id") or ""): [
+                segment for segment in asset.get("transcript", [])
+                if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+            ]
+            for asset in assets
+        }
         result: List[Dict[str, Any]] = []
         timeline_cursor = 0.0
-        snap_roles = {"opening", "broll", "bridge", "climax"}
         for original in clips:
             item = dict(original)
             duration = float(item.get("cut_out_sec", 0)) - float(item.get("cut_in_sec", 0))
             proposed_end = timeline_cursor + duration
-            if str(item.get("story_role") or "").casefold() in snap_roles and absolute_beats:
-                nearest = min(absolute_beats, key=lambda beat: abs(beat - proposed_end))
+            source_in = float(item.get("cut_in_sec", 0))
+            source_out = float(item.get("cut_out_sec", 0))
+            has_dialogue = str(item.get("story_role") or "").casefold() == "interview" or any(
+                min(source_out, float(segment.get("end_sec", 0)))
+                - max(source_in, float(segment.get("start_sec", 0))) >= 0.15
+                for segment in transcript_by_asset.get(str(item.get("asset_id") or ""), [])
+            )
+            music_role = str(item.get("music_edit_role") or "on_beat").casefold()
+            landmarks = (
+                absolute_priority
+                if music_role in {"phrase_start", "payoff_hit", "release"} and absolute_priority
+                else absolute_beats
+            )
+            if not has_dialogue and music_role != "natural_sound" and landmarks:
+                nearest = min(landmarks, key=lambda beat: abs(beat - proposed_end))
                 shift = nearest - proposed_end
                 source_end = float(item.get("cut_out_sec", 0)) + shift
                 maximum = asset_duration.get(str(item.get("asset_id") or ""), source_end)
                 new_duration = duration + shift
-                if abs(shift) <= max_shift_sec and new_duration >= 0.4 and source_end <= maximum + 1e-6:
+                allowed_shift = (
+                    0.75 if music_role == "payoff_hit"
+                    else 0.60 if music_role in {"phrase_start", "release"}
+                    else max_shift_sec
+                )
+                if (
+                    abs(shift) <= allowed_shift
+                    and new_duration >= 0.4
+                    and source_end <= maximum + 1e-6
+                    and source_end > source_in
+                ):
                     item["cut_out_sec"] = round(source_end, 3)
                     item["beat_snap"] = {
                         "timeline_beat_sec": round(nearest, 4),
@@ -2452,6 +2693,96 @@ class AIDirector:
             result.append(item)
             timeline_cursor += max(0.0, duration)
         return result
+
+    def enrich_music_sync_points(
+        self,
+        clips: Sequence[Dict[str, Any]],
+        music_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Ground sparse model sync points in analyzed musical landmarks.
+        用已分析的音乐强拍补足模型过于稀疏的卡点计划。
+
+        Parameters / 参数:
+            clips: Selected picture edit with ``music_edit_role``. /
+                带 ``music_edit_role`` 的入选画面序列。
+            music_plan: Validated cue sheet containing analyzed beats. /
+                含已分析鼓点的已校验 cue 表。
+        """
+        plan = dict(music_plan)
+        cues = [dict(item) for item in plan.get("cues", []) if isinstance(item, dict)]
+        if not cues:
+            return plan
+        boundaries: List[tuple[float, str]] = []
+        cursor = 0.0
+        for clip in clips[:-1]:
+            cursor += max(
+                0.0,
+                float(clip.get("cut_out_sec", 0)) - float(clip.get("cut_in_sec", 0)),
+            )
+            role = str(clip.get("music_edit_role") or "on_beat").casefold()
+            if role != "natural_sound":
+                boundaries.append((cursor, role))
+        aligned: List[Dict[str, Any]] = []
+        for cue in cues:
+            timeline_in = float(cue.get("timeline_in_sec", 0) or 0)
+            timeline_out = float(cue.get("timeline_out_sec", 0) or 0)
+            track_in = float(cue.get("track_in_sec", 0) or 0)
+            track_out = float(cue.get("track_out_sec", 0) or 0)
+            existing = [
+                dict(point) for point in cue.get("sync_points", [])
+                if isinstance(point, dict)
+            ]
+            events: List[tuple[float, str]] = []
+            for field, kind in (("downbeats_sec", "downbeat"), ("strong_beats_sec", "strong_beat")):
+                events.extend(
+                    (float(value), kind)
+                    for value in cue.get(field, [])
+                    if isinstance(value, (int, float)) and track_in <= float(value) <= track_out
+                )
+            events.sort(key=lambda item: item[0])
+            wanted = [
+                (boundary, role) for boundary, role in boundaries
+                if timeline_in <= boundary <= timeline_out
+            ]
+            wanted.sort(
+                key=lambda item: (
+                    0 if item[1] == "payoff_hit" else 1 if item[1] in {"phrase_start", "release"} else 2,
+                    item[0],
+                )
+            )
+            for boundary, role in wanted:
+                if len(existing) >= 6 or not events:
+                    break
+                track_event, event_type = min(
+                    events,
+                    key=lambda item: abs((timeline_in + item[0] - track_in) - boundary),
+                )
+                timeline_event = timeline_in + track_event - track_in
+                if abs(timeline_event - boundary) > 0.75:
+                    continue
+                if any(
+                    abs(float(point.get("timeline_sec", -99)) - timeline_event) < 0.12
+                    for point in existing
+                ):
+                    continue
+                point = {
+                    "timeline_sec": round(timeline_event, 4),
+                    "track_sec": round(track_event, 4),
+                    "type": event_type,
+                    "purpose": f"Ground {role} picture transition on analyzed {event_type}.",
+                }
+                existing.append(point)
+                aligned.append(point)
+            existing.sort(key=lambda point: float(point.get("timeline_sec", 0)))
+            cue["sync_points"] = existing[:6]
+        plan["cues"] = cues
+        plan["rhythm_audit"] = {
+            "director_boundaries": len(boundaries),
+            "grounded_sync_points_added": len(aligned),
+            "method": "analyzed-downbeat-strong-beat-v1",
+        }
+        return plan
 
     def request_sequence(
         self,
@@ -2477,6 +2808,15 @@ class AIDirector:
                     "visual_summary": self._compact_prompt_text(
                         item.get("visual_summary", ""), 220
                     ),
+                    "subject_action": self._compact_prompt_text(
+                        item.get("subject_action", ""), 140
+                    ),
+                    "emotion": self._compact_prompt_text(item.get("emotion", ""), 80),
+                    "action_phase": item.get("action_phase", "action"),
+                    "shot_scale": item.get("shot_scale", "medium"),
+                    "camera_motion": item.get("camera_motion", "static"),
+                    "continuity_tags": list(item.get("continuity_tags") or [])[:6],
+                    "rhythmic_potential": item.get("rhythmic_potential", 0.5),
                     "reason": self._compact_prompt_text(
                         item.get("reason_for_cut", ""), 180
                     ),
@@ -2516,6 +2856,7 @@ class AIDirector:
                 "mode": item.get("mode", ""),
                 "integrated_lufs": item.get("integrated_lufs"),
                 "dynamic_range_db": item.get("dynamic_range_db"),
+                "energy_profile": item.get("energy_profile", {}),
                 "strong_beats_sec": self._sample_numeric_landmarks(
                     item.get("strong_beats_sec") or [], 48
                 ),
@@ -2528,6 +2869,30 @@ class AIDirector:
             for item in self._music_analysis.get("tracks", [])
             if isinstance(item, dict)
         ] or [{"track_file": path.name} for path in self._music_files]
+        strong_music_matches = [
+            item for item in music_choices
+            if bool(item.get("director_match", {}).get("tempo_in_range"))
+            and bool(item.get("director_match", {}).get("energy_arc_match", True))
+        ]
+        if strong_music_matches:
+            music_choices = strong_music_matches[:8]
+        else:
+            music_choices = music_choices[:8]
+        score_profiles = [
+            {
+                "track_file": item.get("track_file", ""),
+                "title": item.get("title", ""),
+                "mood": item.get("mood", ""),
+                "tempo_bpm": item.get("tempo_bpm", 0),
+                "duration_sec": item.get("duration_sec", 0),
+                "key": item.get("key", ""),
+                "mode": item.get("mode", ""),
+                "sections": item.get("sections", []),
+                "energy_profile": item.get("energy_profile", {}),
+                "director_match": item.get("director_match", {}),
+            }
+            for item in music_choices
+        ]
         sequence_prompt = (
             "PICTURE ASSEMBLY STEP 1/2. You have already inspected representative frames and transcripts "
             "from every source video. Build one coherent documentary edit from "
@@ -2544,10 +2909,16 @@ class AIDirector:
             f"or below {self._active_target_duration_sec * 1.10:.1f} seconds. A shorter "
             "complete film is better than padding to the target: never repeat an action, "
             "idea, lineup, countdown, or setup merely to reach runtime. Select only "
-            "the strongest minority of candidates; never include everything. "
+            "the strongest minority of candidates; never include everything. Design "
+            "picture rhythm against AVAILABLE SCORE PROFILES now, before selecting: "
+            "assign every shot a music_edit_role, preserve natural sound for speech, "
+            "use action/reaction and high rhythmic_potential shots for musical builds, "
+            "and reserve payoff_hit for the true narrative payoff. Do not pretend a flat "
+            "track has a crescendo. "
             "Return project_summary and sequence only; the next constrained call "
             "will score music against this exact edit. Return JSON only.\n"
             f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"AVAILABLE SCORE PROFILES:\n{json.dumps(score_profiles, ensure_ascii=False, separators=(',', ':'))}\n"
             f"ASSETS:\n{json.dumps(asset_names, ensure_ascii=False, separators=(',', ':'))}\n"
             f"CANDIDATES:\n{json.dumps(compact_candidates, ensure_ascii=False, separators=(',', ':'))}"
         )
@@ -2573,7 +2944,12 @@ class AIDirector:
                 "choose exact track_file values only. A cue may begin inside a track at "
                 "a musically useful section and must fit both the track and program. "
                 "Use sections, downbeats, and strong beats for openings, transitions, "
-                "and a few meaningful climax hits; do not cut every beat. Protect "
+                "and a few meaningful climax hits; do not cut every beat. Select a "
+                "track section whose measured energy_profile actually follows the "
+                "treatment arc; never describe a swell when the analyzed track is flat. "
+                "Create 2-6 meaningful sync_points across story transitions and the "
+                "payoff when musical landmarks permit, and align a section boundary or "
+                "downbeat with the true payoff. Protect "
                 "intelligible dialogue with 6-14 dB ducking. Use silence_regions for "
                 "emotional breathing room and important speech. Different tracks must "
                 "serve distinct story beats, not add random variety. The CPU conformer "
@@ -2695,6 +3071,10 @@ class AIDirector:
                     "timeline_in": round(cursor, 3),
                     "timeline_out": round(cursor + duration, 3),
                     "story_role": item.get("story_role", "context"),
+                    "music_edit_role": selected.get("music_edit_role", "natural_sound"),
+                    "action_phase": item.get("action_phase", "action"),
+                    "emotion": cls._compact_prompt_text(item.get("emotion", ""), 80),
+                    "rhythmic_potential": item.get("rhythmic_potential", 0.5),
                     "visual": cls._compact_prompt_text(item.get("visual_summary", ""), 180),
                     "position_reason": cls._compact_prompt_text(
                         selected.get("reason_for_position", ""), 140
@@ -2739,6 +3119,14 @@ class AIDirector:
             clip = dict(by_id[candidate_id])
             clip["reason_for_position"] = " ".join(
                 str(sequence_item.get("reason_for_position") or "").split()
+            )
+            clip["music_edit_role"] = self._enum_value(
+                sequence_item.get("music_edit_role"),
+                {
+                    "natural_sound", "on_beat", "phrase_start",
+                    "build", "payoff_hit", "release",
+                },
+                "natural_sound" if clip.get("story_role") == "interview" else "on_beat",
             )
             for key, allowed, default in (
                 (
@@ -2824,7 +3212,57 @@ class AIDirector:
         final = self._remove_overlaps(final)
         for clip in final:
             clip["color_look"] = global_look
-        return self._fit_target_duration(final, active_treatment)
+        final = self._fit_target_duration(final, active_treatment)
+        return self._apply_creative_grade_plan(final, active_treatment)
+
+    def _apply_creative_grade_plan(
+        self,
+        clips: Sequence[Dict[str, Any]],
+        treatment: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Attach one coherent palette plus subtle story-beat grade modulation.
+        为每个镜头挂载统一色彩基线与细微的叙事节拍调色变化。
+
+        Parameters / 参数:
+            clips: Validated edit decisions. / 已校验的剪辑决策。
+            treatment: Validated director treatment. / 已校验的导演阐述。
+        """
+        bible = self._validate_color_bible(
+            treatment.get("color_bible"),
+            str(treatment.get("creative_look") or "clean_neutral"),
+        )
+        chapters = {
+            str(item.get("beat") or "development"): item
+            for item in bible.get("chapter_grades", [])
+            if isinstance(item, dict)
+        }
+        result: List[Dict[str, Any]] = []
+        for raw_clip in clips:
+            clip = dict(raw_clip)
+            beat = self._canonical_story_beat(clip)
+            chapter = chapters.get(beat, chapters.get("development", {}))
+            clip["creative_grade"] = {
+                "palette": bible.get("global_palette", "natural"),
+                "story_beat": beat,
+                "exposure_ev": round(float(chapter.get("exposure_ev", 0)), 3),
+                "contrast": round(
+                    min(1.35, max(0.8, float(bible.get("contrast", 1)) * float(chapter.get("contrast", 1)))),
+                    3,
+                ),
+                "saturation": round(
+                    min(1.35, max(0.65, float(bible.get("saturation", 1)) * float(chapter.get("saturation", 1)))),
+                    3,
+                ),
+                "warmth": round(
+                    min(1.0, max(-1.0, float(bible.get("warmth", 0)) + float(chapter.get("warmth", 0)))),
+                    3,
+                ),
+                "highlight_rolloff": round(float(bible.get("highlight_rolloff", 0.45)), 3),
+                "reason": str(chapter.get("reason") or treatment.get("color_intent") or ""),
+            }
+            result.append(clip)
+        return result
 
     def _remove_overlaps(
         self, clips: Sequence[Dict[str, Any]]
@@ -3227,6 +3665,48 @@ class AIDirector:
                     "quality_score": round(quality_value, 3),
                     "visual_summary": " ".join(
                         str(decision.get("visual_summary") or reason).split()
+                    ),
+                    "subject_action": " ".join(
+                        str(decision.get("subject_action") or reason).split()
+                    ),
+                    "emotion": " ".join(
+                        str(decision.get("emotion") or "observational").split()
+                    ),
+                    "action_phase": self._enum_value(
+                        decision.get("action_phase"),
+                        {"setup", "build", "action", "reaction", "payoff", "aftermath"},
+                        "action",
+                    ),
+                    "shot_scale": self._enum_value(
+                        decision.get("shot_scale"),
+                        {"extreme_wide", "wide", "medium", "closeup", "detail"},
+                        "medium",
+                    ),
+                    "camera_motion": self._enum_value(
+                        decision.get("camera_motion"),
+                        {"static", "pan", "tilt", "handheld", "tracking"},
+                        "static",
+                    ),
+                    "continuity_tags": [
+                        " ".join(str(value).split())
+                        for value in (
+                            decision.get("continuity_tags")
+                            if isinstance(decision.get("continuity_tags"), list) else []
+                        )[:6]
+                        if str(value).strip()
+                    ],
+                    "rhythmic_potential": round(
+                        min(
+                            1.0,
+                            max(
+                                0.0,
+                                self._finite_float(
+                                    decision.get("rhythmic_potential", 0.5),
+                                    f"decisions[{index}].rhythmic_potential",
+                                ),
+                            ),
+                        ),
+                        3,
                     ),
                     "story_role": story_role,
                     "transition_to_next": transition,

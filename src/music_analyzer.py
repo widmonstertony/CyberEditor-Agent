@@ -120,16 +120,105 @@ class MusicCandidateAcquirer:
         instrumental_only = (
             str(brief.get("vocal_policy") or "").casefold() == "instrumental_only"
         )
+        tempo = brief.get("tempo_bpm") if isinstance(brief.get("tempo_bpm"), dict) else {}
+        tempo_min = int(float(tempo.get("min", 0) or 0))
+        tempo_max = int(float(tempo.get("max", 0) or 0))
+        emotion_arc = " ".join(str(brief.get("emotion_arc") or "").split())
+        arc_text = emotion_arc.casefold()
+        needs_build = any(
+            token in arc_text
+            for token in (
+                "build", "rise", "rising", "crescendo", "swell", "peak",
+                "上升", "渐强", "推进", "高潮", "递进",
+            )
+        )
         for query in queries:
             if instrumental_only and not any(
                 token in query.casefold() for token in ("instrumental", "纯音乐", "no vocal")
             ):
                 query = f"{query} instrumental background music no vocals"
+            if tempo_min and tempo_max and "bpm" not in query.casefold():
+                query = f"{query} {tempo_min}-{tempo_max} BPM"
+            if emotion_arc and emotion_arc.casefold() not in query.casefold():
+                query = f"{query} {emotion_arc}"
+            if needs_build and "dynamic sections" not in query.casefold():
+                query = f"{query} gradual build crescendo dynamic sections"
             key = query.casefold()
             if key not in seen:
                 seen.add(key)
                 result.append(query)
         return result[:6]
+
+    @staticmethod
+    def _summarize_energy_arc(energy_curve: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Summarize a track's energy shape for director-side score matching.
+        汇总曲目的能量走势，供导演按情绪弧线选曲。
+
+        Parameters / 参数:
+            energy_curve: Time-ordered ``time_sec``/``dbfs`` samples. /
+                按时间排列的 ``time_sec``/``dbfs`` 采样。
+        """
+        samples: List[tuple[float, float]] = []
+        for raw in energy_curve:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                timestamp = float(raw.get("time_sec", 0))
+                energy = float(raw.get("dbfs", -120))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(timestamp) and math.isfinite(energy):
+                samples.append((timestamp, energy))
+        samples.sort(key=lambda item: item[0])
+        if not samples:
+            return {
+                "trend": "unknown", "start_dbfs": -120.0,
+                "middle_dbfs": -120.0, "end_dbfs": -120.0,
+                "end_vs_start_db": 0.0, "contrast_db": 0.0,
+                "peak_time_ratio": 0.0, "build_score": 0.0,
+            }
+        group_size = max(1, len(samples) // 3)
+        first = samples[:group_size]
+        middle_start = max(0, (len(samples) - group_size) // 2)
+        middle = samples[middle_start:middle_start + group_size]
+        final = samples[-group_size:]
+
+        def mean(values: Sequence[tuple[float, float]]) -> float:
+            return sum(value for _, value in values) / max(1, len(values))
+
+        start_db = mean(first)
+        middle_db = mean(middle)
+        end_db = mean(final)
+        delta = end_db - start_db
+        trend = "rising" if delta >= 2.0 else ("falling" if delta <= -2.0 else "flat")
+        ordered = sorted(value for _, value in samples)
+        low_index = int(round((len(ordered) - 1) * 0.10))
+        high_index = int(round((len(ordered) - 1) * 0.90))
+        contrast = ordered[high_index] - ordered[low_index]
+        peak_time = max(samples, key=lambda item: item[1])[0]
+        duration = max(samples[-1][0], 1e-6)
+        peak_ratio = min(1.0, max(0.0, peak_time / duration))
+        # A useful build combines a louder final third, real dynamics, and a
+        # peak that happens after the midpoint. Each component is bounded.
+        delta_component = min(1.0, max(0.0, (delta + 1.0) / 7.0))
+        contrast_component = min(1.0, max(0.0, contrast / 12.0))
+        late_peak_component = min(1.0, max(0.0, (peak_ratio - 0.35) / 0.50))
+        build_score = (
+            0.50 * delta_component
+            + 0.25 * contrast_component
+            + 0.25 * late_peak_component
+        )
+        return {
+            "trend": trend,
+            "start_dbfs": round(start_db, 2),
+            "middle_dbfs": round(middle_db, 2),
+            "end_dbfs": round(end_db, 2),
+            "end_vs_start_db": round(delta, 2),
+            "contrast_db": round(contrast, 2),
+            "peak_time_ratio": round(peak_ratio, 3),
+            "build_score": round(build_score, 3),
+        }
 
     @staticmethod
     def _classify_search_entry(entry: Dict[str, Any]) -> Dict[str, bool]:
@@ -700,6 +789,7 @@ class LicensedMusicAnalyzer:
             "downbeats_sec": [round(value, 4) for value in downbeats],
             "sections": sections,
             "energy_curve": energy_curve,
+            "energy_profile": MusicCandidateAcquirer._summarize_energy_arc(energy_curve),
             "key": key,
             "mode": mode,
             "key_confidence": key_confidence,
@@ -740,16 +830,45 @@ class LicensedMusicAnalyzer:
         tempo = brief.get("tempo_bpm") if isinstance(brief.get("tempo_bpm"), dict) else {}
         tempo_min = float(tempo.get("min", 0) or 0)
         tempo_max = float(tempo.get("max", 999) or 999)
+        desired_arc = " ".join(str(brief.get("emotion_arc") or "").split()).casefold()
+        requires_build = any(
+            token in desired_arc
+            for token in (
+                "build", "rise", "rising", "crescendo", "swell", "peak",
+                "上升", "渐强", "推进", "高潮", "递进",
+            )
+        )
         for item in analyzed:
             bpm = float(item.get("tempo_bpm", 0) or 0)
+            tempo_in_range = tempo_min <= bpm <= tempo_max
+            tempo_center = (tempo_min + tempo_max) / 2.0
+            tempo_half_range = max(10.0, (tempo_max - tempo_min) / 2.0)
+            tempo_score = max(0.0, 1.0 - abs(bpm - tempo_center) / tempo_half_range)
+            profile = item.get("energy_profile") if isinstance(item.get("energy_profile"), dict) else {}
+            build_score = float(profile.get("build_score", 0) or 0)
+            energy_arc_match = (
+                not requires_build
+                or str(profile.get("trend") or "") == "rising"
+                or build_score >= 0.55
+            )
+            keyword_score = int(item.get("search_score", 0))
             item["director_match"] = {
-                "tempo_in_range": tempo_min <= bpm <= tempo_max,
-                "keyword_score": int(item.get("search_score", 0)),
+                "tempo_in_range": tempo_in_range,
+                "tempo_score": round(tempo_score, 3),
+                "energy_arc_match": energy_arc_match,
+                "energy_build_score": round(build_score, 3),
+                "keyword_score": keyword_score,
+                "total_score": round(
+                    keyword_score + (3.0 if tempo_in_range else tempo_score)
+                    + (4.0 if energy_arc_match else build_score),
+                    3,
+                ),
             }
         analyzed.sort(
             key=lambda item: (
+                -float(item["director_match"]["total_score"]),
                 not bool(item["director_match"]["tempo_in_range"]),
-                -int(item["director_match"]["keyword_score"]),
+                not bool(item["director_match"]["energy_arc_match"]),
             )
         )
         payload = {
