@@ -306,6 +306,28 @@ class WorkflowOrchestrator:
                 return False
         return True
 
+    @staticmethod
+    def _has_reusable_candidate_audit(timeline_cuts: Path) -> bool:
+        """
+        Return whether a prior full visual pass can be safely reused.
+        判断既有计划是否包含可复用的完整视觉候选审计。
+
+        Parameters / 参数:
+            timeline_cuts: Existing final director handoff. / 既有最终导演交接文件。
+        """
+        try:
+            payload = json.loads(timeline_cuts.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        audit = payload.get("candidate_audit") if isinstance(payload, dict) else None
+        review = payload.get("visual_review") if isinstance(payload, dict) else None
+        return (
+            isinstance(audit, list)
+            and bool(audit)
+            and isinstance(review, dict)
+            and review.get("mode") == "continuous_all_saved_samples"
+        )
+
     def run(self, args: argparse.Namespace) -> None:
         """
         Execute selected stages and verify every handoff artifact.
@@ -358,6 +380,11 @@ class WorkflowOrchestrator:
             self._require_file(
                 timeline_cuts, "跳过导演时需要现有 timeline_cuts.json"
             )
+        reuse_visual_audit = bool(
+            args.skip_extraction
+            and not args.skip_director
+            and self._has_reusable_candidate_audit(timeline_cuts)
+        )
 
         with WorkflowLock(lock_path), WindowsSleepInhibitor(self.logger):
             self.logger.info(
@@ -451,6 +478,7 @@ class WorkflowOrchestrator:
             music_analysis = self.data_dir / "music_analysis.json"
             music_cache = self.data_dir / "music-candidates"
             music_bed = self.data_dir / "music" / "music_bed.wav"
+            program_audio = self.data_dir / "audio" / "program_audio.wav"
             provider = str(getattr(args, "music_provider", "off") or "off")
             # Preserve older CLI/UI integrations: supplying a local folder means
             # local-provider mode even when the new flag is absent.
@@ -599,6 +627,12 @@ class WorkflowOrchestrator:
                     command.extend(["--creative-brief", args.creative_brief.strip()])
                 if provider != "off":
                     command.extend(["--music-analysis", str(music_analysis)])
+                if reuse_visual_audit:
+                    command.append("--reassemble-existing")
+                    self.logger.info(
+                        "检测到完整视觉候选审计；最终导演将直接重组，不重复逐秒看图 / "
+                        "Reusable visual audit found; final director will reassemble without re-reviewing frames"
+                    )
                 try:
                     self._run_stage("最终 AI 导演 / Final AI director", command)
                 finally:
@@ -634,6 +668,35 @@ class WorkflowOrchestrator:
                     )
                     # A valid no-music creative decision intentionally produces no WAV.
                     self._release_barrier("FFmpeg CPU music-bed conform")
+
+            needs_program_audio = not (
+                bool(args.skip_director)
+                and bool(args.skip_resolve)
+                and bool(getattr(args, "skip_preview", True))
+            )
+            if needs_program_audio:
+                self._require_file(
+                    timeline_cuts, "现场声合成需要现有 timeline_cuts.json"
+                )
+                program_audio_command = [
+                    self.python_executable,
+                    "-m",
+                    "src.program_audio",
+                    "--timeline",
+                    str(timeline_cuts),
+                    "--output",
+                    str(program_audio),
+                    "--log-level",
+                    args.log_level,
+                ]
+                self._run_stage(
+                    "逐剪点现场声预混 / Frame-faithful production-audio conform",
+                    program_audio_command,
+                )
+                self._require_file(
+                    program_audio, "现场声阶段未生成 program_audio.wav"
+                )
+                self._release_barrier("FFmpeg CPU production-audio conform")
 
             # Programmatic callers created before preview support have no
             # ``skip_preview`` attribute; keep those integrations backward

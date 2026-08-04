@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import gc
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import shutil
@@ -175,7 +176,6 @@ class MediaExtractor:
             )
             transcription = {"language": None, "segments": []}
         segments = transcription["segments"]
-        self.write_srt(segments, srt_destination)
         self.logger.info(
             "Whisper 已卸载并清理缓存；开始 CPU 抽帧 / Whisper unloaded and cache cleared; starting CPU keyframes"
         )
@@ -212,10 +212,12 @@ class MediaExtractor:
         color_analysis["analysis_domain"] = (
             "encoded_log" if bool(source_color.get("is_log")) else "display_referred"
         )
-        duration = max(
-            float(video_metadata.get("duration_sec", 0.0)),
-            max((float(item["end_sec"]) for item in segments), default=0.0),
-        )
+        # Encoded media duration is authoritative. Whisper occasionally emits
+        # a final hallucinated segment beyond EOF; extending the asset duration
+        # to that text made downstream Resolve cuts request nonexistent frames.
+        duration = float(video_metadata.get("duration_sec", 0.0))
+        segments = self._clamp_segments_to_duration(segments, duration)
+        self.write_srt(segments, srt_destination)
 
         proxy_value = proxy_file_name or source.name
         payload: Dict[str, Any] = {
@@ -584,6 +586,34 @@ class MediaExtractor:
                 " / Whisper produced no valid speech segments."
             )
         return normalized
+
+    @staticmethod
+    def _clamp_segments_to_duration(
+        segments: Sequence[Dict[str, Any]], duration_sec: float
+    ) -> List[Dict[str, Any]]:
+        """
+        Clamp Whisper timestamps to encoded media EOF and discard empty tails.
+        将 Whisper 时间戳限制在媒体真实结尾，并丢弃完全越界的幻觉尾句。
+
+        Parameters / 参数:
+            segments: Normalized Whisper segments. / 已规范化的字幕片段。
+            duration_sec: Authoritative encoded duration. / 编码媒体的真实时长。
+        """
+        if not math.isfinite(duration_sec) or duration_sec <= 0:
+            raise ExtractionError(
+                "媒体真实时长无效，无法校准字幕 / Invalid media duration for transcript clamping."
+            )
+        clamped: List[Dict[str, Any]] = []
+        for raw in segments:
+            start = max(0.0, float(raw.get("start_sec", 0.0)))
+            end = min(duration_sec, float(raw.get("end_sec", start)))
+            if start >= duration_sec or end - start < 0.05:
+                continue
+            item = dict(raw)
+            item["start_sec"] = round(start, 3)
+            item["end_sec"] = round(end, 3)
+            clamped.append(item)
+        return clamped
 
     @staticmethod
     def _write_jpeg_unicode_safe(

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import gc
 import hashlib
 import json
 import logging
@@ -415,13 +416,16 @@ class MusicCandidateAcquirer:
             raise MusicAnalysisError(
                 "在线检索没有返回候选。请检查网络与 yt-dlp。 / Online search returned no candidates."
             )
+        # Download modest oversupply so the post-download vocal audit can
+        # reject mislabeled "instrumental" tracks without emptying the pool.
+        download_limit = max(1, min(12, int(math.ceil(limit * 1.5))))
         manifest_tracks: List[Dict[str, Any]] = []
-        for index, item in enumerate(metadata[: max(1, min(12, limit))], start=1):
+        for index, item in enumerate(metadata[:download_limit], start=1):
             url = str(item["source_url"])
             self.logger.info(
                 "下载候选配乐 %d/%d：%s / Downloading music candidate",
                 index,
-                min(len(metadata), limit),
+                min(len(metadata), download_limit),
                 item.get("title") or url,
             )
             command = [
@@ -615,13 +619,155 @@ class LicensedMusicAnalyzer:
     查找用户授权的音频，并在 CPU 上提取剪辑所需的音乐特征。
     """
 
-    def __init__(self, library: os.PathLike, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        library: os.PathLike,
+        logger: Optional[logging.Logger] = None,
+        vocal_audit_model: str = "small",
+        vocal_audit_device: str = "auto",
+    ) -> None:
         """Validate a music-library root without importing librosa. / 校验曲库根目录，但暂不导入 librosa。"""
         self.library = Path(library).expanduser().resolve()
         if not self.library.is_dir():
             raise MusicAnalysisError(f"配乐目录不存在 / Music library not found: {self.library}")
         self.logger = logger or logging.getLogger(LOGGER_NAME)
+        self.vocal_audit_model = str(vocal_audit_model or "small").strip()
+        self.vocal_audit_device = str(vocal_audit_device or "auto").strip()
         self._manifest = self._load_manifest()
+
+    @staticmethod
+    def _classify_whisper_vocals(transcription: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert Whisper confidence fields into a conservative vocal audit.
+        根据 Whisper 置信度字段生成保守的人声审计结果。
+
+        Metadata saying "instrumental" is not evidence about the waveform.
+        Repeated producer tags, speech, and intelligible singing are rejected;
+        low-confidence musical hallucinations are retained as non-vocal.
+        """
+        credible: List[Dict[str, Any]] = []
+        strong_count = 0
+        vocal_seconds = 0.0
+        segments = transcription.get("segments")
+        for raw in segments if isinstance(segments, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            text = " ".join(str(raw.get("text") or "").split())
+            if not text:
+                continue
+            try:
+                start = max(0.0, float(raw.get("start", 0) or 0))
+                end = max(start, float(raw.get("end", start) or start))
+                no_speech = float(raw.get("no_speech_prob", 1) or 1)
+                logprob = float(raw.get("avg_logprob", -9) or -9)
+                compression = float(raw.get("compression_ratio", 99) or 99)
+            except (TypeError, ValueError):
+                continue
+            is_credible = (
+                no_speech <= 0.45
+                and logprob >= -0.90
+                and compression <= 2.40
+            )
+            if not is_credible:
+                continue
+            duration = min(10.0, max(0.0, end - start))
+            vocal_seconds += duration
+            if no_speech <= 0.20 and logprob >= -0.75:
+                strong_count += 1
+            credible.append({
+                "start_sec": round(start, 3),
+                "end_sec": round(end, 3),
+                "text": text[:160],
+                "no_speech_prob": round(no_speech, 4),
+                "avg_logprob": round(logprob, 4),
+            })
+        detected = (
+            len(credible) >= 2
+            or vocal_seconds >= 2.5
+            or strong_count >= 1
+        )
+        return {
+            "engine": "whisper-confidence-v1",
+            "vocal_detected": detected,
+            "credible_segment_count": len(credible),
+            "strong_segment_count": strong_count,
+            "credible_vocal_seconds": round(vocal_seconds, 3),
+            "transcript_excerpt": [item["text"] for item in credible[:6]],
+            "segments": credible[:12],
+        }
+
+    def _audit_instrumental_tracks(
+        self, tracks: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Run one serial Whisper model over candidate waveforms and reject vocals.
+        串行使用一个 Whisper 模型审听候选波形，并拒绝含人声的音乐。
+        """
+        try:
+            import torch
+            import whisper
+        except ImportError as exc:
+            raise MusicAnalysisError(
+                "无人声审计需要项目已有的 Whisper/PyTorch / Vocal audit requires Whisper and PyTorch."
+            ) from exc
+        device = self.vocal_audit_device
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = None
+        accepted: List[Dict[str, Any]] = []
+        try:
+            self.logger.info(
+                "加载 Whisper %s 到 %s 进行真实音频人声审计 / Loading Whisper vocal auditor",
+                self.vocal_audit_model,
+                device,
+            )
+            model = whisper.load_model(self.vocal_audit_model, device=device)
+            for index, raw in enumerate(tracks, start=1):
+                item = dict(raw)
+                self.logger.info(
+                    "人声审计 %d/%d：%s / Vocal audit",
+                    index,
+                    len(tracks),
+                    item.get("title") or item.get("file_name"),
+                )
+                try:
+                    transcription = model.transcribe(
+                        str(item["file_name"]),
+                        verbose=False,
+                        fp16=device.startswith("cuda"),
+                        temperature=0.0,
+                        condition_on_previous_text=False,
+                    )
+                except Exception as exc:
+                    raise MusicAnalysisError(
+                        f"候选音乐人声审计失败 / Vocal audit failed for {item.get('title')}: {exc}"
+                    ) from exc
+                audit = self._classify_whisper_vocals(transcription)
+                item["vocal_audit"] = audit
+                if audit["vocal_detected"]:
+                    self.logger.warning(
+                        "拒绝检测到人声的候选：%s（%s）/ Rejecting candidate with detected vocals",
+                        item.get("title") or item.get("file_name"),
+                        "; ".join(audit.get("transcript_excerpt") or [])[:240],
+                    )
+                    continue
+                accepted.append(item)
+        finally:
+            if model is not None:
+                del model
+            gc.collect()
+            if device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except (AttributeError, RuntimeError):
+                    pass
+        if not accepted:
+            raise MusicAnalysisError(
+                "所有候选音乐都检测到人声；已拒绝生成错误配乐。请扩大搜索后重试。 / "
+                "Every candidate contained detected vocals; broaden the search and retry."
+            )
+        return accepted
 
     def _load_manifest(self) -> Dict[str, Dict[str, Any]]:
         """Load optional rights metadata keyed by relative path. / 按相对路径读取可选权利元数据。"""
@@ -887,8 +1033,14 @@ class LicensedMusicAnalyzer:
         tracks = self.rank(self.discover(), combined_query)
         if not tracks:
             raise MusicAnalysisError(f"曲库中没有受支持的音频 / No supported audio in: {self.library}")
-        analyzed: List[Dict[str, Any]] = []
         maximum = max(1, min(32, int(limit)))
+        instrumental_only = (
+            str(brief.get("vocal_policy") or "").casefold() == "instrumental_only"
+        )
+        if instrumental_only:
+            audit_limit = min(len(tracks), max(maximum * 2, 12))
+            tracks = self._audit_instrumental_tracks(tracks[:audit_limit])
+        analyzed: List[Dict[str, Any]] = []
         for index, track in enumerate(tracks[:maximum], start=1):
             self.logger.info(
                 "CPU 音乐听诊 %d/%d：%s / CPU music analysis",
@@ -975,6 +1127,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jamendo-client-id", default="")
     parser.add_argument("--rights-confirmed", action="store_true")
     parser.add_argument("--rights-claim", default="")
+    parser.add_argument(
+        "--vocal-audit-model",
+        default="small",
+        help="Whisper model used to verify instrumental candidates / 无人声审计模型",
+    )
+    parser.add_argument(
+        "--vocal-audit-device",
+        default="auto",
+        choices=("auto", "cpu", "cuda"),
+        help="Device for the serial vocal-audit stage / 串行人声审计设备",
+    )
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser
 
@@ -1004,7 +1167,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.rights_confirmed,
                     args.rights_claim,
                 )
-        LicensedMusicAnalyzer(library, logger).run(
+        LicensedMusicAnalyzer(
+            library,
+            logger,
+            vocal_audit_model=args.vocal_audit_model,
+            vocal_audit_device=args.vocal_audit_device,
+        ).run(
             args.output, args.query, args.limit, brief
         )
         return 0

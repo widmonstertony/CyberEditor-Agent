@@ -176,6 +176,7 @@ class DaVinciExecutor:
         self.created_project = False
         self.color_pipeline: Dict[str, Any] = {}
         self.music_plan: Dict[str, Any] = {}
+        self.audio_program: Dict[str, Any] = {}
 
     def run(self) -> Sequence[Any]:
         """
@@ -202,6 +203,7 @@ class DaVinciExecutor:
         self.compare_fps(json_fps, active_fps)
         prepared = self.prepare_clips(clips, active_fps)
         appended = self.append_clips(prepared)
+        self.append_program_audio(active_fps, prepared)
         self.append_music_bed(active_fps, prepared)
         self.apply_timeline_audio_preset()
         self.run_macro_fallback()
@@ -240,6 +242,8 @@ class DaVinciExecutor:
         self.color_pipeline = pipeline if isinstance(pipeline, dict) else {}
         music = payload.get("music_plan")
         self.music_plan = music if isinstance(music, dict) else {}
+        audio_program = payload.get("audio_program")
+        self.audio_program = audio_program if isinstance(audio_program, dict) else {}
         fps = self._positive_decimal(payload.get("project_fps"), "project_fps")
         raw_clips = payload.get("clips")
         if not isinstance(raw_clips, list) or not raw_clips:
@@ -703,32 +707,37 @@ class DaVinciExecutor:
 
     def ensure_timeline(self) -> Any:
         """
-        Reuse the current timeline or create/reuse the configured one.
-        复用当前时间线，或创建/复用配置的时间线。
-        """
-        timeline = self.project.GetCurrentTimeline()
-        if timeline is not None:
-            self.logger.info(
-                "使用当前时间线“%s” / Using current timeline '%s'",
-                self._safe_name(timeline, "unnamed"),
-                self._safe_name(timeline, "unnamed"),
-            )
-            return timeline
+        Create a fresh, non-conflicting timeline for this automated assembly.
+        为本次自动总装创建全新且不重名的时间线。
 
+        Existing timelines are never appended to or cleared. Re-running an edit
+        therefore preserves the user's current cut and creates ``Name (2)``,
+        ``Name (3)``, and so on when necessary.
+        既有时间线绝不会被继续追加或清空；重复运行会安全创建 ``名称 (2)`` 等。
+        """
+        current = self.project.GetCurrentTimeline()
+        if current is not None:
+            self.logger.info(
+                "保留当前时间线“%s”，本次总装将创建新时间线 / "
+                "Preserving current timeline '%s'; creating a fresh assembly",
+                self._safe_name(current, "unnamed"),
+                self._safe_name(current, "unnamed"),
+            )
+        existing_names = set()
+        if current is not None:
+            existing_names.add(self._safe_name(current, ""))
         count = self._safe_int_call(self.project, "GetTimelineCount")
         for index in range(1, count + 1):
             candidate = self.project.GetTimelineByIndex(index)
-            if (
-                candidate is not None
-                and self._safe_name(candidate, "") == self.timeline_name
-            ):
-                if not self.project.SetCurrentTimeline(candidate):
-                    raise ResolveExecutorError(
-                        f"无法激活时间线 / Cannot activate timeline: {self.timeline_name}"
-                    )
-                return candidate
+            if candidate is not None:
+                existing_names.add(self._safe_name(candidate, ""))
+        fresh_name = self.timeline_name
+        suffix = 2
+        while fresh_name in existing_names:
+            fresh_name = f"{self.timeline_name} ({suffix})"
+            suffix += 1
         try:
-            timeline = self.media_pool.CreateEmptyTimeline(self.timeline_name)
+            timeline = self.media_pool.CreateEmptyTimeline(fresh_name)
         except Exception as exc:
             raise ResolveExecutorError(
                 f"创建时间线失败 / Timeline creation failed: {exc}"
@@ -739,12 +748,12 @@ class DaVinciExecutor:
             fallback = getattr(self.media_pool, "CreateTimelineFromClips", None)
             if callable(fallback):
                 try:
-                    timeline = fallback(self.timeline_name, [])
+                    timeline = fallback(fresh_name, [])
                 except Exception:
                     timeline = None
         if timeline is None:
             raise ResolveExecutorError(
-                f"无法创建/激活时间线 / Cannot create/activate timeline: {self.timeline_name}"
+                f"无法创建/激活时间线 / Cannot create/activate timeline: {fresh_name}"
             )
         try:
             activated = self.project.SetCurrentTimeline(timeline)
@@ -758,15 +767,15 @@ class DaVinciExecutor:
             if (
                 current is None
                 or self._safe_name(current, "")
-                != self._safe_name(timeline, self.timeline_name)
+                != self._safe_name(timeline, fresh_name)
             ):
                 raise ResolveExecutorError(
-                    f"时间线已创建但无法激活 / Timeline created but cannot be activated: {self.timeline_name}"
+                    f"时间线已创建但无法激活 / Timeline created but cannot be activated: {fresh_name}"
                 )
         self.logger.info(
             "已创建时间线“%s” / Created timeline '%s'",
-            self.timeline_name,
-            self.timeline_name,
+            fresh_name,
+            fresh_name,
         )
         return timeline
 
@@ -839,17 +848,37 @@ class DaVinciExecutor:
             item, index = self._resolve_media(decision, index)
             self._configure_media_input_transform(item, decision)
             source_fps = self._media_fps(item) or fps
+            _, media_path_text = self._media_identity(item)
+            if media_path_text:
+                media_path = Path(media_path_text).expanduser()
+                if media_path.is_file():
+                    source_duration = self._probe_media_duration(media_path)
+                    tolerance = Decimal("2") / source_fps
+                    if source_duration > 0 and decision.cut_out_sec > (
+                        Decimal(str(source_duration)) + tolerance
+                    ):
+                        raise ResolveExecutorError(
+                            f"clip_id={decision.clip_id!r} 的出点 {decision.cut_out_sec}s "
+                            f"超过真实素材时长 {source_duration:.3f}s；已在修改时间线前停止。"
+                            " / Cut out exceeds the real media EOF; stopped before assembly."
+                        )
             start_frame, end_frame = self.seconds_to_frames(
                 decision.cut_in_sec, decision.cut_out_sec, source_fps
             )
+            clip_info: Dict[str, Any] = {
+                "mediaPoolItem": item,
+                "startFrame": start_frame,
+                "endFrame": end_frame,
+            }
+            if str(self.audio_program.get("bed_file") or "").strip():
+                # Source audio is already conformed from the exact same seconds.
+                # Append picture-only here, then place the deterministic WAV on A1.
+                # 原声已按完全相同的秒数预混；此处只追加画面，随后把 WAV 放入 A1。
+                clip_info["mediaType"] = 1
             prepared.append(
                 (
                     decision,
-                    {
-                        "mediaPoolItem": item,
-                        "startFrame": start_frame,
-                        "endFrame": end_frame,
-                    },
+                    clip_info,
                 )
             )
             self.logger.info(
@@ -1083,6 +1112,133 @@ class DaVinciExecutor:
             )
         return result_items
 
+    def append_program_audio(
+        self,
+        fps: Decimal,
+        prepared: Sequence[Tuple[ClipDecision, Dict[str, Any]]],
+    ) -> Sequence[Any]:
+        """
+        Append the exact pre-conformed source-audio WAV to audio track 1.
+        将与画面剪点完全一致的预混原声 WAV 追加到音轨 1。
+
+        Parameters / 参数:
+            fps: Active timeline frame rate. / 当前时间线帧率。
+            prepared: Picture edits defining the frame-quantized program length. /
+                定义逐段帧舍入后成片时长的画面剪辑。
+        """
+        bed_text = str(self.audio_program.get("bed_file") or "").strip()
+        if not bed_text:
+            return []
+        return self._append_preconformed_audio(
+            Path(bed_text).expanduser().resolve(),
+            track_index=1,
+            fps=fps,
+            prepared=prepared,
+            label_cn="现场声",
+            label_en="production audio",
+        )
+
+    def _append_preconformed_audio(
+        self,
+        path: Path,
+        track_index: int,
+        fps: Decimal,
+        prepared: Sequence[Tuple[ClipDecision, Dict[str, Any]]],
+        label_cn: str,
+        label_en: str,
+    ) -> Sequence[Any]:
+        """
+        Import one non-looping WAV and align it to the timeline start frame.
+        导入一条禁止循环的 WAV，并对齐时间线起始帧。
+
+        Parameters / 参数:
+            path: Pre-conformed audio path. / 预混音频路径。
+            track_index: One-based Resolve audio track index. / Resolve 从 1 开始的音轨索引。
+            fps/prepared: Timeline rate and picture decisions. / 时间线帧率与画面决策。
+            label_cn/label_en: Bilingual log labels. / 双语日志标签。
+        """
+        if not path.is_file():
+            raise ResolveExecutorError(f"找不到{label_cn} / {label_en} not found: {path}")
+        imported = self._import_media(path)
+        if len(imported) == 1:
+            media_item = imported[0]
+        else:
+            matches = self._items_for_path(path)
+            if len(matches) != 1:
+                raise ResolveExecutorError(
+                    f"无法唯一导入{label_cn} / Could not uniquely import {label_en}: {path}"
+                )
+            media_item = matches[0]
+        program_frames = sum(
+            max(
+                1,
+                int(
+                    ((decision.cut_out_sec - decision.cut_in_sec) * fps).to_integral_value(
+                        rounding=ROUND_CEILING
+                    )
+                ),
+            )
+            for decision, _ in prepared
+        )
+        audio_seconds = self._probe_media_duration(path)
+        if audio_seconds <= 0:
+            raise ResolveExecutorError(f"无法读取{label_cn}时长 / Could not read {label_en} duration: {path}")
+        audio_frames = max(
+            1,
+            int(
+                (Decimal(str(audio_seconds)) * fps).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            ),
+        )
+        allowed_shortfall = max(2, len(prepared) + 1)
+        if audio_frames + allowed_shortfall < program_frames:
+            raise ResolveExecutorError(
+                f"{label_cn}短于最终时间线 / Pre-conformed {label_en} is shorter than the program."
+            )
+        try:
+            audio_tracks = int(self.timeline.GetTrackCount("audio") or 0)
+        except Exception:
+            audio_tracks = 0
+        add_track = getattr(self.timeline, "AddTrack", None)
+        while audio_tracks < track_index and callable(add_track):
+            if add_track("audio", "stereo") is False:
+                break
+            audio_tracks += 1
+        if audio_tracks < track_index:
+            raise ResolveExecutorError(
+                f"无法创建音轨 {track_index} / Could not create audio track {track_index}."
+            )
+        try:
+            record_frame = int(self.timeline.GetStartFrame() or 0)
+        except Exception:
+            record_frame = 0
+        segment_frames = min(audio_frames, program_frames)
+        clip_info = {
+            "mediaPoolItem": media_item,
+            "startFrame": 0,
+            "endFrame": segment_frames - 1,
+            "mediaType": 2,
+            "trackIndex": track_index,
+            "recordFrame": record_frame,
+        }
+        result = self.media_pool.AppendToTimeline([clip_info])
+        items = self._coerce_items(result)
+        if result is None or result is False or (not items and result is not True):
+            raise ResolveExecutorError(
+                f"Resolve 无法把{label_cn}追加到音轨 {track_index} / "
+                f"Could not append {label_en} to audio track {track_index}."
+            )
+        self.logger.info(
+            "已导入预混%s：%s（音轨 %d）/ Pre-conformed %s added on audio track %d",
+            label_cn,
+            path.name,
+            track_index,
+            label_en,
+            track_index,
+        )
+        return items
+
     def append_music_bed(
         self,
         fps: Decimal,
@@ -1271,7 +1427,11 @@ class DaVinciExecutor:
         并由 ``review_renderer`` 精确生成到可观看预览中。
         """
         voice_isolation = getattr(timeline_item, "SetVoiceIsolationState", None)
-        if decision.audio_cleanup != "none" and callable(voice_isolation):
+        if (
+            not str(self.audio_program.get("bed_file") or "").strip()
+            and decision.audio_cleanup != "none"
+            and callable(voice_isolation)
+        ):
             amount = 75.0 if decision.audio_cleanup == "strong" else 45.0
             try:
                 applied = voice_isolation({"isEnabled": True, "amount": amount})
@@ -1306,7 +1466,10 @@ class DaVinciExecutor:
                     exc,
                 )
 
-        if decision.volume_db != 0:
+        if (
+            not str(self.audio_program.get("bed_file") or "").strip()
+            and decision.volume_db != 0
+        ):
             self._apply_native_clip_volume(timeline_item, decision)
 
         color_values = {

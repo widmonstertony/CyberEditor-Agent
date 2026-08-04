@@ -49,6 +49,18 @@ class MediaExtractorTests(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             MediaExtractor._normalize_segments([])
 
+    def test_whisper_tail_is_clamped_to_real_media_duration(self):
+        result = MediaExtractor._clamp_segments_to_duration(
+            [
+                {"id": 1, "start_sec": 10.0, "end_sec": 14.0, "text": "tail"},
+                {"id": 2, "start_sec": 14.0, "end_sec": 16.0, "text": "hallucination"},
+            ],
+            12.5125,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["end_sec"], 12.512)
+
     def test_default_visual_policy_is_full_one_fps_coverage(self):
         self.assertEqual(self.extractor.sample_interval_sec, 1.0)
         self.assertEqual(self.extractor.min_keyframe_gap_sec, 1.0)

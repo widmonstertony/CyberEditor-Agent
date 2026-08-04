@@ -847,6 +847,78 @@ class AIDirectorTests(unittest.TestCase):
             self.assertTrue(output["clips"][0]["has_dialogue"])
             self.assertTrue(output_path.is_file())
 
+    def test_oversized_prompt_is_blocked_before_ollama_can_left_truncate(self):
+        session = FakeSession()
+        director = self.make_director(session=session, num_ctx=4096)
+
+        with self.assertRaisesRegex(DirectorError, "Request blocked"):
+            director._request_json("x" * 50000, {"type": "object"})
+
+        self.assertEqual(session.posts, [])
+
+    def test_real_video_duration_clamps_transcript_and_candidate_tail(self):
+        director = self.make_director()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw_path = root / "raw_data.json"
+            raw_path.write_text(
+                json.dumps(
+                    {
+                        "assets": [
+                            {
+                                "asset_id": "a1",
+                                "duration_sec": 14.0,
+                                "video": {"duration_sec": 12.5125},
+                                "source_video": "source.mp4",
+                                "transcript": [
+                                    {"start_sec": 10.0, "end_sec": 14.0, "text": "tail"}
+                                ],
+                                "keyframes": [],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = director.load_raw_data(raw_path)
+            asset = payload["assets"][0]
+            candidates = director._sanitize_candidate_bounds(
+                [
+                    {
+                        "asset_id": "a1",
+                        "file_name": "source.mp4",
+                        "cut_in_sec": 5.0,
+                        "cut_out_sec": 14.0,
+                    }
+                ],
+                [asset],
+            )
+
+            self.assertEqual(asset["duration_sec"], 12.5125)
+            self.assertEqual(asset["transcript"][0]["end_sec"], 12.512)
+            self.assertEqual(candidates[0]["cut_out_sec"], 12.512)
+
+    def test_dialogue_overlap_forces_music_ducking(self):
+        director = self.make_director()
+        plan = director.enforce_dialogue_ducking(
+            [
+                {"cut_in_sec": 0, "cut_out_sec": 4, "has_dialogue": True},
+                {"cut_in_sec": 5, "cut_out_sec": 7, "has_dialogue": False},
+            ],
+            {
+                "cues": [
+                    {
+                        "timeline_in_sec": 0,
+                        "timeline_out_sec": 6,
+                        "duck_under_dialogue_db": 0,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(plan["cues"][0]["duck_under_dialogue_db"], -10.0)
+
 
 if __name__ == "__main__":
     unittest.main()

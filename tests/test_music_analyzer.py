@@ -130,6 +130,49 @@ class LicensedMusicAnalyzerTests(unittest.TestCase):
         self.assertGreater(profile["build_score"], 0.55)
         self.assertGreater(profile["peak_time_ratio"], 0.8)
 
+    def test_waveform_vocal_audit_rejects_repeated_producer_tag(self):
+        audit = LicensedMusicAnalyzer._classify_whisper_vocals(
+            {
+                "segments": [
+                    {
+                        "start": 0,
+                        "end": 10,
+                        "text": "producer tag on the track",
+                        "no_speech_prob": 0.06,
+                        "avg_logprob": -0.55,
+                        "compression_ratio": 0.8,
+                    },
+                    {
+                        "start": 40,
+                        "end": 50,
+                        "text": "producer tag on the track",
+                        "no_speech_prob": 0.31,
+                        "avg_logprob": -0.16,
+                        "compression_ratio": 0.8,
+                    },
+                ]
+            }
+        )
+
+        self.assertTrue(audit["vocal_detected"])
+        self.assertEqual(audit["credible_segment_count"], 2)
+
+    def test_waveform_vocal_audit_ignores_low_confidence_music_hallucination(self):
+        audit = LicensedMusicAnalyzer._classify_whisper_vocals(
+            {
+                "segments": [{
+                    "start": 0,
+                    "end": 20,
+                    "text": "imagined words",
+                    "no_speech_prob": 0.91,
+                    "avg_logprob": -1.7,
+                    "compression_ratio": 1.0,
+                }]
+            }
+        )
+
+        self.assertFalse(audit["vocal_detected"])
+
     def test_arbitrary_online_audio_fails_closed_without_per_run_consent(self):
         with tempfile.TemporaryDirectory() as temporary:
             acquirer = MusicCandidateAcquirer(temporary)

@@ -254,6 +254,18 @@ class ResolveExecutorTests(unittest.TestCase):
 
         self.assertEqual(timeline.GetName(), "CyberEditor Timeline")
 
+    def test_existing_current_timeline_is_preserved_and_new_name_is_unique(self):
+        project = FakeProject()
+        project.timeline = FakeTimeline("CyberEditor Timeline", project.fps)
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.project = project
+        executor.media_pool = project.media_pool
+
+        timeline = executor.ensure_timeline()
+
+        self.assertEqual(timeline.GetName(), "CyberEditor Timeline (2)")
+        self.assertIs(project.GetCurrentTimeline(), timeline)
+
     def test_per_source_slog2_input_transform_is_applied(self):
         class MediaItem:
             def __init__(self):
@@ -727,6 +739,44 @@ class ResolveExecutorTests(unittest.TestCase):
 
             self.assertIs(result, expected)
             launch.assert_called_once_with(executable)
+
+    def test_preconformed_program_audio_makes_picture_video_only_and_uses_a1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            program = root / "program_audio.wav"
+            source.write_bytes(b"video")
+            program.write_bytes(b"audio")
+            executor = DaVinciExecutor(root / "timeline_cuts.json")
+            executor.audio_program = {"bed_file": str(program)}
+
+            class Item:
+                def GetClipProperty(self, name=None):
+                    values = {"FPS": "25", "File Path": str(source), "Clip Name": source.name}
+                    return values if name is None else values.get(name, "")
+
+            executor.media_pool = mock.Mock()
+            executor.timeline = mock.Mock()
+            executor.timeline.GetTrackCount.return_value = 1
+            executor.timeline.GetStartFrame.return_value = 0
+            executor.media_pool.AppendToTimeline.return_value = [object()]
+            decision = ClipDecision(1, str(source), Decimal("0"), Decimal("2"), "test")
+            with (
+                mock.patch.object(executor, "_index_media_pool", return_value=[]),
+                mock.patch.object(executor, "_resolve_media", return_value=(Item(), [])),
+                mock.patch.object(executor, "_configure_media_input_transform"),
+                mock.patch.object(executor, "_probe_media_duration", side_effect=[2.0, 2.0]),
+                mock.patch.object(executor, "_import_media", return_value=[object()]),
+            ):
+                prepared = executor.prepare_clips([decision], Decimal("25"))
+                appended = executor.append_program_audio(Decimal("25"), prepared)
+
+            self.assertEqual(prepared[0][1]["mediaType"], 1)
+            self.assertEqual(len(appended), 1)
+            audio_info = executor.media_pool.AppendToTimeline.call_args.args[0][0]
+            self.assertEqual(audio_info["mediaType"], 2)
+            self.assertEqual(audio_info["trackIndex"], 1)
+            self.assertEqual(audio_info["recordFrame"], 0)
 
 
 if __name__ == "__main__":

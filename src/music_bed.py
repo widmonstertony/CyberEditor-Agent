@@ -237,7 +237,15 @@ class MusicBedRenderer:
                     f"afade=t=out:st={max(0.0, duration - fade_out):.6f}:d={fade_out:.6f}"
                 )
             duck_db = min(0.0, max(-24.0, float(cue.get("duck_under_dialogue_db", -9))))
-            for start, end in self._overlap_local(dialogue, timeline_in, timeline_in + duration):
+            dialogue_overlaps = self._overlap_local(
+                dialogue, timeline_in, timeline_in + duration
+            )
+            if dialogue_overlaps and duck_db > -6.0:
+                # Never trust a model-selected 0 dB value over real speech. This
+                # fail-safe also repairs older plans without rerunning the model.
+                # 真实对白优先于模型给出的 0 dB；此守门也能安全修复旧计划。
+                duck_db = -10.0
+            for start, end in dialogue_overlaps:
                 chain.append(self._smooth_duck_filter(start, end, duck_db, duration))
             for start, end in self._overlap_local(silence, timeline_in, timeline_in + duration):
                 chain.append(
