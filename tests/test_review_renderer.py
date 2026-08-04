@@ -42,6 +42,7 @@ class ReviewRendererTests(unittest.TestCase):
 
             self.assertIn("concat=n=2:v=1:a=0", graph)
             self.assertIn("xfade=transition=fade:duration=0.5", graph)
+            self.assertEqual(graph.count("settb=AVTB"), len(clips))
             self.assertIn("afftdn=nr=18:nf=-30", graph)
             self.assertIn("volume=-4.5dB", graph)
             self.assertIn("__FILTER_SCRIPT__", command)

@@ -897,6 +897,51 @@ class DaVinciExecutor:
                 f"Resolve 无法为 clip_id={decision.clip_id!r} 设置逐素材输入色彩空间。"
                 " / MediaPoolItem.SetClipProperty is unavailable."
             )
+
+        def read_input_color_space() -> str:
+            """Read Resolve's normalized combined input value. / 读取 Resolve 规范化后的组合输入值。"""
+            getter = getattr(media_item, "GetClipProperty", None)
+            if not callable(getter):
+                return ""
+            try:
+                value = getter("Input Color Space")
+            except Exception:
+                value = ""
+            if value:
+                return str(value).strip()
+            try:
+                properties = getter()
+            except Exception:
+                return ""
+            if isinstance(properties, dict):
+                return str(properties.get("Input Color Space") or "").strip()
+            return ""
+
+        def readback_matches(value: str) -> bool:
+            """Validate Resolve's version-specific display name. / 验证 Resolve 各版本的显示名称。"""
+            actual = "".join(character for character in value.casefold() if character.isalnum())
+            expected_space = "".join(
+                character for character in color_space.casefold() if character.isalnum()
+            )
+            if expected_space.startswith("sony"):
+                expected_space = expected_space[4:]
+            expected_gamma = "".join(
+                character for character in gamma.casefold() if character.isalnum()
+            )
+            if not actual or expected_space not in actual:
+                return False
+            if expected_gamma in actual:
+                return True
+            # Resolve 21 exposes the XML-defined Sony S-Log2 transform through
+            # ``Sony S-Gamut`` and reads it back as ``S-Gamut/S-Log``. The API
+            # does not accept a separate Input Gamma write for this profile.
+            # Resolve 21 通过 ``Sony S-Gamut`` 暴露 XML 标记的 S-Log2，并将
+            # 读回值规范化为 ``S-Gamut/S-Log``，且不接受单独写入 Input Gamma。
+            return (
+                expected_gamma == "slog2"
+                and actual == "sgamutslog"
+            )
+
         combined_values = (
             f"{color_space}/{gamma}",
             f"{color_space} / {gamma}",
@@ -913,15 +958,31 @@ class DaVinciExecutor:
                 pass
         try:
             color_ok = setter("Input Color Space", color_space)
-            gamma_ok = setter("Input Gamma", gamma)
         except Exception as exc:
             raise ResolveExecutorError(
                 f"Resolve 设置输入变换失败 clip_id={decision.clip_id!r}: {exc}"
             ) from exc
+        normalized_value = read_input_color_space()
+        if color_ok is True and readback_matches(normalized_value):
+            self.logger.info(
+                "逐素材输入变换 clip_id=%r：%s（Resolve=%s） / "
+                "Per-source input transform applied",
+                decision.clip_id,
+                f"{color_space}/{gamma}",
+                normalized_value,
+            )
+            return
+        try:
+            gamma_ok = setter("Input Gamma", gamma)
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"Resolve 设置输入 Gamma 失败 clip_id={decision.clip_id!r}: {exc}"
+            ) from exc
         if color_ok is not True or gamma_ok is not True:
             raise ResolveExecutorError(
                 f"Resolve 拒绝 clip_id={decision.clip_id!r} 的 {color_space}/{gamma} 输入变换；"
-                "请确认 Resolve 色彩管理与脚本 API 权限。 / Resolve rejected the source transform."
+                f"读回值={normalized_value or 'empty'}。请确认 Resolve 色彩管理与脚本 API 权限。"
+                " / Resolve rejected the source transform."
             )
 
     def _media_fps(self, media_item: Any) -> Optional[Decimal]:
@@ -1074,11 +1135,17 @@ class DaVinciExecutor:
             int((Decimal(str(music_seconds)) * fps).to_integral_value(rounding=ROUND_CEILING)),
         )
         if bed_text:
-            if music_frames + 1 < program_frames:
+            # Every picture range is quantized independently to Resolve frames.
+            # A bed rendered from the summed seconds can therefore be roughly
+            # one frame shorter per cut. Accept only that bounded delta and
+            # leave the tiny tail as production audio/silence; never loop a bed.
+            # 每段画面会独立舍入到 Resolve 帧；按总秒数合成的音乐床因此可能每个
+            # 切点少约一帧。只容忍这个有界误差，尾部保留现场声/静音且绝不循环。
+            allowed_shortfall = max(2, len(prepared) + 1)
+            if music_frames + allowed_shortfall < program_frames:
                 raise ResolveExecutorError(
                     "预合成音乐床短于最终时间线 / Pre-conformed music bed is shorter than the program."
                 )
-            music_frames = program_frames
         try:
             audio_tracks = int(self.timeline.GetTrackCount("audio") or 0)
         except Exception:
@@ -1116,7 +1183,19 @@ class DaVinciExecutor:
                 )
             appended.extend(items)
             cursor += segment_frames
+            if bed_text:
+                break
         if bed_text:
+            tail_frames = max(0, program_frames - cursor)
+            if tail_frames:
+                self.logger.info(
+                    "音乐床因逐片段帧舍入比画面短 %d 帧（%.3f 秒）；尾部保留现场声/静音 / "
+                    "Music bed ends %d frame(s) early after per-cut frame rounding; "
+                    "leaving production audio/silence",
+                    tail_frames,
+                    float(Decimal(tail_frames) / fps),
+                    tail_frames,
+                )
             self.logger.info(
                 "已导入预合成音乐床：%s（音轨 2）/ Pre-conformed music bed added on track 2",
                 path.name,

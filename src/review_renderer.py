@@ -311,7 +311,13 @@ class ReviewRenderer:
                 f"[{video_input}:v:0]setpts=PTS-STARTPTS,"
                 f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
                 f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2,"
-                f"fps={self._number(fps)},format=yuv420p"
+                # ``concat`` emits AVTB (microsecond) timestamps. Normalize every
+                # source to that same time base before a later xfade combines a
+                # hard-cut aggregate with the next source. Without this, mixed
+                # cut/xfade timelines fail at the first xfade on NTSC footage.
+                # ``concat`` 会输出 AVTB（微秒）时间基；在后续 xfade 前统一每段
+                # 素材的时间基，避免 NTSC 素材“先硬切、后转场”时初始化失败。
+                f"fps={self._number(fps)},settb=AVTB,format=yuv420p"
                 f"{self._technical_color_filter(clip)}"
                 f"{self._color_match_filter(clip)}"
                 f"{self._color_filter(clip.color_look)}"

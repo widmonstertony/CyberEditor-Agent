@@ -258,10 +258,19 @@ class ResolveExecutorTests(unittest.TestCase):
         class MediaItem:
             def __init__(self):
                 self.calls = []
+                self.value = "Project"
 
             def SetClipProperty(self, key, value):
                 self.calls.append((key, value))
-                return value == "Sony S-Gamut/S-Log2"
+                if key == "Input Color Space" and value == "Sony S-Gamut":
+                    self.value = "S-Gamut/S-Log"
+                    return True
+                return False
+
+            def GetClipProperty(self, key=None):
+                if key == "Input Color Space":
+                    return self.value
+                return {"Input Color Space": self.value}
 
         decision = ClipDecision(
             1,
@@ -282,6 +291,94 @@ class ResolveExecutorTests(unittest.TestCase):
         executor._configure_media_input_transform(item, decision)
 
         self.assertEqual(item.calls[0], ("Input Color Space", "Sony S-Gamut/S-Log2"))
+        self.assertIn(("Input Color Space", "Sony S-Gamut"), item.calls)
+        self.assertNotIn(("Input Gamma", "S-Log2"), item.calls)
+
+    def test_per_source_slog3_accepts_resolve_21_normalized_readback(self):
+        class MediaItem:
+            def __init__(self):
+                self.value = "Project"
+
+            def SetClipProperty(self, key, value):
+                if key == "Input Color Space" and value == "Sony S-Gamut3.Cine":
+                    self.value = "S-Gamut3.Cine/S-Log3"
+                    return True
+                return False
+
+            def GetClipProperty(self, key=None):
+                return self.value if key else {"Input Color Space": self.value}
+
+        decision = ClipDecision(
+            2,
+            "source.mp4",
+            Decimal("0"),
+            Decimal("2"),
+            "Sony XML test",
+            source_color={
+                "is_log": True,
+                "transform_supported": True,
+                "resolve_input_color_space": "Sony S-Gamut3.Cine",
+                "resolve_input_gamma": "S-Log3",
+            },
+        )
+        executor = DaVinciExecutor("timeline_cuts.json")
+
+        executor._configure_media_input_transform(MediaItem(), decision)
+
+    def test_preconformed_music_bed_allows_bounded_frame_rounding_without_loop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bed = Path(temporary) / "music_bed.wav"
+            bed.write_bytes(b"wav")
+
+            class Timeline:
+                def __init__(self):
+                    self.tracks = 1
+
+                def GetTrackCount(self, track_type):
+                    return self.tracks
+
+                def AddTrack(self, track_type, subtype):
+                    self.tracks += 1
+                    return True
+
+                def GetStartFrame(self):
+                    return 0
+
+            class MediaPool:
+                def __init__(self):
+                    self.appended = []
+
+                def AppendToTimeline(self, clip_infos):
+                    self.appended.extend(clip_infos)
+                    return [object()]
+
+            prepared = [
+                (
+                    ClipDecision(
+                        index,
+                        f"source-{index}.mp4",
+                        Decimal("0"),
+                        Decimal("0.02"),
+                        "frame rounding",
+                    ),
+                    {},
+                )
+                for index in range(3)
+            ]
+            executor = DaVinciExecutor("timeline_cuts.json")
+            executor.music_plan = {"bed_file": str(bed)}
+            executor.timeline = Timeline()
+            executor.media_pool = MediaPool()
+
+            with (
+                mock.patch.object(executor, "_import_media", return_value=[object()]),
+                mock.patch.object(executor, "_probe_media_duration", return_value=0.06),
+            ):
+                executor.append_music_bed(Decimal("25"), prepared)
+
+            self.assertEqual(len(executor.media_pool.appended), 1)
+            self.assertEqual(executor.media_pool.appended[0]["startFrame"], 0)
+            self.assertEqual(executor.media_pool.appended[0]["endFrame"], 1)
 
     def test_resolve_process_detection_ignores_windows_code_page(self):
         completed = SimpleNamespace(
