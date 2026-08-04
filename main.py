@@ -44,6 +44,90 @@ class WorkflowError(RuntimeError):
     """Expected workflow orchestration failure. / 可预期的工作流调度错误。"""
 
 
+class WindowsSleepInhibitor:
+    """
+    Keep Windows awake while a long workflow owns the current process.
+    在长时间工作流占用当前进程期间阻止 Windows 因空闲而睡眠。
+
+    ``SetThreadExecutionState`` changes no persistent power-plan setting. The
+    request is scoped to this orchestrator thread and is explicitly cleared on
+    success, failure, or cancellation. Keeping the display awake also protects
+    Resolve UI automation and PyAutoGUI actions later in the pipeline.
+    """
+
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+    ES_CONTINUOUS = 0x80000000
+
+    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+        """Store the logger and inactive state. / 保存日志器与未激活状态。"""
+        self.logger = logger or logging.getLogger(LOGGER_NAME)
+        self.active = False
+
+    @staticmethod
+    def _is_supported() -> bool:
+        """Return whether the Windows execution-state API is available. / 判断 Windows 防睡眠 API 是否可用。"""
+        return os.name == "nt"
+
+    @staticmethod
+    def _set_execution_state(flags: int) -> int:
+        """Call the native execution-state API. / 调用 Windows 原生执行状态 API。"""
+        import ctypes
+
+        setter = ctypes.WinDLL("kernel32", use_last_error=True).SetThreadExecutionState
+        setter.argtypes = (ctypes.c_ulong,)
+        setter.restype = ctypes.c_ulong
+        return int(setter(flags))
+
+    def __enter__(self) -> "WindowsSleepInhibitor":
+        """Request system/display wakefulness for this thread. / 请求本线程保持系统与显示器唤醒。"""
+        if not self._is_supported():
+            return self
+        flags = self.ES_CONTINUOUS | self.ES_SYSTEM_REQUIRED | self.ES_DISPLAY_REQUIRED
+        try:
+            self.active = bool(self._set_execution_state(flags))
+        except (AttributeError, OSError) as exc:
+            self.logger.warning(
+                "Windows 防睡眠请求失败，工作流仍会继续：%s / "
+                "Could not inhibit Windows sleep; workflow will continue: %s",
+                exc,
+                exc,
+            )
+            return self
+        if self.active:
+            self.logger.info(
+                "工作流期间已阻止 Windows 自动睡眠并保持显示器唤醒 / "
+                "Windows sleep and display idle timeout inhibited during workflow"
+            )
+        else:
+            self.logger.warning(
+                "Windows 拒绝了防睡眠请求；请临时检查电源设置 / "
+                "Windows rejected the sleep-inhibition request"
+            )
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        """Restore normal Windows idle behavior on every exit path. / 无论成功或异常退出都恢复正常空闲策略。"""
+        if not self.active:
+            return
+        try:
+            restored = bool(self._set_execution_state(self.ES_CONTINUOUS))
+        except (AttributeError, OSError) as restore_error:
+            self.logger.warning(
+                "恢复 Windows 电源状态请求失败：%s / Failed to restore execution state: %s",
+                restore_error,
+                restore_error,
+            )
+        else:
+            if restored:
+                self.logger.info(
+                    "工作流结束，已恢复 Windows 正常电源策略 / "
+                    "Workflow ended; normal Windows idle policy restored"
+                )
+        finally:
+            self.active = False
+
+
 class WorkflowLock:
     """
     Prevent two local workflows from competing for the same GPU/data directory.
@@ -275,7 +359,7 @@ class WorkflowOrchestrator:
                 timeline_cuts, "跳过导演时需要现有 timeline_cuts.json"
             )
 
-        with WorkflowLock(lock_path):
+        with WorkflowLock(lock_path), WindowsSleepInhibitor(self.logger):
             self.logger.info(
                 "串行工作流启动；任意时刻最多一个重型阶段 / Serial workflow started; one heavy stage at a time"
             )

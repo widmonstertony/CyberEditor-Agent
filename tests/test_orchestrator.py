@@ -10,7 +10,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from main import WorkflowError, WorkflowLock, WorkflowOrchestrator
+from main import (
+    WindowsSleepInhibitor,
+    WorkflowError,
+    WorkflowLock,
+    WorkflowOrchestrator,
+)
 
 
 class OrchestratorTests(unittest.TestCase):
@@ -65,6 +70,42 @@ class OrchestratorTests(unittest.TestCase):
                 )
 
             self.assertFalse(lock_path.exists())
+
+    def test_sleep_inhibitor_restores_state_after_failure(self):
+        setter = mock.Mock(side_effect=[1, 1])
+        guard = WindowsSleepInhibitor(logging.getLogger("test.sleep"))
+
+        with (
+            mock.patch.object(guard, "_is_supported", return_value=True),
+            mock.patch.object(guard, "_set_execution_state", setter),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stage failed"):
+                with guard:
+                    raise RuntimeError("stage failed")
+
+        expected_active = (
+            WindowsSleepInhibitor.ES_CONTINUOUS
+            | WindowsSleepInhibitor.ES_SYSTEM_REQUIRED
+            | WindowsSleepInhibitor.ES_DISPLAY_REQUIRED
+        )
+        self.assertEqual(
+            setter.call_args_list,
+            [mock.call(expected_active), mock.call(WindowsSleepInhibitor.ES_CONTINUOUS)],
+        )
+        self.assertFalse(guard.active)
+
+    def test_sleep_inhibitor_is_noop_on_unsupported_platform(self):
+        setter = mock.Mock()
+        guard = WindowsSleepInhibitor(logging.getLogger("test.sleep"))
+
+        with (
+            mock.patch.object(guard, "_is_supported", return_value=False),
+            mock.patch.object(guard, "_set_execution_state", setter),
+            guard,
+        ):
+            pass
+
+        setter.assert_not_called()
 
     def test_text_only_model_is_rejected_before_extraction(self):
         response = mock.MagicMock()
