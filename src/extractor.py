@@ -76,9 +76,9 @@ class MediaExtractor:
         device: str = "auto",
         language: Optional[str] = None,
         scene_threshold: float = 0.28,
-        sample_interval_sec: float = 2.0,
-        min_keyframe_gap_sec: float = 5.0,
-        max_keyframes: int = 240,
+        sample_interval_sec: float = 1.0,
+        min_keyframe_gap_sec: float = 1.0,
+        max_keyframes: int = 7200,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         """Initialize extraction policy without loading a model. / 初始化提取策略，但不加载模型。"""
@@ -229,6 +229,14 @@ class MediaExtractor:
             "video": video_metadata,
             "source_color": source_color,
             "color_analysis": color_analysis,
+            "visual_sampling": {
+                "mode": "continuous_temporal_coverage",
+                "requested_interval_sec": self.sample_interval_sec,
+                "effective_min_gap_sec": self.min_keyframe_gap_sec,
+                "hard_cap": self.max_keyframes,
+                "saved_frame_count": len(keyframes),
+                "complete_source_span": True,
+            },
             "transcript": segments,
             "keyframes": keyframes,
         }
@@ -365,18 +373,12 @@ class MediaExtractor:
             effective_min_gap = max(
                 self.min_keyframe_gap_sec, coverage_gap
             )
-            # A 30-second fallback was far too sparse for action continuity:
-            # many short clips produced only their first frame, so the vision
-            # director could identify objects but not understand what changed.
-            # Keep a bounded 5-8 second temporal sampling cadence.  The later
-            # vision request still selects only a small, distributed subset, so
-            # denser extraction improves evidence without inflating VRAM use.
-            # 旧版 30 秒保底采样无法理解动作过程。这里改为 5-8 秒的有界时间采样；
-            # 导演请求仍会二次筛选少量代表帧，因此不会破坏严格串行显存策略。
-            temporal_sampling_interval = max(
-                effective_min_gap,
-                min(8.0, max(5.0, duration / 18.0)),
-            )
+            # Full-coverage mode saves every configured temporal sample.  The
+            # hard cap only increases the interval for exceptionally long
+            # sources; a one-hour film at the default 1 fps stores every second.
+            # 完整覆盖模式保存每个时间采样；仅当超长素材触及硬上限时才自动放宽间隔。
+            # 默认 1 fps 时，一小时素材的每一秒都会留下视觉证据。
+            temporal_sampling_interval = effective_min_gap
 
             while timestamp <= duration and len(keyframes) < self.max_keyframes:
                 capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
@@ -394,8 +396,8 @@ class MediaExtractor:
                     else float(cv2.mean(cv2.absdiff(gray, previous_gray))[0])
                     / 255.0
                 )
-                # Scene changes capture visual events; periodic temporal samples
-                # preserve action progression in static interviews and long takes.
+                # Periodic samples provide complete temporal coverage; scene
+                # changes may add an earlier frame but never replace coverage.
                 since_last = timestamp - last_saved_at
                 periodic_due = since_last >= temporal_sampling_interval
                 should_save = (
@@ -646,9 +648,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--language")
     parser.add_argument("--scene-threshold", type=float, default=0.28)
-    parser.add_argument("--sample-interval", type=float, default=2.0)
-    parser.add_argument("--min-keyframe-gap", type=float, default=5.0)
-    parser.add_argument("--max-keyframes", type=int, default=240)
+    parser.add_argument("--sample-interval", type=float, default=1.0)
+    parser.add_argument("--min-keyframe-gap", type=float, default=1.0)
+    parser.add_argument("--max-keyframes", type=int, default=7200)
     parser.add_argument(
         "--log-level",
         default="INFO",

@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 LOGGER_NAME = "cybereditor.director"
 DIRECTOR_CHECKPOINT_VERSION = 1
-DIRECTOR_PROMPT_VERSION = "2026-08-03.4-deep-visual-color-music"
+DIRECTOR_PROMPT_VERSION = "2026-08-03.5-continuous-full-review"
 
 COLOR_BIBLE_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -223,6 +223,11 @@ DECISION_SCHEMA: Dict[str, Any] = {
 CANDIDATE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
+        "continuity_summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1200,
+        },
         "decisions": {
             "type": "array",
             "items": {
@@ -330,7 +335,7 @@ CANDIDATE_SCHEMA: Dict[str, Any] = {
             },
         }
     },
-    "required": ["decisions"],
+    "required": ["continuity_summary", "decisions"],
     "additionalProperties": False,
 }
 
@@ -506,6 +511,49 @@ MUSIC_PLAN_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
+COVERAGE_SYNOPSIS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "whole_footage_summary": {"type": "string", "minLength": 1, "maxLength": 2400},
+        "discovered_central_theme": {"type": "string", "minLength": 1, "maxLength": 500},
+        "character_threads": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 400},
+            "maxItems": 10,
+        },
+        "event_timeline": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string", "minLength": 1},
+                    "source_order": {"type": "integer", "minimum": 0},
+                    "event": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "story_meaning": {"type": "string", "minLength": 1, "maxLength": 500},
+                },
+                "required": ["asset_id", "source_order", "event", "story_meaning"],
+                "additionalProperties": False,
+            },
+            "maxItems": 24,
+        },
+        "visual_motifs": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 300},
+            "maxItems": 10,
+        },
+        "continuity_risks": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 300},
+            "maxItems": 10,
+        },
+    },
+    "required": [
+        "whole_footage_summary", "discovered_central_theme", "character_threads",
+        "event_timeline", "visual_motifs", "continuity_risks",
+    ],
+    "additionalProperties": False,
+}
+
 
 class DirectorError(RuntimeError):
     """Expected AI director failure. / 可预期的 AI 导演错误。"""
@@ -625,6 +673,7 @@ class AIDirector:
         self._active_treatment: Dict[str, Any] = {}
         self._active_target_duration_sec = 0.0
         self._music_files: List[Path] = []
+        self._asset_continuity_summaries: Dict[str, str] = {}
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         self._session = session
 
@@ -949,26 +998,24 @@ class AIDirector:
         Run visual candidate selection followed by global story assembly.
         先执行视觉候选片段筛选，再进行全局故事编排。
 
-        Every source/chunk is analyzed once with its transcript and actual JPEG
-        frames.  A second constrained model call sees candidates from every
-        asset and decides which clips to use and in what order.
+        Every saved one-fps visual sample is inspected exactly once in a small
+        overlapping transport batch. A rolling continuity summary carries the
+        whole source's state between calls. A second constrained model call sees
+        the completed source summaries and candidates from every asset.
 
-        每个素材分块都会结合台词和真实 JPEG 画面分析一次；第二次受约束模型调用会
-        看到全部素材的候选片段，并决定最终选用内容与跨素材顺序。
+        每个已保存的一帧/秒视觉证据都会在小型重叠传输批次中被审看；滚动连续性摘要
+        在调用间携带整条素材状态。第二次受约束模型调用会看到完整素材摘要与全部候选。
         """
         assets = raw_data["assets"]
         chunks: List[Dict[str, Any]] = []
         for asset_order, asset in enumerate(assets):
-            # The 10-15 minute setting is appropriate for text reasoning, but
-            # twelve images across that span are too sparse for action-level
-            # understanding. Review long sources as sequential three-minute
-            # micro-scenes while keeping one vision request/model resident at a
-            # time. This trades time for comprehension without increasing peak
-            # VRAM usage.
-            # 10-15 分钟适合文本推理，却不足以用 12 张图理解动作。长素材按最多
-            # 3 分钟微场景串行审片，只增加耗时，不增加峰值显存。
+            # Ollama cannot accept thousands of images in one request. These
+            # overlapping 16-second batches are transport envelopes only: no
+            # saved frame is sampled away, and continuity is carried forward.
+            # Ollama 无法一次接收数千张图片。16 秒重叠批次仅是传输容器：不会再次
+            # 抽样丢帧，并会把连续性状态传给下一批。
             asset_chunks = self.chunk_raw_data(
-                asset, window_sec=min(self.chunk_duration_sec, 180.0)
+                asset, window_sec=16.0, overlap_sec=2.0
             )
             source_name = str(
                 asset.get("proxy_file_name")
@@ -1011,6 +1058,7 @@ class AIDirector:
             len(chunks),
         )
         candidates: List[Dict[str, Any]] = []
+        self._asset_continuity_summaries = {}
         try:
             self.check_ollama(require_vision=True)
             self._music_analysis = self.load_music_analysis()
@@ -1024,6 +1072,11 @@ class AIDirector:
             self._active_treatment = treatment
             candidates.extend(self.candidates_from_treatment(treatment, assets))
             for index, chunk in enumerate(chunks, start=1):
+                asset_id = str(chunk["asset_id"])
+                chunk["continuity_context"] = self._asset_continuity_summaries.get(
+                    asset_id,
+                    "This is the beginning of the source; no earlier visual state exists.",
+                )
                 chunk_key = self._director_chunk_key(chunk)
                 cached_decisions = completed_chunks.get(chunk_key)
                 if isinstance(cached_decisions, list):
@@ -1036,6 +1089,17 @@ class AIDirector:
                         len(chunks),
                         chunk["asset_label"],
                     )
+                    cached_summary = next(
+                        (
+                            str(item.get("continuity_summary") or "").strip()
+                            for item in reversed(cached_decisions)
+                            if isinstance(item, dict)
+                            and str(item.get("continuity_summary") or "").strip()
+                        ),
+                        "",
+                    )
+                    if cached_summary:
+                        self._asset_continuity_summaries[asset_id] = cached_summary
                     candidates.extend(dict(item) for item in cached_decisions)
                     continue
                 self.logger.info(
@@ -1063,9 +1127,16 @@ class AIDirector:
                     chunk,
                     str(chunk["source_name"]),
                 )
+                continuity_summary = self._compact_prompt_text(
+                    response_payload.get("continuity_summary")
+                    or self._local_continuity_summary(chunk, decisions),
+                    1200,
+                )
+                self._asset_continuity_summaries[asset_id] = continuity_summary
                 for decision in decisions:
-                    decision["asset_id"] = str(chunk["asset_id"])
+                    decision["asset_id"] = asset_id
                     decision["source_order"] = int(chunk["source_order"])
+                    decision["continuity_summary"] = continuity_summary
                 candidates.extend(decisions)
                 completed_chunks[chunk_key] = [dict(item) for item in decisions]
                 self._write_director_checkpoint(
@@ -1164,9 +1235,21 @@ class AIDirector:
             "director_model": self.text_model,
             "chunk_duration_sec": self.chunk_duration_sec,
             "asset_count": len(assets),
+            "visual_review": {
+                "mode": "continuous_all_saved_samples",
+                "transport_batch_sec": 16.0,
+                "transport_overlap_sec": 2.0,
+                "transport_batch_count": len(chunks),
+                "saved_visual_sample_count": sum(
+                    len(asset.get("keyframes", [])) for asset in assets
+                ),
+                "second_stage_frame_subsampling": False,
+                "continuity_summaries": dict(self._asset_continuity_summaries),
+            },
             "candidate_count": len(candidates),
             "candidate_audit": candidates,
             "project_summary": str(sequence_payload.get("project_summary") or "").strip(),
+            "full_review_synopsis": sequence_payload.get("coverage_synopsis", {}),
             "director_treatment": treatment,
             "target_duration_sec": self._active_target_duration_sec,
             "color_pipeline": color_pipeline,
@@ -1334,6 +1417,7 @@ class AIDirector:
         self,
         raw_data: Dict[str, Any],
         window_sec: Optional[float] = None,
+        overlap_sec: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """
         Partition transcript/keyframes into non-overlapping time windows.
@@ -1348,6 +1432,8 @@ class AIDirector:
             raw_data: One extracted source record. / 一条已提取的素材记录。
             window_sec: Optional local visual-review window override. /
                 可选的局部视觉审片窗口秒数。
+            overlap_sec: Context overlap on both sides of each transport batch. /
+                每个传输批次两侧的连续性上下文重叠秒数。
         """
         duration = float(raw_data["duration_sec"])
         transcript = raw_data["transcript"]
@@ -1359,11 +1445,22 @@ class AIDirector:
         effective_window = float(window_sec or self.chunk_duration_sec)
         if not math.isfinite(effective_window) or effective_window <= 0:
             raise DirectorError("window_sec 必须大于 0 / must be positive.")
-        start = 0.0
+        effective_overlap = float(overlap_sec)
+        if (
+            not math.isfinite(effective_overlap)
+            or effective_overlap < 0
+            or effective_overlap >= effective_window / 2.0
+        ):
+            raise DirectorError(
+                "overlap_sec 必须在 [0, window_sec/2) / overlap is out of range."
+            )
+        core_start = 0.0
         index = 0
-        while start < duration:
-            end = min(duration, start + effective_window)
-            is_last = end >= duration
+        while core_start < duration:
+            core_end = min(duration, core_start + effective_window)
+            start = max(0.0, core_start - effective_overlap)
+            end = min(duration, core_end + effective_overlap)
+            is_last = core_end >= duration
             chunk_segments = []
             for segment in transcript:
                 midpoint = (
@@ -1389,12 +1486,14 @@ class AIDirector:
                         "index": index,
                         "start_sec": round(start, 3),
                         "end_sec": round(end, 3),
+                        "core_start_sec": round(core_start, 3),
+                        "core_end_sec": round(core_end, 3),
                         "transcript": chunk_segments,
                         "keyframes": chunk_keyframes,
                     }
                 )
                 index += 1
-            start = end
+            core_start = core_end
         if not chunks:
             raise DirectorError(
                 "没有可分析的分块 / No analyzable chunks were produced."
@@ -1531,11 +1630,16 @@ class AIDirector:
         Request one non-streaming, schema-constrained Ollama completion.
         请求一次非流式、受 JSON Schema 约束的 Ollama 生成。
         """
-        selected_frames = (
-            self._select_keyframes(chunk.get("keyframes", []), limit=12)
-            if include_images
-            else list(chunk.get("keyframes", []))
-        )
+        # Full-review batches are already bounded by time. Never perform a
+        # second representative-frame selection here: every extracted temporal
+        # sample must reach the vision model.
+        # 完整审片批次已经按时间限制；此处禁止再次挑代表帧，所有提取帧都必须送入模型。
+        selected_frames = list(chunk.get("keyframes", []))
+        if include_images and len(selected_frames) > 32:
+            raise DirectorError(
+                "单个连续审片批次超过 32 张图；请使用默认 1 fps，不能静默丢帧。"
+                " / A full-review batch exceeds 32 images; use the default 1 fps."
+            )
         images: List[str] = []
         if include_images:
             selected_frames, images = self._encode_images(selected_frames)
@@ -1749,6 +1853,41 @@ class AIDirector:
             marker in normalized for marker in ("70b", "72b")
         ) else self.num_ctx
 
+    def _local_continuity_summary(
+        self,
+        chunk: Dict[str, Any],
+        decisions: Sequence[Dict[str, Any]],
+    ) -> str:
+        """
+        Build a deterministic rolling-summary fallback for model/test compatibility.
+        为模型兼容与测试构建确定性的滚动摘要回退。
+
+        Parameters / 参数:
+            chunk: Current continuous-review transport batch. / 当前连续审片传输批次。
+            decisions: Validated editorial observations in the batch. / 本批次有效观察。
+        """
+        previous = self._compact_prompt_text(
+            chunk.get("continuity_context", ""), 700
+        )
+        observations = [
+            "{:.1f}-{:.1f}s {} [{}; {}]".format(
+                float(item.get("cut_in_sec", 0)),
+                float(item.get("cut_out_sec", 0)),
+                self._compact_prompt_text(
+                    item.get("subject_action") or item.get("visual_summary") or "",
+                    180,
+                ),
+                item.get("action_phase", "action"),
+                self._compact_prompt_text(item.get("emotion", ""), 80),
+            )
+            for item in decisions[-4:]
+        ]
+        current = "; ".join(observations) or (
+            f"No edit-worthy event in {float(chunk.get('core_start_sec', chunk['start_sec'])):.1f}-"
+            f"{float(chunk.get('core_end_sec', chunk['end_sec'])):.1f}s; continuity remains unchanged."
+        )
+        return self._compact_prompt_text(f"{previous} Latest: {current}", 1200)
+
     def build_prompt(
         self,
         chunk: Dict[str, Any],
@@ -1768,10 +1907,18 @@ class AIDirector:
             )
             for item in chunk["transcript"]
         ]
+        core_start = float(chunk.get("core_start_sec", chunk["start_sec"]))
+        core_end = float(chunk.get("core_end_sec", chunk["end_sec"]))
         keyframe_lines = [
-            "IMAGE_{} [{:.3f}s] scene_score={} file={}".format(
+            "IMAGE_{} [{:.3f}s] role={} scene_score={} file={}".format(
                 index,
                 float(item.get("timestamp_sec", 0)),
+                (
+                    "OVERLAP_CONTEXT"
+                    if float(item.get("timestamp_sec", 0)) < core_start
+                    or float(item.get("timestamp_sec", 0)) >= core_end
+                    else "NEW_CONTINUOUS_EVIDENCE"
+                ),
                 item.get("scene_score", "unknown"),
                 item.get("file_name", ""),
             )
@@ -1793,6 +1940,11 @@ class AIDirector:
             "and shot scale progress. Infer continuity only from adjacent supplied frames; "
             "never invent an unseen action. Fill subject_action, action_phase, continuity_tags, "
             "and rhythmic_potential so the final director can match action to music. Prefer complete "
+            "Read CONTINUITY FROM THE PREVIOUS BATCH first, then update continuity_summary "
+            "into a cumulative account of the source so far. Preserve identities, locations, "
+            "ongoing actions, unresolved intentions, and meaningful changes; do not reset the "
+            "story at this transport boundary. OVERLAP_CONTEXT images are shown only to reconnect "
+            "motion and must not create duplicate edit decisions. "
             "sentences, expressive visuals, stable/focused shots, meaningful B-roll, "
             "and authentic moments; reject dead air, repetition, camera setup, severe "
             "shake, accidental frames, and unusable audio. Suggest restrained effects "
@@ -1809,6 +1961,8 @@ class AIDirector:
             "decisions array is preferred when this source adds no new story value.\n"
             "Source order in the shoot: {source_order}. Preserve production chronology.\n"
             "Source/proxy media: {source}\n"
+            "CORE RANGE FOR NEW EVIDENCE: {core_start:.3f}s to {core_end:.3f}s\n"
+            "CONTINUITY FROM PREVIOUS BATCH: {continuity}\n"
             "DIRECTOR TREATMENT: {treatment}\n"
             "Required JSON schema: {schema}\n\n"
             "TRANSCRIPT:\n{transcript}\n\nKEYFRAMES:\n{keyframes}"
@@ -1817,6 +1971,11 @@ class AIDirector:
             end=float(chunk["end_sec"]),
             source=source_name,
             source_order=int(chunk.get("source_order", 0)),
+            core_start=core_start,
+            core_end=core_end,
+            continuity=self._compact_prompt_text(
+                chunk.get("continuity_context", ""), 1200
+            ),
             treatment=treatment_text,
             schema=schema_text,
             transcript="\n".join(transcript_lines) or "(none)",
@@ -2842,6 +3001,20 @@ class AIDirector:
             }
             for source_order, asset in enumerate(assets)
         ]
+        full_review_summaries = [
+            {
+                "asset_id": str(asset.get("asset_id") or ""),
+                "source_order": source_order,
+                "file": Path(str(asset.get("source_video") or "")).name,
+                "continuous_review_summary": self._compact_prompt_text(
+                    self._asset_continuity_summaries.get(
+                        str(asset.get("asset_id") or ""), ""
+                    ),
+                    600,
+                ),
+            }
+            for source_order, asset in enumerate(assets)
+        ]
         treatment = treatment or self._active_treatment
         compact_treatment = self._compact_treatment_for_prompt(treatment)
         music_choices = [
@@ -2893,9 +3066,33 @@ class AIDirector:
             }
             for item in music_choices
         ]
+        coverage_prompt = (
+            "CONTINUOUS FULL-FOOTAGE SYNTHESIS. The vision pass has inspected every "
+            "saved one-fps visual sample in chronological order and carried state across "
+            "overlapping transport batches. Synthesize the complete source summaries into "
+            "one grounded project memory before selecting shots. Track people, locations, "
+            "actions, reactions, cause/effect, recurring motifs, and unresolved intentions. "
+            "Do not invent events. You may refine the treatment's central thesis when the "
+            "complete evidence supports a stronger interpretation, but respect an explicit "
+            "user creative brief. Return JSON only.\n"
+            f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
+            f"INITIAL TREATMENT: {json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"SOURCE SUMMARIES: {json.dumps(full_review_summaries, ensure_ascii=False, separators=(',', ':'))}"
+        )
+        self.logger.info(
+            "正在汇总连续全片审片记忆 / Synthesizing continuous full-footage memory"
+        )
+        coverage_synopsis = self._request_json(
+            coverage_prompt,
+            COVERAGE_SYNOPSIS_SCHEMA,
+            model=self.text_model,
+        )
         sequence_prompt = (
-            "PICTURE ASSEMBLY STEP 1/2. You have already inspected representative frames and transcripts "
-            "from every source video. Build one coherent documentary edit from "
+            "PICTURE ASSEMBLY STEP 1/2. You have already inspected every saved one-fps frame and transcripts "
+            "from every source video in continuous order. The FULL COVERAGE SYNOPSIS was synthesized "
+            "from every one-fps visual sample in chronological order; use it to understand "
+            "the whole action and intention, not only the shortlisted candidates. Build one "
+            "coherent documentary edit from "
             "the candidate list below. Select only useful candidate_id values, "
             "never invent or duplicate an id. Follow the treatment. Preserve the "
             "real source_order and in-file timestamp chronology; narrative quality "
@@ -2920,6 +3117,7 @@ class AIDirector:
             f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
             f"AVAILABLE SCORE PROFILES:\n{json.dumps(score_profiles, ensure_ascii=False, separators=(',', ':'))}\n"
             f"ASSETS:\n{json.dumps(asset_names, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"FULL COVERAGE SYNOPSIS:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
             f"CANDIDATES:\n{json.dumps(compact_candidates, ensure_ascii=False, separators=(',', ':'))}"
         )
         self.logger.info(
@@ -2957,6 +3155,7 @@ class AIDirector:
                 "JSON only.\n"
                 f"TARGET PROGRAM: {self._active_target_duration_sec:.1f}s\n"
                 f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"FULL COVERAGE SYNOPSIS:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
                 f"SELECTED PICTURE STORYBOARD:\n{json.dumps(selected_storyboard, ensure_ascii=False, separators=(',', ':'))}\n"
                 f"AVAILABLE MUSIC:\n{json.dumps(music_choices, ensure_ascii=False, separators=(',', ':'))}"
             )
@@ -2978,6 +3177,7 @@ class AIDirector:
             }
         return {
             "project_summary": sequence_payload.get("project_summary", ""),
+            "coverage_synopsis": coverage_synopsis,
             "sequence": sequence_payload.get("sequence", []),
             "music_plan": music_plan,
         }
@@ -3595,6 +3795,8 @@ class AIDirector:
         validated: List[Dict[str, Any]] = []
         chunk_start = float(chunk["start_sec"])
         chunk_end = float(chunk["end_sec"])
+        core_start = float(chunk.get("core_start_sec", chunk_start))
+        core_end = float(chunk.get("core_end_sec", chunk_end))
         for index, decision in enumerate(decisions):
             if not isinstance(decision, dict):
                 raise DirectorError(
@@ -3618,6 +3820,10 @@ class AIDirector:
                 )
             cut_in = max(chunk_start, cut_in)
             cut_out = min(chunk_end, cut_out)
+            if cut_out <= core_start or cut_in >= core_end:
+                # Overlap images reconnect motion only; candidates wholly outside
+                # the new core belong to the neighboring transport batch.
+                continue
             maximum_duration = self._max_candidate_duration(story_role)
             if cut_out - cut_in > maximum_duration:
                 self.logger.warning(

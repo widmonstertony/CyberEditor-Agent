@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from src.director import AIDirector, DirectorError
+from src.director import AIDirector, CANDIDATE_SCHEMA, DirectorError
 
 
 class FakeResponse:
@@ -116,6 +116,21 @@ class VisionSession(FakeSession):
                     },
                 ],
             }
+        elif "CONTINUOUS FULL-FOOTAGE SYNTHESIS" in prompt:
+            generated = {
+                "whole_footage_summary": "The crew prepares and completes one coordinated action.",
+                "discovered_central_theme": "Coordination turns preparation into payoff.",
+                "character_threads": ["The crew gathers, prepares, and acts together."],
+                "event_timeline": [
+                    {
+                        "asset_id": "asset-1", "source_order": 0,
+                        "event": "Preparation leads to the final action.",
+                        "story_meaning": "The payoff depends on shared coordination.",
+                    }
+                ],
+                "visual_motifs": ["Repeated preparation gestures"],
+                "continuity_risks": ["Do not repeat the same setup action"],
+            }
         elif "Build one coherent documentary edit" in prompt:
             generated = {
                 "project_summary": "A coherent multi-camera story",
@@ -141,6 +156,7 @@ class VisionSession(FakeSession):
             }
         else:
             generated = {
+                "continuity_summary": "A person enters and begins the source action.",
                 "decisions": [
                     {
                         "cut_in_sec": 1.0,
@@ -242,6 +258,66 @@ class AIDirectorTests(unittest.TestCase):
         self.assertTrue(
             all(chunk["end_sec"] - chunk["start_sec"] <= 180 for chunk in chunks)
         )
+
+    def test_continuous_review_batches_overlap_without_losing_core_time(self):
+        raw = {
+            "duration_sec": 40.0,
+            "transcript": [],
+            "keyframes": [
+                {"timestamp_sec": float(second), "file_name": f"{second}.jpg"}
+                for second in range(40)
+            ],
+        }
+
+        chunks = self.make_director().chunk_raw_data(
+            raw, window_sec=16, overlap_sec=2
+        )
+
+        self.assertEqual(
+            [(item["core_start_sec"], item["core_end_sec"]) for item in chunks],
+            [(0.0, 16.0), (16.0, 32.0), (32.0, 40.0)],
+        )
+        self.assertEqual(
+            [(item["start_sec"], item["end_sec"]) for item in chunks],
+            [(0.0, 18.0), (14.0, 34.0), (30.0, 40.0)],
+        )
+
+    def test_full_review_request_sends_every_extracted_frame(self):
+        session = VisionSession()
+        director = self.make_director(model="qwen3.5:test", session=session)
+        with tempfile.TemporaryDirectory() as temporary:
+            frame = Path(temporary) / "frame.jpg"
+            frame.write_bytes(b"jpeg")
+            chunk = {
+                "index": 0,
+                "start_sec": 0.0,
+                "end_sec": 16.0,
+                "core_start_sec": 0.0,
+                "core_end_sec": 16.0,
+                "source_order": 0,
+                "continuity_context": "source begins",
+                "transcript": [],
+                "keyframes": [
+                    {
+                        "timestamp_sec": float(second),
+                        "file_name": f"{second}.jpg",
+                        "image_path": str(frame),
+                    }
+                    for second in range(16)
+                ],
+            }
+
+            director.request_chunk(
+                chunk,
+                "source.mp4",
+                schema=CANDIDATE_SCHEMA,
+                include_images=True,
+                treatment={},
+            )
+
+        request = next(item for item in session.posts if item.get("images"))
+        self.assertEqual(len(request["images"]), 16)
+        self.assertIn("CONTINUITY FROM PREVIOUS BATCH", request["prompt"])
 
     def test_treatment_excerpt_samples_start_middle_and_end_within_budget(self):
         segments = [
@@ -613,11 +689,14 @@ class AIDirectorTests(unittest.TestCase):
         generation_posts = [
             item for item in session.posts if item.get("keep_alive") != 0
         ]
-        self.assertEqual(len(generation_posts), 2)
-        self.assertIn("step 1", generation_posts[0]["prompt"].casefold())
+        self.assertEqual(len(generation_posts), 3)
+        self.assertIn(
+            "CONTINUOUS FULL-FOOTAGE SYNTHESIS", generation_posts[0]["prompt"]
+        )
+        self.assertIn("step 1", generation_posts[1]["prompt"].casefold())
         self.assertIn(
             "Design the final documentary music cue sheet",
-            generation_posts[1]["prompt"],
+            generation_posts[2]["prompt"],
         )
         self.assertNotIn("AVAILABLE MUSIC", generation_posts[0]["prompt"])
         self.assertEqual(result["sequence"][0]["candidate_id"], "C0001")
@@ -745,6 +824,13 @@ class AIDirectorTests(unittest.TestCase):
             # the second request inspects the source chunk in detail.
             self.assertEqual(len(image_requests), 2)
             self.assertEqual(output["schema_version"], "3.0")
+            self.assertEqual(
+                output["visual_review"]["mode"], "continuous_all_saved_samples"
+            )
+            self.assertFalse(
+                output["visual_review"]["second_stage_frame_subsampling"]
+            )
+            self.assertIn("discovered_central_theme", output["full_review_synopsis"])
             self.assertEqual(
                 output["color_pipeline"]["sources"]["asset-1"]["resolve_input_gamma"],
                 "S-Log3",

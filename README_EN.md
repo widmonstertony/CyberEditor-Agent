@@ -36,12 +36,15 @@ the local gate completes setup, development, payoff, and ending without forcing
 every source file into the movie or repeating an action/countdown to fill time.
 
 The full workflow does not merely concatenate every file. Each source is
-transcribed and sampled from scene changes plus bounded 5–8 second temporal
-evidence, allowing the vision model to understand setup, action, reaction, and
+transcribed and sampled continuously at one saved frame per second by default,
+allowing the vision model to understand setup, action, reaction, and
 payoff rather than merely naming objects. A vision model first writes a
 project-wide treatment with theme, four story beats, target runtime, an
-executable color bible, and music mood. It then reviews long sources as sequential
-visual micro-scenes of no more than three minutes with both images and speech.
+executable color bible, and music mood. It then reviews every saved one-fps image
+and the dialogue in order. Ollama cannot accept thousands of images from an hour
+in one request, so 16-second transport batches overlap by two seconds on each side.
+No second representative-frame selection occurs, and a rolling identity, location,
+action, emotion, and unresolved-intention summary crosses every batch boundary.
 A second global-director pass keeps only the
 minority of shots that serve that treatment. Local validation enforces actual
 source order and in-file timecode, plus per-shot and total-runtime limits. It
@@ -216,9 +219,10 @@ The implementation now follows this strict serial chain:
    sections, whole-track energy trend, peak position, key, dynamic range, and EBU
    R128 LUFS into `music_analysis.json`. Ranking combines BPM, semantic relevance,
    and whether the measured curve can deliver the requested build or climax.
-4. **Final direction**: Qwen3.6 reloads, reviews image/speech micro-scenes of no more
-   than three minutes, and performs cross-source story and multi-cue assembly against
-   analyzed tracks.
+4. **Final direction**: Qwen3.6 reloads and reviews every saved one-fps visual sample
+   and transcript in order. Overlapping 16-second batches only satisfy the context
+   window; they do not discard intermediate samples, and a rolling continuity summary
+   carries whole-source understanding into cross-source story and multi-cue assembly.
    Dynamic shot limits range from 10-second B-roll to complete 45-second interview
    thoughts. Picture selection assigns natural-sound, on-beat, phrase-start, build,
    payoff-hit, or release roles; local validation grounds two to six sync points in
@@ -612,10 +616,11 @@ out-point up, then subtracts one frame to match Resolve's inclusive `endFrame`.
 
 ## Robustness boundaries
 
-- The vision model does not decode every 4K pixel of every frame. Extraction
-  traverses every video and retains time-distributed, scene-change-aware
-  representative frames for windowed review. This balances long-form coverage
-  with local context and memory limits.
+- “Full review” means every saved one-fps visual sample plus all dialogue from
+  beginning to end, not every original frame of a 59.94 fps stream. A one-hour
+  source therefore sends about 3,600 images in overlapping batches with no
+  second sampling pass. This is the explicit boundary between complete temporal
+  coverage and a local VLM context window.
 - Resolve's public scripting API has no stable general transition-insertion
   method. The FFmpeg preview truly renders the AI transition, denoise, look,
   and motion plan. The editable Resolve timeline applies supported Voice

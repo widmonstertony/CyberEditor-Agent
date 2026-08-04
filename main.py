@@ -860,8 +860,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--whisper-device", default="auto")
     parser.add_argument("--language")
     parser.add_argument("--scene-threshold", type=float, default=0.28)
-    parser.add_argument("--sample-interval", type=float, default=2.0)
-    parser.add_argument("--max-keyframes", type=int, default=240)
+    parser.add_argument(
+        "--sample-interval", type=float, default=1.0,
+        help="连续视觉审片采样间隔；默认每秒一帧 / full-review sampling interval",
+    )
+    parser.add_argument(
+        "--max-keyframes", type=int, default=7200,
+        help="每个素材的视觉证据硬上限 / per-source visual evidence cap",
+    )
     parser.add_argument("--ollama-model", default="qwen3.6:27b-mtp-q8_0")
     parser.add_argument(
         "--director-model",

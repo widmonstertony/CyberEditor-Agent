@@ -49,6 +49,11 @@ class MediaExtractorTests(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             MediaExtractor._normalize_segments([])
 
+    def test_default_visual_policy_is_full_one_fps_coverage(self):
+        self.assertEqual(self.extractor.sample_interval_sec, 1.0)
+        self.assertEqual(self.extractor.min_keyframe_gap_sec, 1.0)
+        self.assertEqual(self.extractor.max_keyframes, 7200)
+
     def test_write_srt_utf8(self):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "字幕.srt"
