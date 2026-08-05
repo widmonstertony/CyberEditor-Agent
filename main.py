@@ -326,6 +326,8 @@ class WorkflowOrchestrator:
             and bool(audit)
             and isinstance(review, dict)
             and review.get("mode") == "continuous_all_saved_samples"
+            and review.get("candidate_audit_complete") is True
+            and int(review.get("candidate_audit_version", 0) or 0) >= 2
         )
 
     def run(self, args: argparse.Namespace) -> None:

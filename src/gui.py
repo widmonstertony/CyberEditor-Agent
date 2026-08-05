@@ -471,7 +471,11 @@ def recommend_automatic_settings(
         # slower but produce better edit decisions for hour-long footage.
         # 更短的分块能保留局部叙事细节；调用次数更多但长视频剪辑决策更细致。
         chunk_minutes = 10.0
-        num_ctx = 16384
+        # A 32K window lets the final Qwen director compare the complete compact
+        # candidate ledger on a 64GB-class workstation in most projects. Larger
+        # projects automatically fall back to context-safe director review pages.
+        # 32K 可让 64GB 级工作站在多数项目中一次比较完整候选表；更大项目自动分页。
+        num_ctx = 32768
         profile = "performance"
     elif ram_gb >= 24 or vram_gb >= 6:
         chunk_minutes = 12.0
@@ -1452,7 +1456,7 @@ class CyberEditorApp:
             "Ollama 上下文 / Context",
             ttk.Combobox,
             textvariable=self.ctx_var,
-            values=(2048, 4096, 8192, 16384, 32768),
+            values=(2048, 4096, 8192, 16384, 32768, 49152, 65536),
         )
         self._field(
             grid,
@@ -1781,7 +1785,7 @@ class CyberEditorApp:
                     "whisper_model": "large-v3",
                     "whisper_device": "auto",
                     "chunk_minutes": 10.0,
-                    "num_ctx": 16384,
+                    "num_ctx": 32768,
                 },
             }
             settings = presets.get(profile, presets["balanced"])

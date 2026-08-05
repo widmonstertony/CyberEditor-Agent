@@ -1049,9 +1049,13 @@ class AIDirector:
             [dict(item) for item in audit if isinstance(item, dict)], assets
         )
         candidates = self._attach_candidate_dialogue(candidates, assets)
-        candidates = self._limit_candidates(
+        candidates = sorted(
             candidates,
-            limit=max(18, min(28, self._effective_num_ctx(self.text_model) // 768)),
+            key=lambda item: (
+                int(item.get("source_order", 0) or 0),
+                float(item.get("cut_in_sec", 0) or 0),
+                float(item.get("cut_out_sec", 0) or 0),
+            ),
         )
         for index, candidate in enumerate(candidates, start=1):
             candidate["candidate_id"] = f"C{index:04d}"
@@ -1119,6 +1123,9 @@ class AIDirector:
                 ).strip(),
                 "full_review_synopsis": sequence_payload.get(
                     "coverage_synopsis", {}
+                ),
+                "candidate_directing": sequence_payload.get(
+                    "candidate_directing", {}
                 ),
                 "director_treatment": treatment,
                 "target_duration_sec": self._active_target_duration_sec,
@@ -1300,12 +1307,18 @@ class AIDirector:
             candidates = self.merge_decisions(candidates)
             candidates = self._sanitize_candidate_bounds(candidates, assets)
             candidates = self._attach_candidate_dialogue(candidates, assets)
-            candidate_limit = max(
-                18,
-                min(28, self._effective_num_ctx(self.text_model) // 768),
-            )
-            candidates = self._limit_candidates(
-                candidates, limit=candidate_limit
+            # Do not discard footage with a fixed score-based shortlist. Every
+            # candidate receives a stable id and is considered by the text
+            # director. request_sequence() either sends the complete ledger in
+            # one request or uses context-safe director review pages.
+            # 不再用固定分数上限提前丢弃镜头；每个候选都会进入文字导演流程。
+            candidates = sorted(
+                candidates,
+                key=lambda item: (
+                    int(item.get("source_order", 0) or 0),
+                    float(item.get("cut_in_sec", 0) or 0),
+                    float(item.get("cut_out_sec", 0) or 0),
+                ),
             )
             for index, candidate in enumerate(candidates, start=1):
                 candidate["candidate_id"] = f"C{index:04d}"
@@ -1392,6 +1405,8 @@ class AIDirector:
             "asset_count": len(assets),
             "visual_review": {
                 "mode": "continuous_all_saved_samples",
+                "candidate_audit_complete": True,
+                "candidate_audit_version": 2,
                 "transport_batch_sec": 16.0,
                 "transport_overlap_sec": 2.0,
                 "transport_batch_count": len(chunks),
@@ -1405,6 +1420,7 @@ class AIDirector:
             "candidate_audit": candidates,
             "project_summary": str(sequence_payload.get("project_summary") or "").strip(),
             "full_review_synopsis": sequence_payload.get("coverage_synopsis", {}),
+            "candidate_directing": sequence_payload.get("candidate_directing", {}),
             "director_treatment": treatment,
             "target_duration_sec": self._active_target_duration_sec,
             "color_pipeline": color_pipeline,
@@ -1933,6 +1949,44 @@ class AIDirector:
         )
         return self._request_json(prompt, active_schema, images)
 
+    @staticmethod
+    def _director_system_prompt() -> str:
+        """Return the shared grounded-director system prompt. / 返回统一的事实约束导演提示。"""
+        return (
+            "You are a senior documentary editor and visual storyteller. "
+            "Use only supplied transcript, timestamps, and images. Return "
+            "only the requested JSON and never invent content."
+        )
+
+    def _request_has_capacity(
+        self,
+        prompt: str,
+        schema: Dict[str, Any],
+        *,
+        model: Optional[str] = None,
+        reserve_output_tokens: int = 1024,
+    ) -> bool:
+        """
+        Check whether a request fits without silently truncating its beginning.
+        检查请求能否完整放入上下文，避免静默截断开头。
+
+        Parameters / 参数:
+            prompt: Model-facing evidence and instructions. / 模型输入证据与指令。
+            schema: Required structured-output schema. / 结构化输出 Schema。
+            model: Optional Ollama model override. / 可选 Ollama 模型覆盖。
+            reserve_output_tokens: Minimum generation space to retain. / 最少保留输出空间。
+        """
+        selected_model = str(model or self.model).strip()
+        request_num_ctx = self._effective_num_ctx(selected_model)
+        schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        estimated_input_tokens = self._estimate_prompt_tokens(
+            self._director_system_prompt() + "\n" + prompt + "\n" + schema_text
+        )
+        return (
+            estimated_input_tokens + max(1024, int(reserve_output_tokens)) + 256
+            <= request_num_ctx
+        )
+
     def _request_json(
         self,
         prompt: str,
@@ -1956,11 +2010,7 @@ class AIDirector:
         quality_think: Any = "high" if "gpt-oss" in normalized_model else True
         direct_think: Any = "low" if "gpt-oss" in normalized_model else False
         desired_num_predict = max(1024, min(4096, request_num_ctx // 4))
-        system_prompt = (
-            "You are a senior documentary editor and visual storyteller. "
-            "Use only supplied transcript, timestamps, and images. Return "
-            "only the requested JSON and never invent content."
-        )
+        system_prompt = self._director_system_prompt()
         schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
         estimated_input_tokens = self._estimate_prompt_tokens(
             system_prompt + "\n" + prompt + "\n" + schema_text
@@ -3464,39 +3514,103 @@ class AIDirector:
             COVERAGE_SYNOPSIS_SCHEMA,
             model=self.text_model,
         )
-        sequence_prompt = (
-            "PICTURE ASSEMBLY STEP 1/2. You have already inspected every saved one-fps frame and transcripts "
-            "from every source video in continuous order. The FULL COVERAGE SYNOPSIS was synthesized "
-            "from every one-fps visual sample in chronological order; use it to understand "
-            "the whole action and intention, not only the shortlisted candidates. Build one "
-            "coherent documentary edit from "
-            "the candidate list below. Select only useful candidate_id values, "
-            "never invent or duplicate an id. Follow the treatment. Preserve the "
-            "real source_order and in-file timestamp chronology; narrative quality "
-            "must come from selection and juxtaposition, not scrambling the shoot. "
-            "Establish context, develop the story, "
-            "use B-roll to cover or bridge speech, avoid repetitive points, and "
-            "finish deliberately. Preserve complete thoughts. Choose restrained "
-            "transitions and effects from the schema; default to hard cuts, use "
-            "cross dissolves for genuine time/mood changes, and fade_black only "
-            "for major chapter endings. Keep the sum of selected clip durations at "
-            f"or below {self._active_target_duration_sec * 1.10:.1f} seconds. A shorter "
-            "complete film is better than padding to the target: never repeat an action, "
-            "idea, lineup, countdown, or setup merely to reach runtime. Select only "
-            "the strongest minority of candidates; never include everything. Design "
-            "picture rhythm against AVAILABLE SCORE PROFILES now, before selecting: "
-            "assign every shot a music_edit_role, preserve natural sound for speech, "
-            "use action/reaction and high rhythmic_potential shots for musical builds, "
-            "and reserve payoff_hit for the true narrative payoff. Do not pretend a flat "
-            "track has a crescendo. "
-            "Return project_summary and sequence only; the next constrained call "
-            "will score music against this exact edit. Return JSON only.\n"
-            f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
-            f"AVAILABLE SCORE PROFILES:\n{json.dumps(score_profiles, ensure_ascii=False, separators=(',', ':'))}\n"
-            f"ASSETS:\n{json.dumps(asset_names, ensure_ascii=False, separators=(',', ':'))}\n"
-            f"FULL COVERAGE SYNOPSIS:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
-            f"CANDIDATES:\n{json.dumps(compact_candidates, ensure_ascii=False, separators=(',', ':'))}"
-        )
+        def build_sequence_prompt(
+            active_candidates: Sequence[Dict[str, Any]],
+        ) -> str:
+            return (
+                "PICTURE ASSEMBLY STEP 1/2. You have already inspected every saved one-fps frame and transcripts "
+                "from every source video in continuous order. The FULL COVERAGE SYNOPSIS was synthesized "
+                "from every one-fps visual sample in chronological order; use it to understand "
+                "the whole action and intention, not only the editable candidates. Build one "
+                "coherent documentary edit from "
+                "the candidate list below. Select only useful candidate_id values, "
+                "never invent or duplicate an id. Follow the treatment. Preserve the "
+                "real source_order and in-file timestamp chronology; narrative quality "
+                "must come from selection and juxtaposition, not scrambling the shoot. "
+                "Establish context, develop the story, "
+                "use B-roll to cover or bridge speech, avoid repetitive points, and "
+                "finish deliberately. Preserve complete thoughts. Choose restrained "
+                "transitions and effects from the schema; default to hard cuts, use "
+                "cross dissolves for genuine time/mood changes, and fade_black only "
+                "for major chapter endings. Keep the sum of selected clip durations at "
+                f"or below {self._active_target_duration_sec * 1.10:.1f} seconds. A shorter "
+                "complete film is better than padding to the target: never repeat an action, "
+                "idea, lineup, countdown, or setup merely to reach runtime. Select only "
+                "the strongest minority of candidates; never include everything. Design "
+                "picture rhythm against AVAILABLE SCORE PROFILES now, before selecting: "
+                "assign every shot a music_edit_role, preserve natural sound for speech, "
+                "use action/reaction and high rhythmic_potential shots for musical builds, "
+                "and reserve payoff_hit for the true narrative payoff. Do not pretend a flat "
+                "track has a crescendo. "
+                "Return project_summary and sequence only; the next constrained call "
+                "will score music against this exact edit. Return JSON only.\n"
+                f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"AVAILABLE SCORE PROFILES:\n{json.dumps(score_profiles, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"ASSETS:\n{json.dumps(asset_names, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"FULL COVERAGE SYNOPSIS:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"CANDIDATES:\n{json.dumps(active_candidates, ensure_ascii=False, separators=(',', ':'))}"
+            )
+
+        sequence_prompt = build_sequence_prompt(compact_candidates)
+        candidate_directing: Dict[str, Any] = {
+            "mode": "single_pass_full_ledger",
+            "configured_context_tokens": self._effective_num_ctx(self.text_model),
+            "all_candidate_count": len(compact_candidates),
+            "final_assembly_candidate_count": len(compact_candidates),
+            "all_candidates_considered": True,
+            "review_rounds": [],
+        }
+        # Prefer a single global call when the complete compact ledger fits. If
+        # it does not, every candidate is reviewed by the same director in
+        # chronological pages. Only director-recommended ids advance to the
+        # final assembly call; no score-based Python shortlist is used.
+        # 完整候选表能放下时一次提交；否则由同一导演按时间顺序分页审阅全部候选，
+        # 再汇总进入总编排。不存在 Python 固定 Top-N 丢镜头。
+        review_pool = list(compact_candidates)
+        review_round_number = 0
+        while not self._request_has_capacity(
+            build_sequence_prompt(review_pool),
+            SEQUENCE_SELECTION_SCHEMA,
+            model=self.text_model,
+            reserve_output_tokens=2048,
+        ):
+            if len(review_pool) <= 1:
+                raise DirectorError(
+                    "即使只有一个候选，完整导演上下文仍然超限；请提高 Context。"
+                    " / Even one candidate cannot fit the global director context; increase Context."
+                )
+            review_round_number += 1
+            previous_count = len(review_pool)
+            review_pool, round_audit = self._review_candidate_round(
+                review_pool,
+                compact_treatment,
+                asset_names,
+                coverage_synopsis,
+                round_number=review_round_number,
+            )
+            candidate_directing["review_rounds"].append(round_audit)
+            if len(review_pool) >= previous_count:
+                raise DirectorError(
+                    "分页导演未能缩小最终汇总输入；请提高 Context 后重试。"
+                    " / Paged directing did not reduce the final assembly input; increase Context."
+                )
+            if review_round_number >= 8:
+                raise DirectorError(
+                    "候选分页超过 8 轮仍无法放入最终上下文。"
+                    " / Candidate review exceeded eight rounds without fitting the final context."
+                )
+        if review_round_number:
+            candidate_directing["mode"] = "paged_full_ledger"
+            candidate_directing["final_assembly_candidate_count"] = len(review_pool)
+            sequence_prompt = build_sequence_prompt(review_pool)
+            self.logger.info(
+                "全量候选已由导演分页审阅：%d 个全部进入审阅，%d 个进入最终编排 / "
+                "Paged director reviewed all %d candidates; %d advanced to final assembly",
+                len(compact_candidates),
+                len(review_pool),
+                len(compact_candidates),
+                len(review_pool),
+            )
         self.logger.info(
             "正在进行跨素材全局编排（%d 个候选，第 1/2 步：镜头）/ "
             "Global story assembly (%d candidates, step 1/2: picture)",
@@ -3555,8 +3669,196 @@ class AIDirector:
         return {
             "project_summary": sequence_payload.get("project_summary", ""),
             "coverage_synopsis": coverage_synopsis,
+            "candidate_directing": candidate_directing,
             "sequence": sequence_payload.get("sequence", []),
             "music_plan": music_plan,
+        }
+
+    def _review_candidate_round(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        treatment: Dict[str, Any],
+        assets: Sequence[Dict[str, Any]],
+        coverage_synopsis: Dict[str, Any],
+        *,
+        round_number: int,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Review every candidate in context-safe chronological pages.
+        在上下文安全的时间顺序分页中审阅每一个候选镜头。
+
+        Parameters / 参数:
+            candidates: Complete candidate pool for this review round. / 本轮完整候选池。
+            treatment: Compact director treatment. / 紧凑导演阐述。
+            assets: Source identity and duration records. / 素材标识与时长记录。
+            coverage_synopsis: Memory synthesized from the exhaustive visual pass. /
+                从全量视觉审片中合成的全片记忆。
+            round_number: One-based hierarchy level. / 从 1 开始的分层轮次。
+
+        Returns / 返回:
+            Director-recommended candidates plus a reproducible coverage audit. /
+            导演推荐候选以及可复核的全量覆盖审计。
+        """
+        def review_schema(max_items: int) -> Dict[str, Any]:
+            return {
+                "type": "object",
+                "properties": {
+                    "page_summary": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 900,
+                    },
+                    "recommendations": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": max_items,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "candidate_id": {"type": "string", "minLength": 1},
+                                "story_value": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 320,
+                                },
+                                "suggested_story_role": {
+                                    "type": "string",
+                                    "enum": [
+                                        "opening", "context", "interview", "broll",
+                                        "bridge", "climax", "closing",
+                                    ],
+                                },
+                            },
+                            "required": [
+                                "candidate_id", "story_value", "suggested_story_role"
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["page_summary", "recommendations"],
+                "additionalProperties": False,
+            }
+
+        def page_prompt(page: Sequence[Dict[str, Any]], max_keep: int) -> str:
+            return (
+                f"FULL-LEDGER CANDIDATE REVIEW, hierarchy round {round_number}. "
+                "This is a transport page, not the whole film. Examine EVERY candidate "
+                "on this page against the complete treatment and full-footage memory. "
+                "Recommend the candidates that preserve unique story evidence, complete "
+                "dialogue thoughts, action/reaction continuity, emotional change, or a "
+                "necessary opening/payoff/ending. Reject only genuine repetition, weak "
+                "technical material, or shots with no distinct editorial value. Do not "
+                "invent ids. Chronological position is evidence, not an obligation to keep "
+                "every shot. Return at most "
+                f"{max_keep} recommendations as JSON.\n"
+                f"DIRECTOR TREATMENT:\n{json.dumps(treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"ASSETS:\n{json.dumps(assets, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"FULL COVERAGE SYNOPSIS:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"CANDIDATE PAGE:\n{json.dumps(page, ensure_ascii=False, separators=(',', ':'))}"
+            )
+
+        pages: List[List[Dict[str, Any]]] = []
+        page: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            trial = page + [dict(candidate)]
+            trial_keep = 1 if len(trial) <= 2 else max(2, math.ceil(len(trial) * 0.55))
+            trial_schema = review_schema(trial_keep)
+            if page and (
+                len(trial) > 24
+                or not self._request_has_capacity(
+                    page_prompt(trial, trial_keep),
+                    trial_schema,
+                    model=self.text_model,
+                    reserve_output_tokens=1536,
+                )
+            ):
+                pages.append(page)
+                page = [dict(candidate)]
+            else:
+                page = trial
+        if page:
+            pages.append(page)
+
+        selected_by_id: Dict[str, Dict[str, Any]] = {}
+        page_audits: List[Dict[str, Any]] = []
+        for page_index, candidate_page in enumerate(pages, start=1):
+            max_keep = (
+                1
+                if len(candidate_page) <= 2
+                else max(2, math.ceil(len(candidate_page) * 0.55))
+            )
+            schema = review_schema(max_keep)
+            prompt = page_prompt(candidate_page, max_keep)
+            if not self._request_has_capacity(
+                prompt,
+                schema,
+                model=self.text_model,
+                reserve_output_tokens=1024,
+            ):
+                raise DirectorError(
+                    "单个候选审阅页仍超过上下文，请提高 Context。"
+                    " / One candidate review page still exceeds Context; increase it."
+                )
+            self.logger.info(
+                "全量候选审阅：第 %d 轮，第 %d/%d 页，%d 个候选 / "
+                "Full-ledger review: round %d, page %d/%d, %d candidates",
+                round_number,
+                page_index,
+                len(pages),
+                len(candidate_page),
+                round_number,
+                page_index,
+                len(pages),
+                len(candidate_page),
+            )
+            payload = self._request_json(prompt, schema, model=self.text_model)
+            page_by_id = {
+                str(item.get("candidate_id") or ""): item for item in candidate_page
+            }
+            selected_ids: List[str] = []
+            for recommendation in payload.get("recommendations", []):
+                if not isinstance(recommendation, dict):
+                    continue
+                candidate_id = str(recommendation.get("candidate_id") or "").strip()
+                if candidate_id not in page_by_id or candidate_id in selected_by_id:
+                    continue
+                selected = dict(page_by_id[candidate_id])
+                selected["page_review"] = self._compact_prompt_text(
+                    recommendation.get("story_value", ""), 180
+                )
+                selected["page_suggested_story_role"] = str(
+                    recommendation.get("suggested_story_role") or "context"
+                )
+                selected_by_id[candidate_id] = selected
+                selected_ids.append(candidate_id)
+            if not selected_ids:
+                raise DirectorError(
+                    f"候选审阅第 {round_number} 轮第 {page_index} 页没有返回有效 id。"
+                    " / Candidate review page returned no valid ids."
+                )
+            page_audits.append(
+                {
+                    "page": page_index,
+                    "input_candidate_ids": list(page_by_id),
+                    "recommended_candidate_ids": selected_ids,
+                    "page_summary": self._compact_prompt_text(
+                        payload.get("page_summary", ""), 600
+                    ),
+                }
+            )
+
+        ordered = [
+            selected_by_id[str(item.get("candidate_id") or "")]
+            for item in candidates
+            if str(item.get("candidate_id") or "") in selected_by_id
+        ]
+        return ordered, {
+            "round": round_number,
+            "input_candidate_count": len(candidates),
+            "recommended_candidate_count": len(ordered),
+            "page_count": len(pages),
+            "pages": page_audits,
         }
 
     @staticmethod

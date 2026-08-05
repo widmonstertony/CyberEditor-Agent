@@ -198,6 +198,40 @@ class OrchestratorTests(unittest.TestCase):
                 WorkflowOrchestrator._has_continuous_visual_review(raw_data)
             )
 
+    def test_legacy_truncated_candidate_audit_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            timeline = Path(temporary) / "timeline_cuts.json"
+            timeline.write_text(
+                json.dumps({
+                    "visual_review": {"mode": "continuous_all_saved_samples"},
+                    "candidate_audit": [{"candidate_id": "C0001"}],
+                }),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(
+                WorkflowOrchestrator._has_reusable_candidate_audit(timeline)
+            )
+
+    def test_versioned_complete_candidate_audit_can_be_reused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            timeline = Path(temporary) / "timeline_cuts.json"
+            timeline.write_text(
+                json.dumps({
+                    "visual_review": {
+                        "mode": "continuous_all_saved_samples",
+                        "candidate_audit_complete": True,
+                        "candidate_audit_version": 2,
+                    },
+                    "candidate_audit": [{"candidate_id": "C0001"}],
+                }),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                WorkflowOrchestrator._has_reusable_candidate_audit(timeline)
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -856,6 +856,58 @@ class AIDirectorTests(unittest.TestCase):
 
         self.assertEqual(session.posts, [])
 
+    def test_paged_director_reviews_every_candidate_without_fixed_top_n(self):
+        director = self.make_director(num_ctx=4096)
+        candidates = [
+            {
+                "candidate_id": f"C{index:04d}",
+                "asset_id": "asset-1",
+                "source_order": 0,
+                "source": "source.mp4",
+                "in": float(index),
+                "out": float(index + 2),
+                "story_role": "context",
+                "visual_summary": ("distinct chronological visual evidence " * 4).strip(),
+                "dialogue_excerpt": "",
+                "quality_score": 0.8,
+            }
+            for index in range(1, 31)
+        ]
+
+        def fake_request(prompt, schema, images=(), model=None):
+            page = json.loads(prompt.split("CANDIDATE PAGE:\n", 1)[1])
+            keep = schema["properties"]["recommendations"]["maxItems"]
+            return {
+                "page_summary": "All candidates on this page were compared.",
+                "recommendations": [
+                    {
+                        "candidate_id": item["candidate_id"],
+                        "story_value": "Unique evidence for the chronological story.",
+                        "suggested_story_role": "context",
+                    }
+                    for item in page[:keep]
+                ],
+            }
+
+        director._request_json = fake_request
+        selected, audit = director._review_candidate_round(
+            candidates,
+            {"central_theme": "A complete chronology"},
+            [{"asset_id": "asset-1", "source_order": 0}],
+            {"whole_footage_summary": "The source develops from setup to payoff."},
+            round_number=1,
+        )
+
+        reviewed_ids = {
+            candidate_id
+            for page in audit["pages"]
+            for candidate_id in page["input_candidate_ids"]
+        }
+        self.assertEqual(reviewed_ids, {item["candidate_id"] for item in candidates})
+        self.assertEqual(audit["input_candidate_count"], len(candidates))
+        self.assertGreater(len(selected), 0)
+        self.assertLess(len(selected), len(candidates))
+
     def test_real_video_duration_clamps_transcript_and_candidate_tail(self):
         director = self.make_director()
         with tempfile.TemporaryDirectory() as temporary:

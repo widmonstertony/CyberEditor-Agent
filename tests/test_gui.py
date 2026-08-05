@@ -230,10 +230,10 @@ class WorkflowOptionsTests(unittest.TestCase):
         )
         self.assertEqual(recommendation["profile"], "performance")
         self.assertEqual(recommendation["whisper_model"], "large-v3")
-        self.assertEqual(recommendation["num_ctx"], 16384)
+        self.assertEqual(recommendation["num_ctx"], 32768)
         self.assertEqual(recommendation["ollama_model"], "qwen:32b")
 
-    def test_nominal_64_gib_windows_machine_gets_16k_context(self) -> None:
+    def test_nominal_64_gib_windows_machine_gets_32k_context(self) -> None:
         recommendation = recommend_automatic_settings(
             {
                 "ram_gb": 63.8,
@@ -249,7 +249,7 @@ class WorkflowOptionsTests(unittest.TestCase):
             ],
         )
         self.assertEqual(recommendation["profile"], "performance")
-        self.assertEqual(recommendation["num_ctx"], 16384)
+        self.assertEqual(recommendation["num_ctx"], 32768)
 
     def test_auto_profile_prefers_editing_quality_over_file_size(self) -> None:
         recommendation = recommend_automatic_settings(

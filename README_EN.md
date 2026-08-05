@@ -77,7 +77,11 @@ accounts for Chinese, long context, instruction following, and quantization
 instead of using file size alone. Auto mode never downloads a multi-gigabyte
 model without consent or changes media properties based on hardware
 performance. A 16 GB VRAM + 64 GB RAM machine defaults to the slower quality
-profile: Whisper `large-v3`, 10-minute chunks, and a 16K context.
+profile: Whisper `large-v3`, 10-minute chunks, and a 32K context. Every editable
+candidate is considered by the text director: the complete compact ledger is sent
+in one request when it fits, while longer projects use chronological director-review
+pages followed by global assembly. Python no longer discards candidates with a fixed
+Top-21/28 shortlist, and `timeline_cuts.json` records the ids reviewed on each page.
 
 At UI startup, an installed but stopped local Ollama service is launched
 automatically without loading a model or consuming model VRAM. Resolve is found

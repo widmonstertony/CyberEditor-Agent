@@ -1464,7 +1464,7 @@ class ModernCyberEditorApp:
                 },
                 "performance": {
                     "whisper_model": "large-v3", "whisper_device": "auto",
-                    "chunk_minutes": 10.0, "num_ctx": 16384,
+                    "chunk_minutes": 10.0, "num_ctx": 32768,
                 },
             }
             settings = presets.get(profile, presets["balanced"])

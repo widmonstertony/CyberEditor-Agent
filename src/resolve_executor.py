@@ -436,25 +436,41 @@ class DaVinciExecutor:
             )
 
         if resolve is None:
-            deadline = time.monotonic() + self.startup_timeout
-            while resolve is None and time.monotonic() < deadline:
-                if (
-                    launched_process is not None
-                    and launched_process.poll() is not None
-                ):
-                    raise ResolveExecutorError(
-                        "Resolve 启动后提前退出。请手动打开 Resolve 检查启动报错。"
-                        " / Resolve exited during startup; open it manually to "
-                        "inspect the startup error."
-                    )
-                time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
-                resolve = self._try_scriptapp(module)
+            resolve = self._wait_for_scriptapp(module, launched_process)
+        if (
+            resolve is None
+            and launched_process is not None
+            and executable is not None
+        ):
+            # Resolve 21 can intermittently start its UI while its internal
+            # ScriptServer immediately terminates. A longer wait cannot recover
+            # that state. It is safe to restart only the process launched by
+            # this executor; a Resolve instance opened by the user is never
+            # closed automatically because it may contain unsaved work.
+            # Resolve 21 偶尔会正常打开界面，但内部 ScriptServer 随即退出；继续等待
+            # 无法恢复。这里只重启本执行器刚启动的进程，绝不自动关闭用户自行打开的工程。
+            self.logger.warning(
+                "Resolve 界面已启动但脚本服务未就绪；正在自动重启一次 / "
+                "Resolve UI started without its script service; restarting once"
+            )
+            self._stop_auto_started_resolve(launched_process)
+            time.sleep(3.0)
+            launched_process = self._launch_resolve(executable)
+            self.logger.info(
+                "Resolve 已重新启动，正在再次等待脚本 API（最长 %.0f 秒） / "
+                "Resolve restarted; waiting up to %.0f seconds for its API",
+                self.startup_timeout,
+                self.startup_timeout,
+            )
+            resolve = self._wait_for_scriptapp(module, launched_process)
         if resolve is None:
             raise ResolveExecutorError(
-                "Resolve 已运行，但脚本 API 在等待后仍不可用。请在 Preferences > "
-                "System > General 中将 External scripting 设为 Local 后重启。\n"
-                "Resolve is running but its API did not become ready. Enable Local "
-                "external scripting and restart Resolve."
+                "Resolve 已运行，但内部脚本服务没有就绪。若 Resolve 是手动打开的，"
+                "请保存工作后完全退出并重开；同时确认 Preferences > System > General > "
+                "External scripting 为 Local。\n"
+                "Resolve is running but its internal script service is unavailable. "
+                "If Resolve was opened manually, save your work, exit it completely, "
+                "and relaunch it; also confirm External scripting is Local."
             )
         try:
             name = resolve.GetProductName()
@@ -2213,6 +2229,52 @@ class DaVinciExecutor:
             return module.scriptapp("Resolve")
         except Exception:
             return None
+
+    def _wait_for_scriptapp(
+        self,
+        module: Any,
+        launched_process: Optional[subprocess.Popen],
+    ) -> Any:
+        """
+        Poll Resolve's scripting bridge for one bounded startup attempt.
+        在一次有界启动尝试中轮询 Resolve 脚本桥接。
+
+        Parameters / 参数:
+            module: Imported ``DaVinciResolveScript`` module. / 已导入的脚本模块。
+            launched_process: Process owned by this executor, when applicable. /
+                若由本执行器启动，则为对应进程。
+        """
+        deadline = time.monotonic() + self.startup_timeout
+        resolve = self._try_scriptapp(module)
+        while resolve is None and time.monotonic() < deadline:
+            if launched_process is not None and launched_process.poll() is not None:
+                raise ResolveExecutorError(
+                    "Resolve 启动后提前退出。请手动打开 Resolve 检查启动报错。"
+                    " / Resolve exited during startup; open it manually to "
+                    "inspect the startup error."
+                )
+            time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
+            resolve = self._try_scriptapp(module)
+        return resolve
+
+    @staticmethod
+    def _stop_auto_started_resolve(process: subprocess.Popen) -> None:
+        """
+        Stop only a Resolve process owned by the current executor.
+        仅停止由当前执行器启动并持有的 Resolve 进程。
+        """
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+        except OSError as exc:
+            raise ResolveExecutorError(
+                f"无法重启自动启动的 Resolve / Could not restart auto-started Resolve: {exc}"
+            ) from exc
 
     @staticmethod
     def _launch_resolve(executable: Path) -> subprocess.Popen:

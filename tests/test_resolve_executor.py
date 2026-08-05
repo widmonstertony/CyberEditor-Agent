@@ -740,6 +740,64 @@ class ResolveExecutorTests(unittest.TestCase):
             self.assertIs(result, expected)
             launch.assert_called_once_with(executable)
 
+    def test_connect_restarts_only_the_auto_started_process_when_script_server_dies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = root / "timeline_cuts.json"
+            plan.write_text("{}", encoding="utf-8")
+            executable = root / "Resolve.exe"
+            executable.touch()
+            expected = FakeResolve(FakeProject())
+            module = mock.Mock()
+            module.scriptapp.return_value = None
+            first_process = mock.Mock()
+            second_process = mock.Mock()
+            executor = DaVinciExecutor(
+                json_path=plan,
+                startup_timeout=5,
+                logger=logging.getLogger("test.resolve.restart"),
+            )
+
+            with (
+                mock.patch("src.resolve_executor.platform.system", return_value="Windows"),
+                mock.patch(
+                    "src.resolve_executor.get_resolve_registration",
+                    return_value={"installed": True, "version": "21"},
+                ),
+                mock.patch(
+                    "src.resolve_executor.find_resolve_executable",
+                    return_value=executable,
+                ),
+                mock.patch.object(executor, "_configure_resolve_library"),
+                mock.patch.object(
+                    executor,
+                    "_load_resolve_module",
+                    return_value=(module, [], []),
+                ),
+                mock.patch.object(executor, "_is_resolve_running", return_value=False),
+                mock.patch.object(
+                    executor,
+                    "_launch_resolve",
+                    side_effect=[first_process, second_process],
+                ) as launch,
+                mock.patch.object(
+                    executor,
+                    "_wait_for_scriptapp",
+                    side_effect=[None, expected],
+                ) as wait_for_api,
+                mock.patch.object(executor, "_stop_auto_started_resolve") as stop,
+                mock.patch("src.resolve_executor.time.sleep"),
+            ):
+                result = executor.connect()
+
+            self.assertIs(result, expected)
+            self.assertEqual(launch.call_count, 2)
+            stop.assert_called_once_with(first_process)
+            self.assertEqual(
+                wait_for_api.call_args_list,
+                [mock.call(module, first_process), mock.call(module, second_process)],
+            )
+
     def test_preconformed_program_audio_makes_picture_video_only_and_uses_a1(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
