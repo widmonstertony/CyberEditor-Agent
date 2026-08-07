@@ -85,7 +85,7 @@ async function applicationFetch(url, options = {}, timeoutMs = 10_000) {
     return await fetch(url, {
       ...options,
       signal: controller.signal,
-      targetAddressSpace: "local",
+      targetAddressSpace: "loopback",
     });
   } finally {
     window.clearTimeout(timeout);
