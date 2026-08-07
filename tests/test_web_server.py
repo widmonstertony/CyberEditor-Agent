@@ -39,15 +39,16 @@ class WebServerTests(unittest.TestCase):
         app_source = (project_root / "web" / "app.js").read_text(encoding="utf-8")
         self.assertIn('targetAddressSpace: "loopback"', app_source)
         self.assertNotIn('targetAddressSpace: "local"', app_source)
+        self.assertIn("if (!localCompanionMode) initialize();", app_source)
         self.assertIn(
             'href="http://127.0.0.1:8765/"',
             (project_root / "web" / "index.html").read_text(encoding="utf-8"),
         )
-        self.assertNotIn(
+        self.assertIn(
             "--no-browser",
             (project_root / "launch_companion.command").read_text(encoding="utf-8"),
         )
-        self.assertNotIn(
+        self.assertIn(
             "--no-browser",
             (project_root / "launch_companion.bat").read_text(encoding="utf-8"),
         )

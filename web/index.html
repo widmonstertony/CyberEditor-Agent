@@ -45,14 +45,22 @@
       <div class="remote-copy">
         <span class="pulse"></span>
         <div>
-          <small data-i18n="localApp">REAL LOCAL APP</small>
-          <strong id="localConnectionStatus" data-i18n="localConnecting">正在连接这台电脑上的 CyberEditor companion…</strong>
+          <small data-i18n="localApp">浏览器应用 · 本机后端</small>
+          <strong id="localConnectionStatus" data-i18n="localDisconnected">尚未连接。请先启动 Ollama 和 Python 后端，再点击连接。</strong>
         </div>
       </div>
       <code>127.0.0.1:8765</code>
-      <button id="retryLocal" class="button ghost small" type="button" data-i18n="retryLocal">重新连接</button>
-      <a class="button secondary small" href="http://127.0.0.1:8765/" target="_blank" rel="noopener noreferrer" data-i18n="openLocal">在本机打开 ↗</a>
+      <button id="retryLocal" class="button primary small" type="button" data-i18n="retryLocal">连接并进入工作区</button>
+      <a class="button secondary small" href="http://127.0.0.1:8765/" target="_blank" rel="noopener noreferrer" data-i18n="openLocal">打开备用界面 ↗</a>
       <a class="button ghost small" href="https://github.com/widmonstertony/CyberEditor-Agent" target="_blank" rel="noopener noreferrer" data-i18n="getSource">获取源码与启动器 ↗</a>
+      <div class="backend-setup">
+        <strong data-i18n="setupTitle">一次连接三步</strong>
+        <ol>
+          <li data-i18n="setup1">启动 Ollama（应用或 ollama serve）</li>
+          <li data-i18n="setup2">在仓库启动 Python 后端：python3 web.py --no-browser</li>
+          <li data-i18n="setup3">Chrome 询问时允许 tonytan.me 访问本地网络，然后回到这里连接。</li>
+        </ol>
+      </div>
     </section>
 
     <section id="remoteConnection" class="remote-connection" hidden>
