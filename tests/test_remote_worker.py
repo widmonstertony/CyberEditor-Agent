@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from unittest import mock
+from urllib import request as urllib_request
 
 from src.control_plane import ControlPlaneHandler, ControlPlaneServer, ControlPlaneStore
 from src.remote_worker import ControlPlaneClient, RemoteWorker
@@ -83,6 +84,10 @@ class RemoteWorkerTests(unittest.TestCase):
                     f"http://127.0.0.1:{server.server_port}", TOKEN, "edit-pc"
                 )
                 try:
+                    head = urllib_request.Request(client.server_url + "/", method="HEAD")
+                    with urllib_request.urlopen(head, timeout=3) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.read(), b"")
                     client.register("Editing PC", {"hardware": {"gpu": "local-gpu"}})
                     created = store.create_job("edit-pc", "workflow", {"flow": "resolve"})
                     claimed = client.next_job()
