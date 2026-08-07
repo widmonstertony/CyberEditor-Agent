@@ -40,6 +40,21 @@
   </header>
 
   <main class="shell">
+    <section id="remoteConnection" class="remote-connection" hidden>
+      <div class="remote-copy">
+        <span class="pulse"></span>
+        <div>
+          <small data-i18n="remoteControl">REMOTE CONTROL · LOCAL EXECUTION</small>
+          <strong id="workerStatus" data-i18n="waitingWorker">正在等待本机 Worker 连接…</strong>
+        </div>
+      </div>
+      <label class="worker-select">
+        <span data-i18n="executionComputer">执行电脑</span>
+        <select id="workerSelect" aria-label="Execution computer"></select>
+      </label>
+      <button id="refreshWorkers" class="button ghost small" type="button" data-i18n="refreshWorkers">刷新电脑</button>
+    </section>
+
     <section class="health-grid" aria-label="Environment status">
       <article class="health-card" data-health="python"><small>PYTHON</small><strong>检测中…</strong></article>
       <article class="health-card" data-health="ffmpeg"><small>FFMPEG</small><strong>检测中…</strong></article>
@@ -97,7 +112,7 @@
           </div>
 
           <details class="server-paths">
-            <summary data-i18n="serverPaths">服务器路径 / 高级输入</summary>
+            <summary data-i18n="serverPaths">本机 Worker 路径 / 高级输入</summary>
             <label class="field">
               <span data-i18n="videoPaths">视频绝对路径（每行一个）</span>
               <textarea id="videoPaths" rows="4" spellcheck="false"></textarea>
@@ -215,7 +230,7 @@
   <dialog id="tokenDialog">
     <form method="dialog" class="dialog-card">
       <h3 data-i18n="accessToken">访问令牌</h3>
-      <p data-i18n="tokenHelp">仅当服务部署到局域网或远程 Windows 主机时需要。令牌只保存在当前浏览器。</p>
+      <p data-i18n="tokenHelp">部署版需要管理令牌；该令牌只保存在当前浏览器会话，不会发送给本机 Worker。</p>
       <label class="field"><span>Token</span><input id="tokenInput" type="password" autocomplete="off"></label>
       <div class="dialog-actions"><button value="cancel" class="button ghost" data-i18n="cancel">取消</button><button id="saveToken" value="default" class="button primary" data-i18n="save">保存</button></div>
     </form>

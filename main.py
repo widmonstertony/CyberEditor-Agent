@@ -795,12 +795,17 @@ class WorkflowOrchestrator:
                                 blind.get("reason")
                                 if isinstance(blind, dict) else "blind review failed"
                             )
-                            raise WorkflowError(
-                                "低清成片经过自动重剪后仍无法让陌生观众理解，已阻止 Resolve "
-                                "继续渲染坏成片。请查看审片报告："
-                                f"{review_path}。原因：{reason} / Rendered rough cut still failed "
-                                "the blind viewer after automatic recuts; Resolve was blocked."
+                            self.logger.warning(
+                                "低清成片已耗尽 %d 次导演重剪但盲审仍未通过；将保留当前最佳完整"
+                                "成片并继续 Resolve。审片报告：%s。原因：%s / Rendered rough "
+                                "cut exhausted %d director recuts without passing blind review; "
+                                "preserving the best complete cut and continuing to Resolve.",
+                                max_feedback_recuts,
+                                review_path,
+                                reason,
+                                max_feedback_recuts,
                             )
+                            break
 
                         self.logger.warning(
                             "低清成片盲审未通过，正在把真实成片反馈交回导演重剪 %d/%d / "

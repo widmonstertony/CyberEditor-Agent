@@ -1,0 +1,16 @@
+services:
+  cybereditor-control-plane:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      CYBEREDITOR_ADMIN_TOKEN: "${CYBEREDITOR_ADMIN_TOKEN:?set a browser admin token of at least 16 characters}"
+      CYBEREDITOR_WORKER_TOKEN: "${CYBEREDITOR_WORKER_TOKEN:?set a distinct worker token of at least 24 characters}"
+      CYBEREDITOR_MAX_PREVIEW_MB: "256"
+      CYBEREDITOR_STORAGE: "/data"
+    volumes:
+      - cybereditor-control-data:/data
+
+volumes:
+  cybereditor-control-data:

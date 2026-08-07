@@ -567,7 +567,16 @@ class CyberEditorHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/") and not self._require_api_auth():
             return
         try:
-            if parsed.path == "/api/config":
+            if parsed.path == "/api/capabilities":
+                self._send_json(
+                    {
+                        "ok": True,
+                        "mode": "local",
+                        "picker": "server",
+                        "preview_relay": False,
+                    }
+                )
+            elif parsed.path == "/api/config":
                 self._send_json({"ok": True, "config": self.server.manager.settings()})
             elif parsed.path == "/api/status":
                 query = urllib_parse.parse_qs(parsed.query)

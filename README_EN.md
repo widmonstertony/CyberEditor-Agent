@@ -41,10 +41,9 @@ Resolve, so it retains no model VRAM.
 
 Browsers cannot read arbitrary local absolute paths. On a local Windows host,
 CyberEditor opens a native server-side multi-file/folder picker, avoiding a
-second upload or copy of hundreds of gigabytes of 4K media. Remote deployments
-can enter absolute paths on the Windows host or its mounted storage. Resolve,
-Ollama, FFmpeg, and the media must exist on the machine running Web Studio; a
-generic cloud-hosted static page cannot directly control Resolve on a home PC.
+second upload or copy of hundreds of gigabytes of 4K media. In this single-PC
+mode, Resolve, Ollama, FFmpeg, and the media live on the Windows host running
+`web.py`.
 
 The default bind is loopback-only. LAN, workstation, or reverse-proxy
 deployments require a token of at least 16 characters:
@@ -56,6 +55,53 @@ deployments require a token of at least 16 characters:
 Enter the same token through the top-right **Access token** control on the first
 remote visit. Prefer a trusted LAN, VPN, or authenticated HTTPS reverse proxy;
 never expose Resolve scripting or this service directly to the public Internet.
+
+## Cloud Web UI + Local Windows Execution
+
+The deployable mode is a cloud control plane paired with an outbound Windows
+worker. It does **not** require Ollama or Resolve on the deployment host:
+
+```text
+Any browser ─HTTPS─> Cloud Control Plane <─outbound HTTPS polling─ Windows Worker
+                                                                  ├─ local RAW/proxies
+                                                                  ├─ local Ollama/CUDA/FFmpeg
+                                                                  └─ local Resolve Studio
+```
+
+- The cloud stores jobs, progress, bounded logs, and an optional low-bitrate
+  720p preview. RAW media, keyframes, transcripts, and models stay local.
+- The worker initiates every connection, so there is no home port forwarding,
+  public IP requirement, or exposed Resolve scripting port.
+- **Choose videos/folder** opens the native picker on the selected Windows PC.
+- CUDA, Ollama, and Resolve cards report the worker PC, not the cloud host.
+- The control plane needs a persistent SQLite volume. It fits a Docker VPS or a
+  persistent Render/Railway-style service, not a static site or ephemeral
+  serverless function.
+
+Set two different random secrets on the deployment host and launch the control
+plane:
+
+```bash
+export CYBEREDITOR_ADMIN_TOKEN="replace-with-random-admin-token"
+export CYBEREDITOR_WORKER_TOKEN="replace-with-a-different-long-worker-token"
+docker compose -f docker-compose.control-plane.yml up -d --build
+```
+
+The container listens on HTTP internally; terminate public HTTPS through the
+hosting platform, Caddy, or Nginx. On the Windows PC containing the media and
+local applications, run:
+
+```powershell
+$env:CYBEREDITOR_WORKER_TOKEN = "replace-with-a-different-long-worker-token"
+.\.venv\Scripts\python.exe worker.py --server "https://edit.example.com"
+```
+
+You can instead set the environment variable and double-click
+`launch_worker.bat https://edit.example.com`. Open the deployed site, enter
+`CYBEREDITOR_ADMIN_TOKEN` through **Access token**, and select the online PC.
+The admin secret is never sent to the worker and the worker secret never enters
+the browser. Add `--no-preview-upload` if no rendered copy may be stored in the
+cloud; remote control and logs still work, while output playback remains local.
 
 The bilingual desktop UI can multi-select any number of videos or recursively
 load a media folder. It also includes Whisper and Ollama settings, resumable
@@ -412,6 +458,11 @@ CyberEditor-Agent/
 ├─ launch_ui.bat                 # Double-click UI launcher
 ├─ launch_web.bat                # Double-click local Web Studio launcher
 ├─ web.py                        # Browser controller entry point
+├─ control_plane.py              # Deployable cloud control-plane entry point
+├─ worker.py                     # Outbound Windows worker entry point
+├─ launch_worker.bat             # Double-click worker launcher
+├─ Dockerfile
+├─ docker-compose.control-plane.yml
 ├─ web/                          # Dependency-free HTML/CSS/JavaScript client
 ├─ main.py                       # Strict serial workflow orchestrator
 ├─ scripts/
@@ -429,6 +480,8 @@ CyberEditor-Agent/
 │  ├─ __init__.py
 │  ├─ gui.py                     # Dependency-free fallback and shared probes
 │  ├─ modern_gui.py              # Windows 11, 4K, Chinese/English UI
+│  ├─ control_plane.py           # SQLite queue, authentication, preview relay
+│  ├─ remote_worker.py           # Local probes, command execution, status relay
 │  ├─ runtime_services.py        # Cross-drive discovery and service auto-start
 │  ├─ media_manifest.py          # Multi-video/folder discovery and proxy mapping
 │  ├─ ui_i18n.py                 # GUI-independent bilingual strings

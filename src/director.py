@@ -5562,20 +5562,25 @@ class AIDirector:
         final_metrics = best_metrics
         quality_violations = best_violations
         blind_review = best_blind_review
-        if quality_violations:
-            # These are measured contract failures, not optional aesthetic advice.
-            # Continuing here used to render a film that the blind viewer could not
-            # understand while the JSON itself said quality_gate_passed=false.
-            # Never spend more time in music/Resolve on an invalid picture lock.
-            # 这些是可测量的故事合同失败，不是可忽略的审美建议；盲审未通过时禁止渲染。
+        quality_gate_degraded = bool(quality_violations)
+        if quality_gate_degraded:
+            # Narrative quality scores are advisory after all bounded AI recuts have
+            # been exhausted.  They must not turn a structurally valid, complete edit
+            # into a late workflow crash.  Preserve the best director-authored plan;
+            # do not let Python invent a replacement edit behind the director's back.
+            # 叙事质量分在有限次 AI 重剪耗尽后属于质量告警，不能把结构完整的最佳导演
+            # 方案变成工作流末尾崩溃；Python 也不得越权静默改剪。
             details = json.dumps(
                 quality_violations,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-            raise DirectorError(
-                "Director quality gate failed after all bounded recuts; Resolve render "
-                f"has been blocked. Measured failures: {details}"
+            self.logger.warning(
+                "导演质量门已耗尽有限重剪；将保留评分最高的完整导演方案并继续后续阶段。"
+                "未解决问题会写入 timeline_cuts.json / Director quality gate exhausted "
+                "its bounded recuts; preserving the best complete director-authored plan "
+                "and continuing. Unresolved advisories: %s",
+                details,
             )
 
         draft_picture_signature = json.dumps(
@@ -5601,9 +5606,12 @@ class AIDirector:
         candidate_directing["supervising_editor_changed_plan"] = supervising_changed_plan
         candidate_directing["draft_metrics"] = draft_metrics
         candidate_directing["final_metrics"] = final_metrics
-        candidate_directing["quality_gate_passed"] = True
-        candidate_directing["quality_gate_degraded_acceptance"] = False
-        candidate_directing["unresolved_quality_advisories"] = []
+        candidate_directing["quality_gate_passed"] = not quality_gate_degraded
+        candidate_directing["quality_gate_degraded_acceptance"] = quality_gate_degraded
+        candidate_directing["quality_gate_status"] = (
+            "degraded_best_available" if quality_gate_degraded else "passed"
+        )
+        candidate_directing["unresolved_quality_advisories"] = list(quality_violations)
         candidate_directing["quality_revision_count"] = max(
             0, len(quality_audit_rounds) - 1
         )
@@ -5673,6 +5681,7 @@ class AIDirector:
             )
             music_request = music_prompt
             music_plan = None
+            music_violations: List[str] = []
             for music_revision in range(2):
                 music_payload = self._request_json(
                     music_request,
@@ -5685,13 +5694,20 @@ class AIDirector:
                 music_violations = self.music_plan_quality_violations(
                     normalized_music, compact_treatment
                 )
+                # Always hand the structurally validated form to downstream audio
+                # conforming, even when its artistic energy match remains imperfect.
+                # 即使艺术能量匹配仍不理想，下游也只接收经过结构校验的安全版本。
+                music_plan = normalized_music
                 if not music_violations:
                     break
                 if music_revision >= 1:
-                    raise DirectorError(
-                        "Music director quality gate failed after reselection: "
-                        + "; ".join(music_violations)
+                    self.logger.warning(
+                        "配乐导演重选后仍有能量匹配告警；将保留校验后的最佳方案并继续。"
+                        " / Music reselection still has measured energy advisories; "
+                        "preserving the validated plan and continuing: %s",
+                        "; ".join(music_violations),
                     )
+                    break
                 self.logger.warning(
                     "Music cue sheet contradicted measured audio energy; returning it "
                     "to the director for one grounded reselection: %s",
@@ -5704,12 +5720,24 @@ class AIDirector:
                     + json.dumps(music_violations, ensure_ascii=False)
                     + "\nReturn a materially different, measurement-grounded music_plan."
                 )
+            candidate_directing["music_quality_gate_passed"] = not bool(
+                music_violations
+            )
+            candidate_directing["music_quality_gate_degraded_acceptance"] = bool(
+                music_violations
+            )
+            candidate_directing["unresolved_music_advisories"] = list(
+                music_violations
+            )
         else:
             music_plan = {
                 "strategy": "No analyzed music candidates were supplied.",
                 "silence_regions": [],
                 "cues": [],
             }
+            candidate_directing["music_quality_gate_passed"] = True
+            candidate_directing["music_quality_gate_degraded_acceptance"] = False
+            candidate_directing["unresolved_music_advisories"] = []
         return {
             "project_summary": sequence_payload.get("project_summary", ""),
             "viewer_takeaway": sequence_payload.get(

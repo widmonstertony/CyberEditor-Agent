@@ -1021,7 +1021,7 @@ class AIDirectorTests(unittest.TestCase):
         self.assertEqual(result["visual_motifs"], [])
         self.assertIn("held pose", result["observed_ending"])
 
-    def test_no_progress_quality_recut_blocks_workflow(self):
+    def test_no_progress_quality_recut_preserves_best_plan_and_continues(self):
         director = self.make_director()
         director._active_target_duration_sec = 20.0
         treatment = {
@@ -1159,13 +1159,18 @@ class AIDirectorTests(unittest.TestCase):
             raise AssertionError(prompt[:120])
 
         director._request_json = fake_request
-        with self.assertRaisesRegex(DirectorError, "quality gate failed"):
-            director.request_sequence(candidates, assets, treatment)
+        result = director.request_sequence(candidates, assets, treatment)
 
         # One incremental repair is followed by one genuinely different
-        # structural reset before the workflow admits that the evidence cannot
-        # support a coherent film. Repeating the same edit indefinitely is banned.
+        # structural reset. Repeating the same edit indefinitely is banned, but
+        # subjective scores must not discard the best complete director plan.
         self.assertEqual(calls.count("picture_recut"), 2)
+        directing = result["candidate_directing"]
+        self.assertFalse(directing["quality_gate_passed"])
+        self.assertTrue(directing["quality_gate_degraded_acceptance"])
+        self.assertEqual(directing["quality_gate_status"], "degraded_best_available")
+        self.assertTrue(directing["unresolved_quality_advisories"])
+        self.assertEqual(len(result["sequence"]), 4)
 
     def test_canonical_coverage_promotes_explicit_missing_event_risk(self):
         director = self.make_director()
