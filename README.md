@@ -25,6 +25,8 @@ Ollama/Resolve 环境状态、实时日志、阶段进度、安全停止以及�
 Web 服务本身只使用 Python 标准库，也不会导入 Torch、Whisper、OpenCV 或 Resolve，因此常驻
 浏览器控制台不占用模型显存。
 
+也可以让 [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/) 使用同一套真实本机服务。Windows 双击 `launch_companion.bat`（等价于 `web.py --no-browser`），再回到网页点击“重新连接”。托管页面会直接请求 `http://127.0.0.1:8765`；本机服务只接受 `tonytan.me` 与回环开发 Origin，并实现 CORS/Private Network Access 预检。素材选择、环境检测、Ollama 模型列表、工作流启动/停止、日志和输出都来自本仓库的真实 `WorkflowManager`，没有浏览器假数据，EC2 也不会接收 RAW、模型请求或执行指令。
+
 浏览器出于安全原因不能直接读取任意本机绝对路径。本项目在本机 Windows 模式下通过服务端
 打开原生多文件/文件夹选择器，不上传或复制数百 GB 的 4K 素材。若只需要在同一台电脑上使用，
 Resolve、Ollama、FFmpeg 和素材都位于运行 `web.py` 的 Windows 主机。
@@ -56,7 +58,7 @@ Resolve、Ollama、FFmpeg 和素材都位于运行 `web.py` 的 Windows 主机�
 - 这是需要 SQLite 与持久磁盘的轻量控制服务，适合 Docker VPS、Render/Railway 持久服务等，
   不是纯静态站或短生命周期 Serverless Function。
 
-公开的源码体验位于 [tonytan.me/cybereditor/?demo=1](https://tonytan.me/cybereditor/?demo=1)：它直接复用本仓库 Web Studio，通过确定性的浏览器适配器演示选择素材、硬件检测、任务进度和安全停止，不读取令牌，也不会假装处理真实视频。相同地址去掉 `?demo=1` 后是受管理令牌保护的真实控制面；Windows Worker 仍只主动发起出站 HTTPS 连接。
+公开默认入口 [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/) 是真实本机应用模式，直连这台电脑上只监听回环地址的源码 companion。需要从外部设备远程控制 Windows Worker 时，使用 `?remote=1` 进入受管理令牌保护的云端控制面；Worker 仍只主动发起出站 HTTPS 连接。旧的浏览器假数据 Demo 已删除。
 
 该实例由 `Personal-Website/ops` 中的 Caddy、systemd、受限 sudo 和原子发布脚本管理。合并受保护的 `main` 后，独立 GitHub Runner 只部署审查过的控制面文件。服务器最多保留 512 MiB 预览，自动删除七天前或超额的文件；RAW、字幕、关键帧、Ollama 和 Resolve 永远不上传。
 
@@ -362,6 +364,7 @@ CyberEditor-Agent/
 ├─ gui.py                        # Windows 桌面 UI 入口
 ├─ launch_ui.bat                 # 双击启动 UI
 ├─ launch_web.bat                # 双击启动本地 Web Studio
+├─ launch_companion.bat / .command # 供 tonytan.me 直连的仅回环启动器
 ├─ web.py                        # 浏览器控制台入口
 ├─ control_plane.py              # 可部署的轻量云端控制面
 ├─ worker.py                     # 主动出站连接的 Windows 本机 Worker

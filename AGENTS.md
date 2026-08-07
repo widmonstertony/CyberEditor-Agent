@@ -10,8 +10,13 @@ host runs only the standard-library control plane in `src/control_plane.py`.
   SMB share, or local picker port to the Internet.
 - Admin and worker tokens are distinct and never enter Git. Admin tokens stay
   in browser session storage; worker tokens never reach the browser.
-- The `?demo=1` path uses the real Web Studio with a deterministic browser
-  adapter. It must not call authenticated APIs or pretend to process real media.
+- The default `https://tonytan.me/cybereditor/` UI connects directly to the
+  loopback `src/web_server.py` companion on the visitor's editing workstation.
+  Preserve its exact-origin CORS/PNA boundary and never add a non-loopback bind
+  to the companion launcher.
+- `?remote=1` preserves the authenticated cloud control-plane/outbound-worker
+  mode. Do not add deterministic browser data or present a UI preview as an
+  operational workflow.
 - Keep preview uploads bounded per file, at 512 MiB total, and seven days by
   default. Do not remove managed-path validation or artifact pruning.
 - Preserve strict serial execution and explicit GPU-process exit boundaries.
@@ -27,7 +32,9 @@ Branch from protected `main`, open a PR, and merge after CI passes. A merge
 packages only `control_plane.py`, `src`, and `web`; the repository-scoped runner
 calls `deploy-cybereditor-control`. Caddy serves
 `https://tonytan.me/cybereditor/` and strips that prefix before proxying to
-`127.0.0.1:4020`. Releases are immutable under
+`127.0.0.1:4020` for assets and optional `?remote=1` control-plane calls. The
+default hosted JavaScript sends app API calls directly to `127.0.0.1:8765` on
+the visitor's computer. Releases are immutable under
 `/srv/cybereditor/releases`; persistent bounded state lives under
 `/var/lib/cybereditor`.
 

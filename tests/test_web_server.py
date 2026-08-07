@@ -131,6 +131,7 @@ class WebServerTests(unittest.TestCase):
                 with self.assertRaises(urllib_error.HTTPError) as unauthorized:
                     urllib_request.urlopen(base_url + "/api/config", timeout=3)
                 self.assertEqual(unauthorized.exception.code, 401)
+                unauthorized.exception.close()
 
                 request = urllib_request.Request(
                     base_url + "/api/workflow/stop",
@@ -144,6 +145,7 @@ class WebServerTests(unittest.TestCase):
                 with self.assertRaises(urllib_error.HTTPError) as wrong_type:
                     urllib_request.urlopen(request, timeout=3)
                 self.assertEqual(wrong_type.exception.code, 400)
+                wrong_type.exception.close()
 
                 request = urllib_request.Request(
                     base_url + "/api/workflow/stop",
@@ -156,6 +158,68 @@ class WebServerTests(unittest.TestCase):
                 )
                 with urllib_request.urlopen(request, timeout=3) as response:
                     self.assertEqual(response.status, 200)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
+    def test_hosted_ui_cors_and_private_network_preflight_are_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = self.make_manager(root)
+            static_root = root / "web"
+            static_root.mkdir()
+            (static_root / "index.html").write_text("ok", encoding="utf-8")
+            server = CyberEditorHTTPServer(
+                ("127.0.0.1", 0),
+                CyberEditorHandler,
+                manager,
+                static_root,
+                "",
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                request = urllib_request.Request(
+                    base_url + "/api/capabilities",
+                    method="OPTIONS",
+                    headers={
+                        "Origin": "https://tonytan.me",
+                        "Access-Control-Request-Method": "GET",
+                        "Access-Control-Request-Private-Network": "true",
+                    },
+                )
+                with urllib_request.urlopen(request, timeout=3) as response:
+                    self.assertEqual(response.status, 204)
+                    self.assertEqual(
+                        response.headers["Access-Control-Allow-Origin"],
+                        "https://tonytan.me",
+                    )
+                    self.assertEqual(
+                        response.headers["Access-Control-Allow-Private-Network"],
+                        "true",
+                    )
+
+                request = urllib_request.Request(
+                    base_url + "/api/config",
+                    headers={"Origin": "https://attacker.example"},
+                )
+                with self.assertRaises(urllib_error.HTTPError) as forbidden:
+                    urllib_request.urlopen(request, timeout=3)
+                self.assertEqual(forbidden.exception.code, 403)
+                forbidden.exception.close()
+
+                request = urllib_request.Request(
+                    base_url + "/api/config",
+                    headers={"Origin": "https://tonytan.me"},
+                )
+                with urllib_request.urlopen(request, timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(
+                        response.headers["Access-Control-Allow-Origin"],
+                        "https://tonytan.me",
+                    )
             finally:
                 server.shutdown()
                 server.server_close()

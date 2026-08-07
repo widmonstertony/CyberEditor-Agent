@@ -54,6 +54,13 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".mxf", ".mts", ".m2ts"}
 OUTPUT_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_LOG_LINES = 5000
+DEFAULT_BROWSER_ORIGINS = (
+    "https://tonytan.me",
+    "https://www.tonytan.me",
+)
+LOCAL_BROWSER_ORIGIN = re.compile(
+    r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$"
+)
 
 
 def _json_bytes(payload: object) -> bytes:
@@ -475,12 +482,14 @@ class CyberEditorHTTPServer(ThreadingHTTPServer):
         manager: WorkflowManager,
         static_root: Path,
         token: str,
+        allowed_origins: Sequence[str] = DEFAULT_BROWSER_ORIGINS,
     ) -> None:
         """Attach shared manager, static root, and API token. / 绑定管理器、静态目录与令牌。"""
         super().__init__(address, handler)
         self.manager = manager
         self.static_root = static_root.resolve()
         self.api_token = token
+        self.allowed_origins = frozenset(allowed_origins)
 
 
 class CyberEditorHandler(BaseHTTPRequestHandler):
@@ -504,6 +513,25 @@ class CyberEditorHandler(BaseHTTPRequestHandler):
             supplied = str((query.get("token") or [""])[0])
         return secrets.compare_digest(supplied, expected)
 
+    def _origin_allowed(self) -> bool:
+        """Allow the hosted first-party UI and loopback development only."""
+        origin = self.headers.get("Origin", "")
+        return (
+            not origin
+            or origin in self.server.allowed_origins
+            or bool(LOCAL_BROWSER_ORIGIN.fullmatch(origin))
+        )
+
+    def _cors_headers(self) -> Dict[str, str]:
+        origin = self.headers.get("Origin", "")
+        if not origin or not self._origin_allowed():
+            return {}
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Private-Network": "true",
+            "Vary": "Origin",
+        }
+
     def _send_bytes(
         self,
         body: bytes,
@@ -519,6 +547,8 @@ class CyberEditorHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; media-src 'self' blob:; img-src 'self' data:; connect-src 'self'")
+        for key, value in self._cors_headers().items():
+            self.send_header(key, value)
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -558,12 +588,44 @@ class CyberEditorHandler(BaseHTTPRequestHandler):
         self._error(HTTPStatus.UNAUTHORIZED, "Invalid or missing API token.")
         return False
 
+    def _require_api_origin(self) -> bool:
+        if self._origin_allowed():
+            return True
+        self._error(HTTPStatus.FORBIDDEN, "Browser origin is not allowed.")
+        return False
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        """Answer CORS/PNA preflights for the hosted first-party UI."""
+        parsed = urllib_parse.urlparse(self.path)
+        if not parsed.path.startswith("/api/"):
+            self._error(HTTPStatus.NOT_FOUND, "Not found.")
+            return
+        if not self._origin_allowed():
+            self._error(HTTPStatus.FORBIDDEN, "Browser origin is not allowed.")
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        for key, value in self._cors_headers().items():
+            self.send_header(key, value)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, X-CyberEditor-Token",
+        )
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self.do_GET()
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         """Handle static, state, environment, and output requests.
 
         处理静态资源、状态、环境检测和输出文件请求。
         """
         parsed = urllib_parse.urlparse(self.path)
+        if parsed.path.startswith("/api/") and not self._require_api_origin():
+            return
         if parsed.path.startswith("/api/") and not self._require_api_auth():
             return
         try:
@@ -604,6 +666,8 @@ class CyberEditorHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         """Handle workflow and native picker mutations. / 处理工作流及原生选择器操作。"""
         parsed = urllib_parse.urlparse(self.path)
+        if not self._require_api_origin():
+            return
         if not self._require_api_auth():
             return
         try:
@@ -680,6 +744,8 @@ class CyberEditorHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in self._cors_headers().items():
+            self.send_header(key, value)
         if status == HTTPStatus.PARTIAL_CONTENT:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
@@ -702,6 +768,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     parser.add_argument("--port", type=int, default=8765, help="TCP port")
     parser.add_argument("--token", default="", help="Required API token for non-loopback binds")
+    parser.add_argument(
+        "--allow-origin",
+        action="append",
+        default=list(DEFAULT_BROWSER_ORIGINS),
+        help="Additional exact HTTPS browser origin allowed to use the loopback API",
+    )
     parser.add_argument("--no-browser", action="store_true", help="Do not open the default browser")
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser
@@ -727,7 +799,12 @@ def run_server(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit(f"Web assets not found: {static_root}")
     manager = WorkflowManager(project_root, sys.executable)
     server = CyberEditorHTTPServer(
-        (args.host, args.port), CyberEditorHandler, manager, static_root, args.token
+        (args.host, args.port),
+        CyberEditorHandler,
+        manager,
+        static_root,
+        args.token,
+        args.allow_origin,
     )
     display_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
     url = f"http://{display_host}:{args.port}/"
