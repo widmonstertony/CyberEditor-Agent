@@ -33,7 +33,7 @@ const copy = {
     noWorkers: "尚无本机 Worker；请先在 Windows 电脑运行 worker.py", chooseWorker: "请选择一台在线执行电脑",
     pickerRemote: "选择框会在所选 Windows 电脑上打开；RAW 素材不会上传云端。",
     localApp: "真实本机应用", localConnecting: "正在连接这台电脑上的 CyberEditor companion…", localConnected: "已连接本机源码与 AI 工作流",
-    localDisconnected: "尚未连接。请在本机源码目录运行 launch_companion.command（macOS）或 launch_companion.bat（Windows）。", retryLocal: "重新连接", getSource: "获取源码与启动器 ↗"
+    localDisconnected: "尚未连接。请运行本机启动器，并允许浏览器授予 tonytan.me 本地网络访问权限后重新连接。", retryLocal: "重新连接", getSource: "获取源码与启动器 ↗"
   },
   en: {
     tagline: "Local · Private · Strict-serial AI editing", localFirst: "LOCAL FIRST", theme: "Theme", language: "Language",
@@ -57,7 +57,7 @@ const copy = {
     noWorkers: "No local worker yet; run worker.py on the Windows PC first", chooseWorker: "Choose an online execution PC",
     pickerRemote: "The picker opens on the selected Windows PC; RAW media is never uploaded.",
     localApp: "REAL LOCAL APP", localConnecting: "Connecting to the CyberEditor companion on this computer…", localConnected: "Connected to the local source and AI workflow",
-    localDisconnected: "Not connected. Run launch_companion.command on macOS or launch_companion.bat on Windows from the source folder.", retryLocal: "Reconnect", getSource: "Get source and launcher ↗"
+    localDisconnected: "Not connected. Run the local launcher, allow tonytan.me local-network access in the browser, then reconnect.", retryLocal: "Reconnect", getSource: "Get source and launcher ↗"
   }
 };
 
@@ -77,14 +77,29 @@ function apiUrl(path) {
   const base = localCompanionMode ? localCompanionBase : document.baseURI;
   return new URL(path.replace(/^\/+/, ""), base);
 }
+async function applicationFetch(url, options = {}, timeoutMs = 10_000) {
+  if (!localCompanionMode) return fetch(url, options);
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      targetAddressSpace: "local",
+    });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
 async function api(path, options = {}) {
-  const headers = { "Accept": "application/json", ...(options.headers || {}) };
+  const { timeoutMs = 10_000, ...requestOptions } = options;
+  const headers = { "Accept": "application/json", ...(requestOptions.headers || {}) };
   if (token()) headers["X-CyberEditor-Token"] = token();
-  if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+  if (requestOptions.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
   const url = apiUrl(path);
   let response;
   try {
-    response = await fetch(url, { ...options, headers, cache: "no-store" });
+    response = await applicationFetch(url, { ...requestOptions, headers, cache: "no-store" }, timeoutMs);
   } catch (error) {
     if (localCompanionMode) throw new Error(t("localDisconnected"));
     throw error;
@@ -233,7 +248,7 @@ async function pick(kind) {
   try {
     const workerId = requireWorker();
     const request = { kind }; if (state.mode === "remote") request.worker_id = workerId;
-    const payload = await api("/api/picker", { method: "POST", body: JSON.stringify(request) });
+    const payload = await api("/api/picker", { method: "POST", body: JSON.stringify(request), timeoutMs: 600_000 });
     if (!payload.paths.length) return;
     if (kind === "videos") { $("#videoPaths").value = payload.paths.join("\n"); $("#inputFolder").value = ""; }
     else { $("#inputFolder").value = payload.paths[0]; $("#videoPaths").value = ""; }
@@ -295,7 +310,7 @@ async function refreshOutputs() {
       button.addEventListener("click", async () => {
         try {
           const url = apiUrl(String(output.url || ""));
-          const response = await fetch(url, { headers: { "X-CyberEditor-Token": token() }, cache: "no-store" });
+          const response = await applicationFetch(url, { headers: { "X-CyberEditor-Token": token() }, cache: "no-store" }, 120_000);
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const objectUrl = URL.createObjectURL(await response.blob());
           const link = document.createElement("a");
