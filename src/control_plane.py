@@ -600,7 +600,8 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; media-src 'self' blob:; img-src 'self' data:; connect-src 'self'")
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
         self._send(_json_bytes(payload), "application/json; charset=utf-8", status)
@@ -671,6 +672,10 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             LOGGER.exception("GET %s failed", parsed.path)
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        """Return GET metadata and headers without transferring a body."""
+        self.do_GET()
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib_parse.urlparse(self.path)
@@ -773,6 +778,8 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         if status == HTTPStatus.PARTIAL_CONTENT:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
+        if self.command == "HEAD":
+            return
         with path.open("rb") as handle:
             handle.seek(start)
             remaining = length
