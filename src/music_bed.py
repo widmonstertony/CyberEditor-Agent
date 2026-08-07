@@ -20,6 +20,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -85,29 +86,70 @@ class MusicBedRenderer:
     @staticmethod
     def _dialogue_intervals(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
         """
-        Infer conservative dialogue spans from final story roles.
-        根据最终叙事角色保守推断对白区间。
+        Map exact source transcript spans into final timeline time.
+        将精确源字幕区间映射到最终时间线。
 
-        Explicit ``has_dialogue`` wins. Otherwise interview, context, opening,
-        and closing roles are protected; visual B-roll and bridges remain full.
-        显式 ``has_dialogue`` 优先；否则保护采访、背景、开场和收尾，纯 B-roll/桥段不压低。
+        Whole-shot ducking made music disappear whenever every selected clip
+        contained even a fraction of speech. Exact ranges win; only a legacy
+        interview clip falls back to whole-shot protection.
+        旧版整镜头 ducking 会在每段都沾到一句话时压低整条音乐；现在仅保护真实说话区间。
         """
+        music_plan = payload.get("music_plan")
+        planned = music_plan.get("dialogue_regions") if isinstance(music_plan, dict) else None
+        if isinstance(planned, list):
+            explicit_ranges: List[Tuple[float, float]] = []
+            for item in planned:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    start = float(item.get("timeline_in_sec", 0))
+                    end = float(item.get("timeline_out_sec", 0))
+                except (TypeError, ValueError):
+                    continue
+                if end - start >= 0.05:
+                    explicit_ranges.append((start, end))
+            if explicit_ranges:
+                return explicit_ranges
         intervals: List[Tuple[float, float]] = []
         cursor = 0.0
-        protected_roles = {"interview", "context", "opening", "closing"}
         for clip in payload.get("clips", []):
             if not isinstance(clip, dict):
                 continue
+            source_in = float(clip.get("cut_in_sec", 0))
             duration = max(
                 0.0,
                 float(clip.get("cut_out_sec", 0)) - float(clip.get("cut_in_sec", 0)),
             )
-            explicit = clip.get("has_dialogue")
-            has_dialogue = explicit is True or (
-                explicit is not False
-                and str(clip.get("story_role") or "").casefold() in protected_roles
-            )
-            if has_dialogue and duration > 0:
+            audio_intent = str(clip.get("audio_intent") or "").casefold()
+            exact_ranges = clip.get("dialogue_ranges_sec")
+            added = False
+            if audio_intent != "mute_for_music" and isinstance(exact_ranges, list):
+                for item in exact_ranges:
+                    if not isinstance(item, dict):
+                        continue
+                    start = max(source_in, float(item.get("start_sec", source_in)))
+                    end = min(source_in + duration, float(item.get("end_sec", source_in)))
+                    if end - start < 0.05:
+                        continue
+                    intervals.append((cursor + start - source_in, cursor + end - source_in))
+                    added = True
+            if (
+                not added
+                and audio_intent != "mute_for_music"
+                and (
+                    bool(clip.get("has_dialogue"))
+                    or (
+                        exact_ranges is None
+                        and "has_dialogue" not in clip
+                        and str(clip.get("story_role") or "").casefold() == "interview"
+                    )
+                )
+                and (
+                    exact_ranges is None
+                    or str(clip.get("story_role") or "").casefold() == "interview"
+                )
+                and duration > 0
+            ):
                 intervals.append((cursor, cursor + duration))
             cursor += duration
         return intervals
@@ -166,6 +208,65 @@ class MusicBedRenderer:
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(str(temporary), str(destination))
 
+    def _measure_peak_db(self, path: Path) -> float:
+        """
+        Measure the rendered bed peak and reject digital silence.
+        测量音乐床峰值并拒绝数字静音文件。
+
+        Parameters / 参数:
+            path: Candidate rendered WAV. / 待验收的 WAV。
+        """
+        completed = subprocess.run(
+            [
+                self.ffmpeg, "-hide_banner", "-nostats", "-i", str(path),
+                "-af", "volumedetect", "-f", "null", os.devnull,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        match = re.search(
+            r"max_volume:\s*(?P<value>-?(?:inf|\d+(?:\.\d+)?))\s*dB",
+            completed.stderr,
+            flags=re.IGNORECASE,
+        )
+        if not match or match.group("value").casefold() == "-inf":
+            return float("-inf")
+        return float(match.group("value"))
+
+    def _measure_integrated_lufs(self, path: Path) -> float:
+        """
+        Measure EBU R128 integrated loudness for final music-bed QA.
+        测量最终音乐床的 EBU R128 综合响度，用于可闻度验收。
+
+        Parameters / 参数:
+            path: Candidate rendered WAV. / 待验收的 WAV。
+        """
+        completed = subprocess.run(
+            [
+                self.ffmpeg, "-hide_banner", "-nostats", "-i", str(path),
+                "-af", "loudnorm=I=-23:TP=-2:LRA=11:print_format=json",
+                "-f", "null", os.devnull,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        matches = re.findall(
+            r'"input_i"\s*:\s*"(?P<value>-?(?:inf|\d+(?:\.\d+)?))"',
+            completed.stderr,
+            flags=re.IGNORECASE,
+        )
+        if not matches or matches[-1].casefold() == "-inf":
+            return float("-inf")
+        return float(matches[-1])
+
     def render(self) -> Optional[Path]:
         """
         Render ``music_bed.wav`` and update the timeline's ``bed_file``.
@@ -193,7 +294,14 @@ class MusicBedRenderer:
             if isinstance(item, dict)
         ]
 
-        inputs: List[str] = []
+        # A finite silent base makes the final mix begin at PTS zero and end at
+        # the exact program duration. The previous adelay+apad graph could keep
+        # a delayed start PTS and trim away the cue itself, producing a valid but
+        # completely silent WAV. / 固定静音底轨消除延迟 PTS 导致整条音乐被裁掉的问题。
+        inputs: List[str] = [
+            "-f", "lavfi", "-t", f"{program_duration:.6f}",
+            "-i", "anullsrc=r=48000:cl=stereo",
+        ]
         filters: List[str] = []
         cue_labels: List[str] = []
         audit_cues: List[Dict[str, Any]] = []
@@ -212,7 +320,7 @@ class MusicBedRenderer:
             )
             if duration <= 0.05:
                 continue
-            input_index = len(cue_labels)
+            input_index = len(cue_labels) + 1
             inputs.extend(["-i", str(path)])
             target_lufs = float(cue.get("target_lufs", -24) or -24)
             measured = cue.get("integrated_lufs")
@@ -237,7 +345,15 @@ class MusicBedRenderer:
                     f"afade=t=out:st={max(0.0, duration - fade_out):.6f}:d={fade_out:.6f}"
                 )
             duck_db = min(0.0, max(-24.0, float(cue.get("duck_under_dialogue_db", -9))))
-            for start, end in self._overlap_local(dialogue, timeline_in, timeline_in + duration):
+            dialogue_overlaps = self._overlap_local(
+                dialogue, timeline_in, timeline_in + duration
+            )
+            if dialogue_overlaps and duck_db > -6.0:
+                # Never trust a model-selected 0 dB value over real speech. This
+                # fail-safe also repairs older plans without rerunning the model.
+                # 真实对白优先于模型给出的 0 dB；此守门也能安全修复旧计划。
+                duck_db = -10.0
+            for start, end in dialogue_overlaps:
                 chain.append(self._smooth_duck_filter(start, end, duck_db, duration))
             for start, end in self._overlap_local(silence, timeline_in, timeline_in + duration):
                 chain.append(
@@ -245,7 +361,10 @@ class MusicBedRenderer:
                 )
             delay_ms = max(0, int(round(timeline_in * 1000)))
             label = f"cue{len(cue_labels)}"
-            chain.append(f"adelay={delay_ms}|{delay_ms}[{label}]")
+            chain.append(
+                f"adelay={delay_ms}|{delay_ms},"
+                f"atrim=start=0:end={program_duration:.6f},asetpts=PTS-STARTPTS[{label}]"
+            )
             filters.append(",".join(chain))
             cue_labels.append(f"[{label}]")
             audit_cues.append({
@@ -264,15 +383,26 @@ class MusicBedRenderer:
             })
         if not cue_labels:
             return None
+        mix_labels = ["[0:a:0]", *cue_labels]
         filters.append(
-            "".join(cue_labels)
-            + f"amix=inputs={len(cue_labels)}:duration=longest:normalize=0,"
-            + f"apad=pad_dur={program_duration:.6f},atrim=duration={program_duration:.6f},"
-            + "alimiter=limit=0.95[bed]"
+            "".join(mix_labels)
+            + f"amix=inputs={len(mix_labels)}:duration=first:normalize=0,"
+            + f"atrim=start=0:end={program_duration:.6f},asetpts=PTS-STARTPTS,"
+            + "loudnorm=I=-23:TP=-2:LRA=11,alimiter=limit=0.95[bed]"
         )
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_path = self.output_path.with_name(
+            self.output_path.stem + ".partial" + self.output_path.suffix
+        )
+        try:
+            partial_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise MusicBedError(
+                f"无法清理临时音乐床 / Could not clear temporary music bed: {exc}"
+            ) from exc
         command = [self.ffmpeg, "-hide_banner", "-y", *inputs, "-filter_complex", ";".join(filters),
-                   "-map", "[bed]", "-ar", "48000", "-ac", "2", "-c:a", "pcm_s24le", str(self.output_path)]
+                   "-map", "[bed]", "-t", f"{program_duration:.6f}", "-ar", "48000", "-ac", "2",
+                   "-c:a", "pcm_s24le", str(partial_path)]
         self.logger.info(
             "正在合成 %d 段音乐床：%s / Rendering %d-cue music bed",
             len(cue_labels), self.output_path, len(cue_labels),
@@ -286,9 +416,30 @@ class MusicBedRenderer:
             errors="replace",
             check=False,
         )
-        if completed.returncode != 0 or not self.output_path.is_file():
+        if completed.returncode != 0 or not partial_path.is_file():
             tail = "\n".join(completed.stderr.splitlines()[-20:])
             raise MusicBedError(f"音乐床 FFmpeg 合成失败 / Music-bed render failed:\n{tail}")
+        peak_db = self._measure_peak_db(partial_path)
+        integrated_lufs = self._measure_integrated_lufs(partial_path)
+        if not math.isfinite(peak_db) or peak_db <= -50.0:
+            try:
+                partial_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise MusicBedError(
+                "音乐床验收失败：输出为静音或低于 -50 dBFS；已阻止继续渲染。"
+                " / Music-bed QA failed: output is silent or below -50 dBFS; workflow stopped."
+            )
+        if not math.isfinite(integrated_lufs) or not (-29.0 <= integrated_lufs <= -16.0):
+            try:
+                partial_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise MusicBedError(
+                "Music-bed loudness QA failed: integrated loudness is "
+                f"{integrated_lufs:.1f} LUFS; required range is -29 to -16 LUFS."
+            )
+        os.replace(str(partial_path), str(self.output_path))
         music_plan["bed_file"] = str(self.output_path)
         music_plan["bed_render"] = {
             "rendered_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -297,6 +448,9 @@ class MusicBedRenderer:
             "codec": "pcm_s24le",
             "program_duration_sec": round(program_duration, 4),
             "cue_count": len(cue_labels),
+            "qa_peak_dbfs": round(peak_db, 3),
+            "qa_integrated_lufs": round(integrated_lufs, 3),
+            "qa_status": "passed",
         }
         payload["music_plan"] = music_plan
         self._atomic_write_json(payload, self.timeline_path)

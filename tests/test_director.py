@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from src.director import AIDirector, DirectorError
+from src.director import AIDirector, CANDIDATE_SCHEMA, DirectorError
 
 
 class FakeResponse:
@@ -116,6 +116,49 @@ class VisionSession(FakeSession):
                     },
                 ],
             }
+        elif "CONTINUOUS FULL-FOOTAGE SYNTHESIS" in prompt:
+            generated = {
+                "whole_footage_summary": "The crew prepares and completes one coordinated action.",
+                "discovered_central_theme": "Coordination turns preparation into payoff.",
+                "character_threads": ["The crew gathers, prepares, and acts together."],
+                "event_timeline": [
+                    {
+                        "asset_id": "asset-1", "source_order": 0,
+                        "event": "Preparation leads to the final action.",
+                        "story_meaning": "The payoff depends on shared coordination.",
+                    }
+                ],
+                "visual_motifs": ["Repeated preparation gestures"],
+                "continuity_risks": ["Do not repeat the same setup action"],
+                "observed_ending": "The coordinated action is visibly completed.",
+                "absent_or_unproven_events": [],
+                "honest_adaptation": "Use the observed coordinated action as the ending.",
+            }
+        elif "EVIDENCE-FIRST STORY CONTRACT" in prompt:
+            generated = {
+                "narrative_mode": "character_vignette",
+                "premise": "One observed action reveals the subject's preparation.",
+                "subject": "The person preparing",
+                "observed_goal": "Complete the observed action",
+                "has_causal_arc": False,
+                "causal_chain": [
+                    {
+                        "candidate_id": "C0001",
+                        "observed_fact": "The person enters and begins an action.",
+                        "state_before": "The frame is empty.",
+                        "state_after": "The person is acting in frame.",
+                        "story_consequence": "The subject is introduced.",
+                        "evidence_type": "visual",
+                    }
+                ],
+                "final_observed_state": "The observed action is complete.",
+                "unsupported_promises": [],
+                "dialogue_policy": "story_dialogue_only",
+                "success_criteria": [
+                    "The subject is clear.", "The action is readable.", "The ending is observed."
+                ],
+                "recommended_duration_sec": 12,
+            }
         elif "Build one coherent documentary edit" in prompt:
             generated = {
                 "project_summary": "A coherent multi-camera story",
@@ -131,6 +174,62 @@ class VisionSession(FakeSession):
                     }
                 ],
             }
+        elif "SUPERVISING EDITOR REVIEW" in prompt:
+            generated = {
+                "project_summary": "A coherent multi-camera story",
+                "viewer_takeaway": "Coordination creates the payoff.",
+                "editorial_style": "narrative_documentary",
+                "graphics_plan": {"strategy": "No graphics needed.", "items": []},
+                "sequence": [
+                    {
+                        "candidate_id": "C0001",
+                        "trim_in_sec": 1.0,
+                        "trim_out_sec": 4.0,
+                        "narrative_function": "hook",
+                        "viewer_information": "A person begins the action.",
+                        "reason_for_position": "Grounds the story in observed action.",
+                        "evidence_claim": "A person enters and begins the action.",
+                        "connection_to_previous": "Opens the film.",
+                        "audio_intent": "preserve_dialogue",
+                        "music_edit_role": "phrase_start",
+                        "transition_to_next": "cross_dissolve",
+                        "transition_duration_sec": 0.5,
+                        "audio_cleanup": "strong",
+                        "color_look": "warm",
+                        "motion": "gentle_push_in",
+                    }
+                ],
+                "review": {
+                    "clarity_score": 8,
+                    "pacing_score": 8,
+                    "visual_storytelling_score": 8,
+                    "rhythm_score": 7,
+                    "problems_found": [
+                        "The draft held the opening longer than its visible action required."
+                    ],
+                    "changes_made": [
+                        "Tightened the opening to the exact observed action."
+                    ],
+                    "dialogue_strategy": "Keep only the line that changes viewer understanding.",
+                    "rhythm_strategy": "Move from natural sound into a phrase start.",
+                },
+            }
+        elif "BLIND VIEWER TEST" in prompt:
+            generated = {
+                "literal_synopsis": "A person enters and completes one observed action.",
+                "subject": "The person",
+                "apparent_goal": "Complete the action",
+                "progression": ["The person enters", "The action begins", "The action ends"],
+                "ending": "The action is visibly complete.",
+                "takeaway_guess": "Preparation creates a focused moment.",
+                "coherence_score": 8,
+                "causal_clarity_score": 8,
+                "visual_payoff_score": 8,
+                "confusing_transitions": [],
+                "unsupported_or_unresolved_points": [],
+                "passes": True,
+                "reason": "The subject and action are legible.",
+            }
         elif "Design the final documentary music cue sheet" in prompt:
             generated = {
                 "music_plan": {
@@ -141,6 +240,7 @@ class VisionSession(FakeSession):
             }
         else:
             generated = {
+                "continuity_summary": "A person enters and begins the source action.",
                 "decisions": [
                     {
                         "cut_in_sec": 1.0,
@@ -232,6 +332,76 @@ class AIDirectorTests(unittest.TestCase):
             for segment in chunk["transcript"]
         ]
         self.assertEqual(texts, ["a", "b", "c"])
+
+    def test_visual_micro_scene_window_can_be_shorter_than_text_chunk(self):
+        chunks = self.make_director().chunk_raw_data(
+            self.raw_data(), window_sec=180
+        )
+
+        self.assertEqual(len(chunks), 3)
+        self.assertTrue(
+            all(chunk["end_sec"] - chunk["start_sec"] <= 180 for chunk in chunks)
+        )
+
+    def test_continuous_review_batches_overlap_without_losing_core_time(self):
+        raw = {
+            "duration_sec": 40.0,
+            "transcript": [],
+            "keyframes": [
+                {"timestamp_sec": float(second), "file_name": f"{second}.jpg"}
+                for second in range(40)
+            ],
+        }
+
+        chunks = self.make_director().chunk_raw_data(
+            raw, window_sec=16, overlap_sec=2
+        )
+
+        self.assertEqual(
+            [(item["core_start_sec"], item["core_end_sec"]) for item in chunks],
+            [(0.0, 16.0), (16.0, 32.0), (32.0, 40.0)],
+        )
+        self.assertEqual(
+            [(item["start_sec"], item["end_sec"]) for item in chunks],
+            [(0.0, 18.0), (14.0, 34.0), (30.0, 40.0)],
+        )
+
+    def test_full_review_request_sends_every_extracted_frame(self):
+        session = VisionSession()
+        director = self.make_director(model="qwen3.5:test", session=session)
+        with tempfile.TemporaryDirectory() as temporary:
+            frame = Path(temporary) / "frame.jpg"
+            frame.write_bytes(b"jpeg")
+            chunk = {
+                "index": 0,
+                "start_sec": 0.0,
+                "end_sec": 16.0,
+                "core_start_sec": 0.0,
+                "core_end_sec": 16.0,
+                "source_order": 0,
+                "continuity_context": "source begins",
+                "transcript": [],
+                "keyframes": [
+                    {
+                        "timestamp_sec": float(second),
+                        "file_name": f"{second}.jpg",
+                        "image_path": str(frame),
+                    }
+                    for second in range(16)
+                ],
+            }
+
+            director.request_chunk(
+                chunk,
+                "source.mp4",
+                schema=CANDIDATE_SCHEMA,
+                include_images=True,
+                treatment={},
+            )
+
+        request = next(item for item in session.posts if item.get("images"))
+        self.assertEqual(len(request["images"]), 16)
+        self.assertIn("CONTINUITY FROM PREVIOUS BATCH", request["prompt"])
 
     def test_treatment_excerpt_samples_start_middle_and_end_within_budget(self):
         segments = [
@@ -375,6 +545,40 @@ class AIDirectorTests(unittest.TestCase):
         result = director.validate_sequence(sequence, candidates, treatment)
 
         self.assertEqual({item["color_look"] for item in result}, {"warm"})
+        self.assertEqual(result[0]["creative_grade"]["story_beat"], "opening")
+        self.assertEqual(result[-1]["creative_grade"]["story_beat"], "ending")
+
+    def test_color_bible_is_clamped_and_applied_by_story_beat(self):
+        director = self.make_director()
+        bible = director._validate_color_bible(
+            {
+                "global_palette": "neon_night",
+                "contrast": 99,
+                "saturation": 0,
+                "warmth": -9,
+                "highlight_rolloff": 2,
+                "chapter_grades": [
+                    {
+                        "beat": "payoff", "exposure_ev": 2,
+                        "contrast": 2, "saturation": 2, "warmth": 2,
+                        "reason": "Release the energy",
+                    }
+                ],
+            },
+            "cool_steel",
+        )
+
+        self.assertEqual(bible["global_palette"], "neon_night")
+        self.assertEqual(bible["contrast"], 1.25)
+        self.assertEqual(bible["saturation"], 0.75)
+        self.assertEqual(bible["warmth"], -1.0)
+        self.assertEqual(len(bible["chapter_grades"]), 4)
+        graded = director._apply_creative_grade_plan(
+            [{"story_role": "climax"}],
+            {"creative_look": "cool_steel", "color_bible": bible},
+        )
+        self.assertEqual(graded[0]["creative_grade"]["story_beat"], "payoff")
+        self.assertLessEqual(graded[0]["creative_grade"]["contrast"], 1.35)
 
     def test_parse_fenced_json(self):
         parsed = AIDirector.parse_generated_json(
@@ -404,6 +608,31 @@ class AIDirectorTests(unittest.TestCase):
         self.assertIn("beat_snap", result[0])
         self.assertEqual(result[1]["cut_out_sec"], 6.0)
         self.assertNotIn("beat_snap", result[1])
+
+    def test_sparse_music_sync_points_are_grounded_from_picture_roles(self):
+        director = self.make_director()
+        clips = [
+            {"cut_in_sec": 0, "cut_out_sec": 3.1, "music_edit_role": "phrase_start"},
+            {"cut_in_sec": 0, "cut_out_sec": 3.0, "music_edit_role": "payoff_hit"},
+            {"cut_in_sec": 0, "cut_out_sec": 2.0, "music_edit_role": "release"},
+        ]
+        plan = director.enrich_music_sync_points(
+            clips,
+            {
+                "cues": [
+                    {
+                        "timeline_in_sec": 0, "timeline_out_sec": 8,
+                        "track_in_sec": 0, "track_out_sec": 8,
+                        "downbeats_sec": [0, 3, 6],
+                        "strong_beats_sec": [1, 2, 4, 5, 7],
+                        "sync_points": [],
+                    }
+                ]
+            },
+        )
+
+        self.assertGreaterEqual(len(plan["cues"][0]["sync_points"]), 2)
+        self.assertGreaterEqual(plan["rhythm_audit"]["grounded_sync_points_added"], 2)
 
     def test_multi_cue_music_plan_is_bounded_to_analyzed_candidates(self):
         director = self.make_director()
@@ -445,6 +674,25 @@ class AIDirectorTests(unittest.TestCase):
         self.assertEqual(len(plan["cues"]), 1)
         self.assertEqual(plan["cues"][0]["track_file"], "authorized.wav")
         self.assertEqual(plan["mode"], "multi_cue_pre_mix")
+
+    def test_music_quality_gate_rejects_flat_low_payoff_and_adjacent_duplicate(self):
+        plan = {
+            "cues": [
+                {"cue_id": "M1", "file_name": "ambient.wav", "story_beat": "development",
+                 "timeline_in_sec": 0, "timeline_out_sec": 10, "reason": "quiet opening",
+                 "energy_profile": {"trend": "flat", "build_score": 0.1, "contrast_db": 1.0},
+                 "sections": [{"energy": "low"}]},
+                {"cue_id": "M2", "file_name": "ambient.wav", "story_beat": "payoff",
+                 "timeline_in_sec": 10, "timeline_out_sec": 20, "reason": "rising climax",
+                 "energy_profile": {"trend": "flat", "build_score": 0.1, "contrast_db": 1.0},
+                 "sections": [{"energy": "low"}]},
+            ]
+        }
+        violations = AIDirector.music_plan_quality_violations(
+            plan, {"music_energy_arc": "slow rise into climax"}
+        )
+        self.assertTrue(any("all-low-energy" in item for item in violations))
+        self.assertTrue(any("same track" in item for item in violations))
 
     def test_empty_thinking_response_retries_without_qwen_thinking(self):
         session = EmptyThinkingSession()
@@ -544,15 +792,834 @@ class AIDirectorTests(unittest.TestCase):
         generation_posts = [
             item for item in session.posts if item.get("keep_alive") != 0
         ]
-        self.assertEqual(len(generation_posts), 2)
-        self.assertIn("step 1", generation_posts[0]["prompt"].casefold())
+        self.assertEqual(len(generation_posts), 6)
+        self.assertIn(
+            "CONTINUOUS FULL-FOOTAGE SYNTHESIS", generation_posts[0]["prompt"]
+        )
+        self.assertIn(
+            "EVIDENCE-FIRST STORY CONTRACT",
+            generation_posts[1]["prompt"],
+        )
+        self.assertIn("step 1", generation_posts[2]["prompt"].casefold())
+        self.assertIn("SUPERVISING EDITOR REVIEW", generation_posts[3]["prompt"])
+        self.assertIn("BLIND VIEWER TEST", generation_posts[4]["prompt"])
         self.assertIn(
             "Design the final documentary music cue sheet",
-            generation_posts[1]["prompt"],
+            generation_posts[5]["prompt"],
         )
         self.assertNotIn("AVAILABLE MUSIC", generation_posts[0]["prompt"])
         self.assertEqual(result["sequence"][0]["candidate_id"], "C0001")
         self.assertIn("music_plan", result)
+        self.assertTrue(result["candidate_directing"]["supervising_editor_reviewed"])
+        self.assertTrue(result["candidate_directing"]["supervising_editor_changed_plan"])
+        self.assertEqual(
+            result["candidate_directing"]["supervising_review"]["clarity_score"],
+            8,
+        )
+        self.assertEqual(result["candidate_directing"]["final_metrics"]["clip_count"], 1)
+
+    def test_measured_quality_gate_sends_bad_plan_back_to_ai_for_recut(self):
+        director = self.make_director(num_ctx=16384)
+        director._active_target_duration_sec = 30.0
+        treatment = {
+            "central_theme": "Movement becomes collective focus.",
+            "edit_style": "kinetic_montage",
+            "target_duration_sec": 30.0,
+        }
+        candidates = []
+        assets = []
+        for index in range(8):
+            candidate_id = f"C{index + 1:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "asset_id": f"asset-{index}",
+                    "source_order": index,
+                    "file_name": f"source-{index}.mp4",
+                    "cut_in_sec": 0.0,
+                    "cut_out_sec": 6.0,
+                    "story_role": "broll",
+                    "visual_summary": f"Distinct observed action {index}",
+                    "subject_action": f"Subject moves {index}",
+                    "camera_motion": "static" if index < 6 else "tracking",
+                    "shot_scale": "wide" if index < 6 else "closeup",
+                    "has_dialogue": index < 5,
+                }
+            )
+            assets.append(
+                {
+                    "asset_id": f"asset-{index}",
+                    "source_video": f"source-{index}.mp4",
+                    "duration_sec": 6.0,
+                    "transcript": [],
+                    "keyframes": [],
+                }
+            )
+
+        def shot(candidate_id, function, music_role, audio="natural_texture"):
+            return {
+                "candidate_id": candidate_id,
+                "trim_in_sec": 0.0,
+                "trim_out_sec": 3.0,
+                "narrative_function": function,
+                "viewer_information": f"New information from {candidate_id}",
+                "reason_for_position": f"Advances the cut with {candidate_id}",
+                "evidence_claim": f"Observed action in {candidate_id}",
+                "connection_to_previous": "Opens." if candidate_id == "C0001" else "Progresses visibly.",
+                "audio_intent": audio,
+                "music_edit_role": music_role,
+                "transition_to_next": "cut",
+                "transition_duration_sec": 0.0,
+                "audio_cleanup": "none",
+                "color_look": "neutral",
+                "motion": "static",
+            }
+
+        bad_sequence = [
+            shot(
+                f"C{index + 1:04d}",
+                "hook" if index == 0 else "closure" if index == 5 else "context",
+                "payoff_hit" if index in {0, 5} else "build",
+                "preserve_dialogue" if index < 5 else "natural_texture",
+            )
+            for index in range(6)
+        ]
+        good_sequence = [
+            shot("C0001", "hook", "natural_sound"),
+            shot("C0007", "escalation", "phrase_start"),
+            shot("C0008", "payoff", "payoff_hit"),
+            shot("C0006", "closure", "release"),
+        ]
+        calls = []
+
+        def plan(sequence, include_review):
+            payload = {
+                "project_summary": "A concise movement study",
+                "viewer_takeaway": "Small actions build collective focus.",
+                "editorial_style": "kinetic_montage",
+                "graphics_plan": {"strategy": "No graphics", "items": []},
+                "sequence": sequence,
+            }
+            if include_review:
+                payload["review"] = {
+                    "clarity_score": 8,
+                    "pacing_score": 8,
+                    "visual_storytelling_score": 8,
+                    "rhythm_score": 8,
+                    "problems_found": ["The measured draft needed material revision."],
+                    "changes_made": ["Changed selection, trims, and rhythm."],
+                    "dialogue_strategy": "Use visual action instead of routine speech.",
+                    "rhythm_strategy": "Progress from natural sound to payoff and release.",
+                }
+            return payload
+
+        def fake_request(
+            prompt, schema, images=(), model=None, progress_activity="director_generation"
+        ):
+            calls.append(progress_activity)
+            if "CONTINUOUS FULL-FOOTAGE SYNTHESIS" in prompt:
+                return {
+                    "whole_footage_summary": "Several distinct actions occur.",
+                    "discovered_central_theme": "Collective focus",
+                    "character_threads": [],
+                    "event_timeline": [],
+                    "visual_motifs": [],
+                    "continuity_risks": [],
+                    "observed_ending": "The group settles.",
+                    "absent_or_unproven_events": [],
+                    "honest_adaptation": "Use observed movement.",
+                }
+            if "EVIDENCE-FIRST STORY CONTRACT" in prompt:
+                return {
+                    "narrative_mode": "mood_montage",
+                    "premise": "Distinct movement builds collective focus.",
+                    "subject": "The moving group",
+                    "observed_goal": "Create a visual movement study",
+                    "has_causal_arc": False,
+                    "causal_chain": [
+                        {
+                            "candidate_id": "C0001",
+                            "observed_fact": "The first movement begins.",
+                            "state_before": "The group is still.",
+                            "state_after": "Movement begins.",
+                            "story_consequence": "The visual pattern starts.",
+                            "evidence_type": "visual",
+                        }
+                    ],
+                    "final_observed_state": "The movement study resolves.",
+                    "unsupported_promises": [],
+                    "dialogue_policy": "mute_production_chatter",
+                    "success_criteria": ["Clear subject", "Visible progression", "Visual payoff"],
+                    "recommended_duration_sec": 20,
+                }
+            if "BLIND VIEWER TEST" in prompt:
+                passed = "source-6.mp4" in prompt
+                return {
+                    "literal_synopsis": "Distinct actions form a movement study." if passed else "Several unrelated setup shots.",
+                    "subject": "The group",
+                    "apparent_goal": "Create collective movement" if passed else "Unclear",
+                    "progression": ["Movement begins", "Energy increases", "The group resolves"] if passed else ["People wait"],
+                    "ending": "A visible group payoff." if passed else "The setup stops.",
+                    "takeaway_guess": "Small actions create focus." if passed else "Unclear",
+                    "coherence_score": 8 if passed else 4,
+                    "causal_clarity_score": 7 if passed else 3,
+                    "visual_payoff_score": 8 if passed else 4,
+                    "confusing_transitions": [] if passed else ["Setup lines do not connect."],
+                    "unsupported_or_unresolved_points": [] if passed else ["No result is shown."],
+                    "passes": passed,
+                    "reason": "The visual progression is legible." if passed else "The sequence lacks progression.",
+                }
+            if "PICTURE QUALITY RECUT" in prompt:
+                return plan(good_sequence, True)
+            if "SUPERVISING EDITOR REVIEW" in prompt:
+                return plan(bad_sequence, True)
+            if "PICTURE ASSEMBLY STEP" in prompt:
+                return plan(bad_sequence, False)
+            raise AssertionError(prompt[:120])
+
+        director._request_json = fake_request
+        result = director.request_sequence(candidates, assets, treatment)
+
+        self.assertIn("picture_recut", calls)
+        self.assertTrue(result["candidate_directing"]["quality_gate_passed"])
+        self.assertEqual(result["candidate_directing"]["quality_revision_count"], 1)
+        self.assertEqual(
+            [item["candidate_id"] for item in result["sequence"]],
+            ["C0001", "C0007", "C0008", "C0006"],
+        )
+
+    def test_nested_coverage_audit_is_normalized_without_losing_absent_events(self):
+        director = self.make_director()
+
+        result = director._normalize_coverage_synopsis(
+            {
+                "project_memory": {
+                    "location": "night parking lot",
+                    "characters": ["riders", "crew"],
+                    "narrative_arc_observed": [
+                        "The crew prepares a motorcycle portrait.",
+                        "Riders lean forward and hold position.",
+                    ],
+                    "visual_motifs": None,
+                    "unresolved_intentions": ["No departure is visible."],
+                },
+                "audit_report": {
+                    "absent_or_unproven_events": ["The motorcycles ride away."],
+                    "source_evidence": "The last visible action is a held pose.",
+                    "honest_adaptation": "End on anticipation, not departure.",
+                },
+                "revised_treatment": {"central_theme": "Preparation as ritual"},
+            },
+            {"central_theme": "A night ride"},
+        )
+
+        self.assertEqual(result["discovered_central_theme"], "Preparation as ritual")
+        self.assertEqual(
+            result["absent_or_unproven_events"],
+            ["The motorcycles ride away."],
+        )
+        self.assertEqual(result["visual_motifs"], [])
+        self.assertIn("held pose", result["observed_ending"])
+
+    def test_no_progress_quality_recut_blocks_workflow(self):
+        director = self.make_director()
+        director._active_target_duration_sec = 20.0
+        treatment = {
+            "central_theme": "Observed preparation",
+            "edit_style": "hybrid_cinematic",
+            "target_duration_sec": 20.0,
+        }
+        candidates = []
+        assets = []
+        sequence = []
+        for index in range(4):
+            candidate_id = f"C{index + 1:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "asset_id": f"asset-{index}",
+                    "source_order": index,
+                    "file_name": f"source-{index}.mp4",
+                    "cut_in_sec": 0.0,
+                    "cut_out_sec": 4.0,
+                    "story_role": "context",
+                    "visual_summary": f"Observed preparation {index}",
+                    "subject_action": f"Action {index}",
+                    "camera_motion": "handheld",
+                    "shot_scale": "medium",
+                    "has_dialogue": False,
+                }
+            )
+            assets.append(
+                {
+                    "asset_id": f"asset-{index}",
+                    "source_video": f"source-{index}.mp4",
+                    "duration_sec": 4.0,
+                    "transcript": [],
+                    "keyframes": [],
+                }
+            )
+            sequence.append(
+                {
+                    "candidate_id": candidate_id,
+                    "trim_in_sec": 0.0,
+                    "trim_out_sec": 3.0,
+                    "narrative_function": "context",
+                    "viewer_information": f"Information {index}",
+                    "reason_for_position": f"Position {index}",
+                    "evidence_claim": f"Visible action {index}",
+                    "connection_to_previous": "Opens" if index == 0 else "Continues",
+                    "audio_intent": "mute_for_music",
+                    "music_edit_role": "build",
+                }
+            )
+
+        def plan(include_review):
+            result = {
+                "project_summary": "Preparation montage",
+                "viewer_takeaway": "The group prepares.",
+                "editorial_style": "hybrid_cinematic",
+                "graphics_plan": {"strategy": "None", "items": []},
+                "sequence": sequence,
+            }
+            if include_review:
+                result["review"] = {
+                    "clarity_score": 6,
+                    "pacing_score": 6,
+                    "visual_storytelling_score": 6,
+                    "rhythm_score": 6,
+                    "problems_found": ["Repetitive structure"],
+                    "changes_made": ["No safe alternative found"],
+                    "dialogue_strategy": "No dialogue",
+                    "rhythm_strategy": "Build throughout",
+                }
+            return result
+
+        calls = []
+
+        def fake_request(
+            prompt, schema, images=(), model=None, progress_activity="director_generation"
+        ):
+            calls.append(progress_activity)
+            if "CONTINUOUS FULL-FOOTAGE SYNTHESIS" in prompt:
+                return {
+                    "whole_footage_summary": "Preparation is observed.",
+                    "discovered_central_theme": "Preparation",
+                    "character_threads": [],
+                    "event_timeline": [],
+                    "visual_motifs": [],
+                    "continuity_risks": [],
+                    "observed_ending": "The group remains ready.",
+                    "absent_or_unproven_events": [],
+                    "honest_adaptation": "Use preparation only.",
+                }
+            if "EVIDENCE-FIRST STORY CONTRACT" in prompt:
+                return {
+                    "narrative_mode": "mood_montage",
+                    "premise": "Preparation as a visual study.",
+                    "subject": "The group",
+                    "observed_goal": "Prepare together",
+                    "has_causal_arc": False,
+                    "causal_chain": [
+                        {
+                            "candidate_id": "C0001",
+                            "observed_fact": "The group prepares.",
+                            "state_before": "The group is waiting.",
+                            "state_after": "Preparation begins.",
+                            "story_consequence": "The visual study starts.",
+                            "evidence_type": "visual",
+                        }
+                    ],
+                    "final_observed_state": "The group remains prepared.",
+                    "unsupported_promises": [],
+                    "dialogue_policy": "natural_texture_only",
+                    "success_criteria": ["Clear subject", "Visible pattern", "Deliberate ending"],
+                    "recommended_duration_sec": 20,
+                }
+            if "BLIND VIEWER TEST" in prompt:
+                return {
+                    "literal_synopsis": "Repeated preparation shots do not resolve.",
+                    "subject": "The group",
+                    "apparent_goal": "Unclear",
+                    "progression": ["Preparation repeats"],
+                    "ending": "The group remains waiting.",
+                    "takeaway_guess": "Unclear",
+                    "coherence_score": 4,
+                    "causal_clarity_score": 3,
+                    "visual_payoff_score": 4,
+                    "confusing_transitions": ["Repeated setup"],
+                    "unsupported_or_unresolved_points": ["No result"],
+                    "passes": False,
+                    "reason": "No readable progression or payoff.",
+                }
+            if "PICTURE ASSEMBLY STEP" in prompt:
+                return plan(False)
+            if "SUPERVISING EDITOR REVIEW" in prompt or "PICTURE QUALITY RECUT" in prompt:
+                return plan(True)
+            raise AssertionError(prompt[:120])
+
+        director._request_json = fake_request
+        with self.assertRaisesRegex(DirectorError, "quality gate failed"):
+            director.request_sequence(candidates, assets, treatment)
+
+        # One incremental repair is followed by one genuinely different
+        # structural reset before the workflow admits that the evidence cannot
+        # support a coherent film. Repeating the same edit indefinitely is banned.
+        self.assertEqual(calls.count("picture_recut"), 2)
+
+    def test_canonical_coverage_promotes_explicit_missing_event_risk(self):
+        director = self.make_director()
+        result = director._normalize_coverage_synopsis(
+            {
+                "whole_footage_summary": "Riders prepare in a parking garage.",
+                "discovered_central_theme": "Preparation",
+                "character_threads": [],
+                "event_timeline": [],
+                "visual_motifs": [],
+                "continuity_risks": [
+                    "The source footage does not show an actual departure."
+                ],
+                "observed_ending": "Riders hold position.",
+                "absent_or_unproven_events": [],
+                "honest_adaptation": "End on anticipation.",
+            },
+            {"central_theme": "Night ride"},
+        )
+
+        self.assertEqual(
+            result["absent_or_unproven_events"],
+            ["The source footage does not show an actual departure."],
+        )
+
+    def test_existing_raw_transcript_filters_long_sparse_hallucination(self):
+        director = self.make_director()
+        result = director._sanitize_transcript_segments(
+            [
+                {
+                    "start_sec": 59.68,
+                    "end_sec": 75.92,
+                    "text": "难道是",
+                },
+                {
+                    "start_sec": 76.0,
+                    "end_sec": 79.0,
+                    "text": "我们现在一起戴上头盔",
+                },
+            ],
+            "C1918.MP4",
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "我们现在一起戴上头盔")
+
+    def test_picture_plan_metrics_expose_dialogue_graphics_and_repetition(self):
+        director = self.make_director()
+        candidates = []
+        sequence = []
+        for index in range(10):
+            candidate_id = f"C{index + 1:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "file_name": f"source-{index // 2}.mp4",
+                    "cut_in_sec": 0.0,
+                    "cut_out_sec": 7.0,
+                    "has_dialogue": index < 8,
+                    "camera_motion": "static" if index < 7 else "pan",
+                }
+            )
+            sequence.append(
+                {
+                    "candidate_id": candidate_id,
+                    "trim_in_sec": 0.0,
+                    "trim_out_sec": 7.0,
+                    "audio_intent": "preserve_dialogue" if index < 8 else "mute_for_music",
+                    "narrative_function": "process" if index < 6 else "payoff",
+                    "music_edit_role": "release" if index < 9 else "payoff_hit",
+                }
+            )
+
+        metrics = director._picture_plan_metrics(
+            {
+                "graphics_plan": {
+                    "items": [{"text": str(index)} for index in range(5)]
+                },
+                "sequence": sequence,
+            },
+            candidates,
+        )
+
+        self.assertEqual(metrics["clip_count"], 10)
+        self.assertEqual(metrics["graphic_count"], 5)
+        self.assertEqual(metrics["preserved_dialogue_ratio"], 0.8)
+        self.assertEqual(metrics["long_dialogue_shots_over_6_sec"], 8)
+        self.assertEqual(metrics["longest_same_music_role_run"], 9)
+
+    def test_quality_gate_rejects_static_dialogue_heavy_context_chain(self):
+        director = self.make_director()
+        candidates = []
+        sequence = []
+        functions = ["hook", "context", "context", "context", "context", "closure"]
+        roles = ["payoff_hit", "build", "build", "build", "build", "payoff_hit"]
+        for index in range(6):
+            candidate_id = f"C{index + 1:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "file_name": f"source-{index}.mp4",
+                    "cut_in_sec": 0.0,
+                    "cut_out_sec": 6.0,
+                    "has_dialogue": index != 4,
+                    "camera_motion": "static" if index != 1 else "handheld",
+                    "shot_scale": "wide" if index != 1 else "medium",
+                    "story_role": "context",
+                }
+            )
+            sequence.append(
+                {
+                    "candidate_id": candidate_id,
+                    "trim_in_sec": 0.0,
+                    "trim_out_sec": 6.0,
+                    "audio_intent": "preserve_dialogue" if index != 4 else "natural_texture",
+                    "narrative_function": functions[index],
+                    "music_edit_role": roles[index],
+                }
+            )
+        candidates.extend(
+            [
+                {
+                    "candidate_id": "ALT1", "camera_motion": "tracking",
+                    "shot_scale": "closeup", "story_role": "broll",
+                },
+                {
+                    "candidate_id": "ALT2", "camera_motion": "pan",
+                    "shot_scale": "detail", "story_role": "broll",
+                },
+            ]
+        )
+        payload = {
+            "editorial_style": "kinetic_montage",
+            "graphics_plan": {"items": []},
+            "sequence": sequence,
+        }
+        metrics = director._picture_plan_metrics(payload, candidates)
+        violations = director._picture_plan_quality_violations(
+            payload,
+            metrics,
+            candidates,
+            {"edit_style": "kinetic_montage", "central_theme": "Preparation"},
+        )
+
+        combined = " ".join(violations)
+        self.assertIn("preserved-dialogue ratio", combined)
+        self.assertIn("Static-shot ratio", combined)
+        self.assertIn("same narrative function", combined)
+        self.assertIn("one music-edit role", combined)
+        self.assertIn("no authored escalation", combined)
+        self.assertIn("Both the opening teaser and ending", combined)
+
+    def test_quality_gate_allows_explicit_interview_structure(self):
+        director = self.make_director(creative_brief="以人物采访为主")
+        candidates = []
+        sequence = []
+        for index, (function, music_role) in enumerate(
+            zip(
+                ["hook", "escalation", "payoff", "closure"],
+                ["natural_sound", "phrase_start", "payoff_hit", "release"],
+            )
+        ):
+            candidate_id = f"C{index + 1:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "file_name": f"interview-{index}.mp4",
+                    "cut_in_sec": 0,
+                    "cut_out_sec": 4,
+                    "has_dialogue": True,
+                    "camera_motion": "static",
+                    "shot_scale": "medium",
+                    "story_role": "interview",
+                }
+            )
+            sequence.append(
+                {
+                    "candidate_id": candidate_id,
+                    "trim_in_sec": 0,
+                    "trim_out_sec": 4,
+                    "audio_intent": "preserve_dialogue",
+                    "narrative_function": function,
+                    "music_edit_role": music_role,
+                }
+            )
+        payload = {
+            "editorial_style": "dialogue-led interview",
+            "graphics_plan": {"items": []},
+            "sequence": sequence,
+        }
+        metrics = director._picture_plan_metrics(payload, candidates)
+        violations = director._picture_plan_quality_violations(
+            payload, metrics, candidates, {"edit_style": "dialogue_led"}
+        )
+
+        self.assertFalse(any("dialogue" in item.casefold() for item in violations))
+
+    def test_quality_gate_rejects_hybrid_cut_dominated_by_production_chatter(self):
+        director = self.make_director()
+        candidates = []
+        sequence = []
+        functions = ["hook", "context", "contrast", "payoff", "closure"]
+        for index in range(5):
+            candidate_id = f"C{index + 1:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "file_name": f"source-{index}.mp4",
+                    "cut_in_sec": 0,
+                    "cut_out_sec": 8,
+                    "has_dialogue": True,
+                    "dialogue_ranges_sec": [
+                        {"start_sec": 0, "end_sec": 7.5, "text": "假装我们闲聊再拍一条"}
+                    ],
+                    "production_context_hint": True,
+                    "camera_motion": "handheld",
+                    "shot_scale": "medium",
+                }
+            )
+            sequence.append(
+                {
+                    "candidate_id": candidate_id,
+                    "trim_in_sec": 0,
+                    "trim_out_sec": 8,
+                    "audio_intent": "preserve_dialogue",
+                    "narrative_function": functions[index],
+                    "music_edit_role": "payoff_hit" if index == 3 else "build",
+                }
+            )
+        payload = {
+            "editorial_style": "hybrid_cinematic",
+            "graphics_plan": {"items": []},
+            "sequence": sequence,
+        }
+        metrics = director._picture_plan_metrics(payload, candidates)
+        violations = director._picture_plan_quality_violations(
+            payload,
+            metrics,
+            candidates,
+            {"edit_style": "hybrid_cinematic"},
+            {
+                "narrative_mode": "mood_montage",
+                "has_causal_arc": False,
+                "causal_chain": [],
+            },
+        )
+
+        combined = " ".join(violations)
+        self.assertIn("audible-speech ratio", combined)
+        self.assertIn("Production-process chatter", combined)
+
+    def test_narrative_contract_downgrades_unproven_bts_arc(self):
+        director = self.make_director()
+        payload = {
+            "narrative_mode": "bts_process",
+            "premise": "The crew solves a problem.",
+            "subject": "The crew",
+            "observed_goal": "Finish the setup",
+            "has_causal_arc": True,
+            "causal_chain": [
+                {
+                    "candidate_id": candidate_id,
+                    "observed_fact": f"Observed action {candidate_id}",
+                    "state_before": "before",
+                    "state_after": "after",
+                    "story_consequence": "change",
+                    "evidence_type": "visual",
+                }
+                for candidate_id in ("C0001", "C0002", "C0003")
+            ],
+            "final_observed_state": "The group holds a pose.",
+            "unsupported_promises": [],
+            "dialogue_policy": "story_dialogue_only",
+            "success_criteria": ["a", "b", "c"],
+            "recommended_duration_sec": 30,
+        }
+        normalized = director._normalize_narrative_contract(
+            payload,
+            [{"candidate_id": f"C000{index}"} for index in range(1, 4)],
+            {"event_timeline": []},
+        )
+
+        self.assertFalse(normalized["has_causal_arc"])
+        self.assertEqual(normalized["narrative_mode"], "mood_montage")
+        self.assertIn("contract_correction", normalized)
+
+    def test_natural_texture_speech_is_measured_as_audible(self):
+        director = self.make_director()
+        candidates = [
+            {
+                "candidate_id": "C0001",
+                "file_name": "source.mp4",
+                "cut_in_sec": 0,
+                "cut_out_sec": 5,
+                "has_dialogue": True,
+                "dialogue_ranges_sec": [
+                    {"start_sec": 1, "end_sec": 4, "text": "production talk"}
+                ],
+                "camera_motion": "static",
+                "shot_scale": "wide",
+            }
+        ]
+        metrics = director._picture_plan_metrics(
+            {
+                "graphics_plan": {"items": []},
+                "sequence": [
+                    {
+                        "candidate_id": "C0001",
+                        "trim_in_sec": 0,
+                        "trim_out_sec": 5,
+                        "audio_intent": "natural_texture",
+                        "narrative_function": "context",
+                        "music_edit_role": "natural_sound",
+                    }
+                ],
+            },
+            candidates,
+        )
+
+        self.assertEqual(metrics["audible_speech_duration_sec"], 3.0)
+        self.assertEqual(metrics["audible_speech_ratio"], 0.6)
+
+    def test_silent_trim_inside_dialogue_candidate_is_not_counted_as_speech(self):
+        director = self.make_director()
+        candidates = [
+            {
+                "candidate_id": "C0001",
+                "file_name": "source.mp4",
+                "cut_in_sec": 0,
+                "cut_out_sec": 10,
+                "has_dialogue": True,
+                "dialogue_ranges_sec": [
+                    {"start_sec": 0, "end_sec": 4, "text": "crew talk"}
+                ],
+                "camera_motion": "static",
+                "shot_scale": "wide",
+            }
+        ]
+
+        metrics = director._picture_plan_metrics(
+            {
+                "graphics_plan": {"items": []},
+                "sequence": [
+                    {
+                        "candidate_id": "C0001",
+                        "trim_in_sec": 6,
+                        "trim_out_sec": 9,
+                        "audio_intent": "natural_texture",
+                        "narrative_function": "context",
+                        "music_edit_role": "natural_sound",
+                    }
+                ],
+            },
+            candidates,
+        )
+
+        self.assertEqual(metrics["audible_speech_duration_sec"], 0.0)
+        self.assertEqual(metrics["shot_audit"][0]["source_speech_sec"], 0.0)
+
+    def test_hybrid_dialogue_story_is_not_forced_under_visual_montage_cap(self):
+        director = self.make_director()
+        candidates = []
+        sequence = []
+        for index, function in enumerate(
+            ["hook", "context", "escalation", "payoff", "closure"]
+        ):
+            candidate_id = f"C{index + 1:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "file_name": f"source-{index}.mp4",
+                    "cut_in_sec": 0,
+                    "cut_out_sec": 6,
+                    "has_dialogue": True,
+                    "camera_motion": "handheld",
+                    "shot_scale": "medium",
+                    "story_role": "context",
+                }
+            )
+            sequence.append(
+                {
+                    "candidate_id": candidate_id,
+                    "trim_in_sec": 0,
+                    "trim_out_sec": 6,
+                    "audio_intent": "preserve_dialogue",
+                    "narrative_function": function,
+                    "music_edit_role": "payoff_hit" if index in {0, 3} else "build",
+                }
+            )
+        payload = {
+            "editorial_style": "hybrid_cinematic",
+            "graphics_plan": {"items": []},
+            "sequence": sequence,
+        }
+        metrics = director._picture_plan_metrics(payload, candidates)
+        violations = director._picture_plan_quality_violations(
+            payload,
+            metrics,
+            candidates,
+            {
+                "edit_style": "hybrid_cinematic",
+                "development_beat": "The crew discussion reveals the production conflict.",
+                "chronology_policy": "teaser_then_chronological",
+                "opening_beat": "A teaser of the final pose.",
+            },
+        )
+
+        combined = " ".join(violations).casefold()
+        self.assertNotIn("preserved-dialogue ratio", combined)
+        self.assertNotIn("both the opening teaser", combined)
+
+    def test_validator_preserves_director_picture_lock_without_python_recut(self):
+        director = self.make_director()
+        candidates = []
+        sequence = []
+        for index in range(8):
+            candidate_id = f"C{index + 1:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "asset_id": "asset-1",
+                    "source_order": index,
+                    "file_name": f"source-{index}.mp4",
+                    "cut_in_sec": 0.0,
+                    "cut_out_sec": 5.0,
+                    "story_role": "context",
+                    "visual_summary": f"Observed action {index}",
+                }
+            )
+            sequence.append(
+                {
+                    "candidate_id": candidate_id,
+                    "trim_in_sec": 0.0,
+                    "trim_out_sec": 5.0,
+                    "narrative_function": "context",
+                    "viewer_information": f"Information {index}",
+                    "reason_for_position": f"Director position {index}",
+                    "evidence_claim": f"Observed action {index}",
+                    "connection_to_previous": "Opens." if index == 0 else f"Builds from {index - 1}.",
+                    "audio_intent": "natural_texture",
+                    "music_edit_role": "build",
+                }
+            )
+
+        clips = director.validate_sequence(
+            {"sequence": sequence},
+            candidates,
+            {"target_duration_sec": 10.0, "creative_look": "clean_neutral"},
+        )
+
+        self.assertEqual([item["candidate_id"] for item in clips], [
+            f"C{index + 1:04d}" for index in range(8)
+        ])
+        self.assertTrue(all(item.get("reason_for_position") for item in clips))
 
     def test_prompt_token_estimator_protects_chinese_and_ascii(self):
         self.assertGreaterEqual(AIDirector._estimate_prompt_tokens("剪辑" * 100), 200)
@@ -677,6 +1744,13 @@ class AIDirectorTests(unittest.TestCase):
             self.assertEqual(len(image_requests), 2)
             self.assertEqual(output["schema_version"], "3.0")
             self.assertEqual(
+                output["visual_review"]["mode"], "continuous_all_saved_samples"
+            )
+            self.assertFalse(
+                output["visual_review"]["second_stage_frame_subsampling"]
+            )
+            self.assertIn("discovered_central_theme", output["full_review_synopsis"])
+            self.assertEqual(
                 output["color_pipeline"]["sources"]["asset-1"]["resolve_input_gamma"],
                 "S-Log3",
             )
@@ -691,6 +1765,239 @@ class AIDirectorTests(unittest.TestCase):
             self.assertEqual(output["clips"][0]["audio_cleanup"], "strong")
             self.assertTrue(output["clips"][0]["has_dialogue"])
             self.assertTrue(output_path.is_file())
+
+    def test_oversized_prompt_is_blocked_before_ollama_can_left_truncate(self):
+        session = FakeSession()
+        director = self.make_director(session=session, num_ctx=4096)
+
+        with self.assertRaisesRegex(DirectorError, "Request blocked"):
+            director._request_json("x" * 50000, {"type": "object"})
+
+        self.assertEqual(session.posts, [])
+
+    def test_paged_director_reviews_every_candidate_without_fixed_top_n(self):
+        director = self.make_director(num_ctx=4096)
+        candidates = [
+            {
+                "candidate_id": f"C{index:04d}",
+                "asset_id": "asset-1",
+                "source_order": 0,
+                "source": "source.mp4",
+                "in": float(index),
+                "out": float(index + 2),
+                "story_role": "context",
+                "visual_summary": ("distinct chronological visual evidence " * 4).strip(),
+                "dialogue_excerpt": "",
+                "quality_score": 0.8,
+            }
+            for index in range(1, 31)
+        ]
+
+        def fake_request(prompt, schema, images=(), model=None):
+            page = json.loads(prompt.split("CANDIDATE PAGE:\n", 1)[1])
+            keep = schema["properties"]["recommendations"]["maxItems"]
+            return {
+                "page_summary": "All candidates on this page were compared.",
+                "recommendations": [
+                    {
+                        "candidate_id": item["candidate_id"],
+                        "story_value": "Unique evidence for the chronological story.",
+                        "suggested_story_role": "context",
+                    }
+                    for item in page[:keep]
+                ],
+            }
+
+        director._request_json = fake_request
+        selected, audit = director._review_candidate_round(
+            candidates,
+            {"central_theme": "A complete chronology"},
+            [{"asset_id": "asset-1", "source_order": 0}],
+            {"whole_footage_summary": "The source develops from setup to payoff."},
+            round_number=1,
+        )
+
+        reviewed_ids = {
+            candidate_id
+            for page in audit["pages"]
+            for candidate_id in page["input_candidate_ids"]
+        }
+        self.assertEqual(reviewed_ids, {item["candidate_id"] for item in candidates})
+        self.assertEqual(audit["input_candidate_count"], len(candidates))
+        self.assertGreater(len(selected), 0)
+        self.assertLess(len(selected), len(candidates))
+
+    def test_real_video_duration_clamps_transcript_and_candidate_tail(self):
+        director = self.make_director()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw_path = root / "raw_data.json"
+            raw_path.write_text(
+                json.dumps(
+                    {
+                        "assets": [
+                            {
+                                "asset_id": "a1",
+                                "duration_sec": 14.0,
+                                "video": {"duration_sec": 12.5125},
+                                "source_video": "source.mp4",
+                                "transcript": [
+                                    {"start_sec": 10.0, "end_sec": 14.0, "text": "tail"}
+                                ],
+                                "keyframes": [],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = director.load_raw_data(raw_path)
+            asset = payload["assets"][0]
+            candidates = director._sanitize_candidate_bounds(
+                [
+                    {
+                        "asset_id": "a1",
+                        "file_name": "source.mp4",
+                        "cut_in_sec": 5.0,
+                        "cut_out_sec": 14.0,
+                    }
+                ],
+                [asset],
+            )
+
+            self.assertEqual(asset["duration_sec"], 12.5125)
+            self.assertEqual(asset["transcript"][0]["end_sec"], 12.512)
+            self.assertEqual(candidates[0]["cut_out_sec"], 12.512)
+
+    def test_dialogue_overlap_forces_music_ducking(self):
+        director = self.make_director()
+        plan = director.enforce_dialogue_ducking(
+            [
+                {"cut_in_sec": 0, "cut_out_sec": 4, "has_dialogue": True},
+                {"cut_in_sec": 5, "cut_out_sec": 7, "has_dialogue": False},
+            ],
+            {
+                "cues": [
+                    {
+                        "timeline_in_sec": 0,
+                        "timeline_out_sec": 6,
+                        "duck_under_dialogue_db": 0,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(plan["cues"][0]["duck_under_dialogue_db"], -10.0)
+
+    def test_final_sequence_refines_candidate_and_obeys_director_audio_intent(self):
+        director = self.make_director()
+        treatment = {
+            "chronology_policy": "teaser_then_chronological",
+            "target_duration_sec": 45,
+            "creative_look": "cool_steel",
+            "edit_style": "kinetic_montage",
+        }
+        candidate = {
+            "candidate_id": "C0001", "asset_id": "a1", "source_order": 0,
+            "file_name": "source.mp4", "cut_in_sec": 0, "cut_out_sec": 12,
+            "story_role": "opening", "reason_for_cut": "Rider adjusts gloves",
+            "visual_summary": "Rider prepares beside a motorcycle",
+            "subject_action": "Adjusting gloves", "dialogue_excerpt": "麦克风不需要录声音",
+            "quality_score": 0.9, "confidence": 0.9,
+        }
+
+        clips = director.validate_sequence(
+            {
+                "sequence": [
+                    {
+                        "candidate_id": "C0001", "trim_in_sec": 2.0,
+                        "trim_out_sec": 5.5, "narrative_function": "hook",
+                        "viewer_information": "The riders treat preparation as ritual.",
+                        "reason_for_position": "A tactile action creates an immediate promise.",
+                        "audio_intent": "preserve_dialogue", "music_edit_role": "phrase_start",
+                    }
+                ]
+            },
+            [candidate],
+            treatment,
+        )
+
+        self.assertEqual((clips[0]["cut_in_sec"], clips[0]["cut_out_sec"]), (2.0, 5.5))
+        self.assertEqual(clips[0]["narrative_function"], "hook")
+        self.assertEqual(clips[0]["audio_intent"], "preserve_dialogue")
+        self.assertEqual(clips[0]["volume_db"], 0.0)
+        self.assertNotIn("production_chatter_muted", clips[0])
+
+    def test_graphics_plan_is_grounded_to_surviving_picture_lock(self):
+        director = self.make_director()
+        clips = [
+            {"candidate_id": "C1", "cut_in_sec": 0, "cut_out_sec": 3},
+            {"candidate_id": "C2", "cut_in_sec": 5, "cut_out_sec": 9},
+        ]
+        plan = director.validate_graphics_plan(
+            {
+                "strategy": "State the promise, then mark the payoff.",
+                "items": [
+                    {
+                        "graphic_id": "G1", "kind": "chapter",
+                        "anchor_candidate_id": "C2", "placement": "clip_middle",
+                        "duration_sec": 2, "text": "READY", "subtitle": "",
+                        "style": "kinetic", "purpose": "Name the payoff",
+                    },
+                    {
+                        "graphic_id": "BAD", "kind": "chapter",
+                        "anchor_candidate_id": "REMOVED", "placement": "clip_start",
+                        "duration_sec": 2, "text": "INVALID", "subtitle": "",
+                        "style": "minimal", "purpose": "Removed anchor",
+                    },
+                ],
+            },
+            clips,
+            {"title": "Night Shift", "viewer_takeaway": "Preparation becomes unity."},
+        )
+
+        self.assertEqual(len(plan["items"]), 1)
+        self.assertEqual(plan["items"][0]["text"], "READY")
+        self.assertEqual(plan["items"][0]["timeline_in_sec"], 4.0)
+        self.assertEqual(plan["items"][0]["timeline_out_sec"], 6.0)
+
+    def test_first_music_cue_extends_to_program_start_without_moving_later_beats(self):
+        director = self.make_director()
+        with tempfile.TemporaryDirectory() as temporary:
+            track = Path(temporary) / "score.wav"
+            track.touch()
+            director._music_analysis = {
+                "tracks": [
+                    {
+                        "file_name": str(track), "duration_sec": 180,
+                        "integrated_lufs": -14, "beats_sec": [],
+                        "strong_beats_sec": [], "downbeats_sec": [], "sections": [],
+                    }
+                ]
+            }
+            plan = director.validate_music_plan(
+                {
+                    "strategy": "one build", "silence_regions": [],
+                    "cues": [
+                        {
+                            "cue_id": "M1", "track_file": "score.wav",
+                            "story_beat": "development", "timeline_in_sec": 24,
+                            "timeline_out_sec": 70, "track_in_sec": 79,
+                            "track_out_sec": 125, "reason": "build",
+                            "target_lufs": -18, "fade_in_sec": 1,
+                            "fade_out_sec": 1, "crossfade_sec": 0,
+                            "duck_under_dialogue_db": -9, "sync_points": [],
+                        }
+                    ],
+                },
+                70,
+            )
+
+        cue = plan["cues"][0]
+        self.assertEqual(cue["timeline_in_sec"], 0.0)
+        self.assertEqual(cue["track_in_sec"], 55.0)
+        self.assertEqual(cue["timeline_out_sec"], 70.0)
 
 
 if __name__ == "__main__":

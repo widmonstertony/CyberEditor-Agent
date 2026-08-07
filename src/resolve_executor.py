@@ -11,7 +11,7 @@ module are used in this stage.
 """
 
 import argparse
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 import importlib
 import json
 import logging
@@ -61,6 +61,7 @@ class ClipDecision(NamedTuple):
     asset_id: str = ""
     source_color: Optional[Dict[str, Any]] = None
     color_match: Optional[Dict[str, Any]] = None
+    creative_grade: Optional[Dict[str, Any]] = None
 
 
 class MediaRecord(NamedTuple):
@@ -98,6 +99,9 @@ class DaVinciExecutor:
         startup_timeout:
             Maximum seconds to wait for the Resolve scripting API.
             等待 Resolve 脚本 API 就绪的最长秒数。
+        startup_attempts:
+            Maximum auto-start attempts, including the first launch.
+            自动启动的最大尝试次数（包含首次启动）。
     """
 
     def __init__(
@@ -109,6 +113,7 @@ class DaVinciExecutor:
         strict_fps: bool = False,
         auto_start_resolve: bool = True,
         startup_timeout: float = 120.0,
+        startup_attempts: int = 3,
         drx_root: Optional[os.PathLike] = None,
         fairlight_preset: str = "",
         render_enabled: bool = False,
@@ -116,6 +121,7 @@ class DaVinciExecutor:
         render_name: str = "CyberEditor_final",
         render_preset: str = "",
         render_timeout: float = 86400.0,
+        approved_preview: Optional[os.PathLike] = None,
         macro_profile: Optional[os.PathLike] = None,
         macro_action: str = "post_assembly",
         logger: Optional[logging.Logger] = None,
@@ -132,6 +138,7 @@ class DaVinciExecutor:
         self.strict_fps = strict_fps
         self.auto_start_resolve = bool(auto_start_resolve)
         self.startup_timeout = float(startup_timeout)
+        self.startup_attempts = int(startup_attempts)
         self.drx_root = (
             Path(drx_root).expanduser().resolve()
             if drx_root
@@ -147,6 +154,10 @@ class DaVinciExecutor:
         self.render_name = render_name.strip()
         self.render_preset = render_preset.strip()
         self.render_timeout = float(render_timeout)
+        self.approved_preview = (
+            Path(approved_preview).expanduser().resolve()
+            if approved_preview else None
+        )
         self.macro_profile = (
             Path(macro_profile).expanduser().resolve() if macro_profile else None
         )
@@ -160,6 +171,11 @@ class DaVinciExecutor:
             raise ResolveExecutorError(
                 "Resolve 启动超时必须大于 0 秒"
                 " / Resolve startup timeout must be greater than zero."
+            )
+        if self.startup_attempts < 1:
+            raise ResolveExecutorError(
+                "Resolve 启动尝试次数必须至少为 1"
+                " / Resolve startup attempts must be at least one."
             )
         if not self.render_name or self.render_timeout <= 0:
             raise ResolveExecutorError(
@@ -175,6 +191,8 @@ class DaVinciExecutor:
         self.created_project = False
         self.color_pipeline: Dict[str, Any] = {}
         self.music_plan: Dict[str, Any] = {}
+        self.audio_program: Dict[str, Any] = {}
+        self.graphics_plan: Dict[str, Any] = {}
 
     def run(self) -> Sequence[Any]:
         """
@@ -201,9 +219,13 @@ class DaVinciExecutor:
         self.compare_fps(json_fps, active_fps)
         prepared = self.prepare_clips(clips, active_fps)
         appended = self.append_clips(prepared)
+        self.append_graphics_titles(active_fps)
+        self.append_program_audio(active_fps, prepared)
         self.append_music_bed(active_fps, prepared)
         self.apply_timeline_audio_preset()
         self.run_macro_fallback()
+        if self.approved_preview is not None:
+            self.create_reviewed_delivery_timeline(self.approved_preview)
         self.save_project()
         if self.render_enabled:
             self.render_final()
@@ -239,6 +261,10 @@ class DaVinciExecutor:
         self.color_pipeline = pipeline if isinstance(pipeline, dict) else {}
         music = payload.get("music_plan")
         self.music_plan = music if isinstance(music, dict) else {}
+        audio_program = payload.get("audio_program")
+        self.audio_program = audio_program if isinstance(audio_program, dict) else {}
+        graphics = payload.get("graphics_plan")
+        self.graphics_plan = graphics if isinstance(graphics, dict) else {}
         fps = self._positive_decimal(payload.get("project_fps"), "project_fps")
         raw_clips = payload.get("clips")
         if not isinstance(raw_clips, list) or not raw_clips:
@@ -314,7 +340,7 @@ class DaVinciExecutor:
                         "static",
                     ),
                     volume_db=max(
-                        Decimal("-24"),
+                        Decimal("-60"),
                         min(
                             Decimal("12"),
                             self._decimal(item.get("volume_db", 0), f"{prefix}.volume_db"),
@@ -351,6 +377,10 @@ class DaVinciExecutor:
                     color_match=(
                         dict(item["color_match"])
                         if isinstance(item.get("color_match"), dict) else None
+                    ),
+                    creative_grade=(
+                        dict(item["creative_grade"])
+                        if isinstance(item.get("creative_grade"), dict) else None
                     ),
                 )
             )
@@ -427,25 +457,51 @@ class DaVinciExecutor:
             )
 
         if resolve is None:
-            deadline = time.monotonic() + self.startup_timeout
-            while resolve is None and time.monotonic() < deadline:
-                if (
-                    launched_process is not None
-                    and launched_process.poll() is not None
-                ):
-                    raise ResolveExecutorError(
-                        "Resolve 启动后提前退出。请手动打开 Resolve 检查启动报错。"
-                        " / Resolve exited during startup; open it manually to "
-                        "inspect the startup error."
-                    )
-                time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
-                resolve = self._try_scriptapp(module)
+            resolve = self._wait_for_scriptapp(module, launched_process)
+        restart_number = 0
+        while (
+            resolve is None
+            and launched_process is not None
+            and executable is not None
+            and restart_number < self.startup_attempts - 1
+        ):
+            # Resolve 21 can intermittently start its UI while its internal
+            # ScriptServer immediately terminates. A longer wait cannot recover
+            # that state. On some machines this can happen more than once after
+            # a cold boot, so retry a small bounded number of times. It is safe
+            # to restart only the process launched by
+            # this executor; a Resolve instance opened by the user is never
+            # closed automatically because it may contain unsaved work.
+            # Resolve 21 偶尔会正常打开界面，但内部 ScriptServer 随即退出；继续等待
+            # 无法恢复。这里只重启本执行器刚启动的进程，绝不自动关闭用户自行打开的工程。
+            restart_number += 1
+            self.logger.warning(
+                "Resolve 界面已启动但脚本服务未就绪；正在自动恢复 %d/%d / "
+                "Resolve UI started without its script service; recovery restart %d/%d",
+                restart_number,
+                self.startup_attempts - 1,
+                restart_number,
+                self.startup_attempts - 1,
+            )
+            self._stop_auto_started_resolve(launched_process)
+            time.sleep(3.0)
+            launched_process = self._launch_resolve(executable)
+            self.logger.info(
+                "Resolve 已重新启动，正在再次等待脚本 API（最长 %.0f 秒） / "
+                "Resolve restarted; waiting up to %.0f seconds for its API",
+                self.startup_timeout,
+                self.startup_timeout,
+            )
+            resolve = self._wait_for_scriptapp(module, launched_process)
         if resolve is None:
             raise ResolveExecutorError(
-                "Resolve 已运行，但脚本 API 在等待后仍不可用。请在 Preferences > "
-                "System > General 中将 External scripting 设为 Local 后重启。\n"
-                "Resolve is running but its API did not become ready. Enable Local "
-                "external scripting and restart Resolve."
+                "Resolve 已运行，但内部脚本服务没有就绪。若 Resolve 是手动打开的，"
+                "请保存工作后完全退出并重开；同时确认 Preferences > System > General > "
+                "External scripting 为 Local。\n"
+                f"Resolve is running but its internal script service is unavailable "
+                f"after {self.startup_attempts if launched_process is not None else 1} bounded attempt(s). "
+                "If Resolve was opened manually, save your work, exit it completely, "
+                "and relaunch it; also confirm External scripting is Local."
             )
         try:
             name = resolve.GetProductName()
@@ -698,32 +754,37 @@ class DaVinciExecutor:
 
     def ensure_timeline(self) -> Any:
         """
-        Reuse the current timeline or create/reuse the configured one.
-        复用当前时间线，或创建/复用配置的时间线。
-        """
-        timeline = self.project.GetCurrentTimeline()
-        if timeline is not None:
-            self.logger.info(
-                "使用当前时间线“%s” / Using current timeline '%s'",
-                self._safe_name(timeline, "unnamed"),
-                self._safe_name(timeline, "unnamed"),
-            )
-            return timeline
+        Create a fresh, non-conflicting timeline for this automated assembly.
+        为本次自动总装创建全新且不重名的时间线。
 
+        Existing timelines are never appended to or cleared. Re-running an edit
+        therefore preserves the user's current cut and creates ``Name (2)``,
+        ``Name (3)``, and so on when necessary.
+        既有时间线绝不会被继续追加或清空；重复运行会安全创建 ``名称 (2)`` 等。
+        """
+        current = self.project.GetCurrentTimeline()
+        if current is not None:
+            self.logger.info(
+                "保留当前时间线“%s”，本次总装将创建新时间线 / "
+                "Preserving current timeline '%s'; creating a fresh assembly",
+                self._safe_name(current, "unnamed"),
+                self._safe_name(current, "unnamed"),
+            )
+        existing_names = set()
+        if current is not None:
+            existing_names.add(self._safe_name(current, ""))
         count = self._safe_int_call(self.project, "GetTimelineCount")
         for index in range(1, count + 1):
             candidate = self.project.GetTimelineByIndex(index)
-            if (
-                candidate is not None
-                and self._safe_name(candidate, "") == self.timeline_name
-            ):
-                if not self.project.SetCurrentTimeline(candidate):
-                    raise ResolveExecutorError(
-                        f"无法激活时间线 / Cannot activate timeline: {self.timeline_name}"
-                    )
-                return candidate
+            if candidate is not None:
+                existing_names.add(self._safe_name(candidate, ""))
+        fresh_name = self.timeline_name
+        suffix = 2
+        while fresh_name in existing_names:
+            fresh_name = f"{self.timeline_name} ({suffix})"
+            suffix += 1
         try:
-            timeline = self.media_pool.CreateEmptyTimeline(self.timeline_name)
+            timeline = self.media_pool.CreateEmptyTimeline(fresh_name)
         except Exception as exc:
             raise ResolveExecutorError(
                 f"创建时间线失败 / Timeline creation failed: {exc}"
@@ -734,12 +795,12 @@ class DaVinciExecutor:
             fallback = getattr(self.media_pool, "CreateTimelineFromClips", None)
             if callable(fallback):
                 try:
-                    timeline = fallback(self.timeline_name, [])
+                    timeline = fallback(fresh_name, [])
                 except Exception:
                     timeline = None
         if timeline is None:
             raise ResolveExecutorError(
-                f"无法创建/激活时间线 / Cannot create/activate timeline: {self.timeline_name}"
+                f"无法创建/激活时间线 / Cannot create/activate timeline: {fresh_name}"
             )
         try:
             activated = self.project.SetCurrentTimeline(timeline)
@@ -753,15 +814,15 @@ class DaVinciExecutor:
             if (
                 current is None
                 or self._safe_name(current, "")
-                != self._safe_name(timeline, self.timeline_name)
+                != self._safe_name(timeline, fresh_name)
             ):
                 raise ResolveExecutorError(
-                    f"时间线已创建但无法激活 / Timeline created but cannot be activated: {self.timeline_name}"
+                    f"时间线已创建但无法激活 / Timeline created but cannot be activated: {fresh_name}"
                 )
         self.logger.info(
             "已创建时间线“%s” / Created timeline '%s'",
-            self.timeline_name,
-            self.timeline_name,
+            fresh_name,
+            fresh_name,
         )
         return timeline
 
@@ -834,17 +895,37 @@ class DaVinciExecutor:
             item, index = self._resolve_media(decision, index)
             self._configure_media_input_transform(item, decision)
             source_fps = self._media_fps(item) or fps
+            _, media_path_text = self._media_identity(item)
+            if media_path_text:
+                media_path = Path(media_path_text).expanduser()
+                if media_path.is_file():
+                    source_duration = self._probe_media_duration(media_path)
+                    tolerance = Decimal("2") / source_fps
+                    if source_duration > 0 and decision.cut_out_sec > (
+                        Decimal(str(source_duration)) + tolerance
+                    ):
+                        raise ResolveExecutorError(
+                            f"clip_id={decision.clip_id!r} 的出点 {decision.cut_out_sec}s "
+                            f"超过真实素材时长 {source_duration:.3f}s；已在修改时间线前停止。"
+                            " / Cut out exceeds the real media EOF; stopped before assembly."
+                        )
             start_frame, end_frame = self.seconds_to_frames(
                 decision.cut_in_sec, decision.cut_out_sec, source_fps
             )
+            clip_info: Dict[str, Any] = {
+                "mediaPoolItem": item,
+                "startFrame": start_frame,
+                "endFrame": end_frame,
+            }
+            if str(self.audio_program.get("bed_file") or "").strip():
+                # Source audio is already conformed from the exact same seconds.
+                # Append picture-only here, then place the deterministic WAV on A1.
+                # 原声已按完全相同的秒数预混；此处只追加画面，随后把 WAV 放入 A1。
+                clip_info["mediaType"] = 1
             prepared.append(
                 (
                     decision,
-                    {
-                        "mediaPoolItem": item,
-                        "startFrame": start_frame,
-                        "endFrame": end_frame,
-                    },
+                    clip_info,
                 )
             )
             self.logger.info(
@@ -1078,6 +1159,411 @@ class DaVinciExecutor:
             )
         return result_items
 
+    @staticmethod
+    def _offset_timecode(start_timecode: str, fps: Decimal, offset_sec: float) -> str:
+        """
+        Add a timeline-second offset to a Resolve start timecode.
+        在 Resolve 起始时间码上增加时间线秒数。
+
+        Parameters / 参数:
+            start_timecode: ``HH:MM:SS:FF`` or drop-frame ``HH:MM:SS;FF``. /
+                起始时间码字符串。
+            fps: Active timeline rate. / 当前时间线帧率。
+            offset_sec: Non-negative offset from the first program frame. / 节目首帧后的秒数。
+        """
+        text = str(start_timecode or "01:00:00:00").strip()
+        separator = ";" if ";" in text else ":"
+        parts = re.split(r"[:;]", text)
+        if len(parts) != 4:
+            parts = ["01", "00", "00", "00"]
+        try:
+            hours, minutes, seconds, frames = (int(value) for value in parts)
+        except ValueError:
+            hours, minutes, seconds, frames = 1, 0, 0, 0
+        nominal = max(1, int(Decimal(fps).to_integral_value(rounding=ROUND_HALF_UP)))
+        total = (
+            ((hours * 60 + minutes) * 60 + seconds) * nominal
+            + frames
+            + int(
+                (Decimal(str(max(0.0, offset_sec))) * fps).to_integral_value(
+                    rounding=ROUND_HALF_UP
+                )
+            )
+        )
+        out_frames = total % nominal
+        total_seconds = total // nominal
+        out_seconds = total_seconds % 60
+        total_minutes = total_seconds // 60
+        out_minutes = total_minutes % 60
+        out_hours = (total_minutes // 60) % 24
+        return (
+            f"{out_hours:02d}:{out_minutes:02d}:{out_seconds:02d}"
+            f"{separator}{out_frames:02d}"
+        )
+
+    def append_graphics_titles(self, fps: Decimal) -> Sequence[Any]:
+        """
+        Insert the director's validated typography as editable Resolve Text+ items.
+        将导演已校验的字体设计插入为可编辑的 Resolve Text+ 条目。
+
+        The FFmpeg review renderer executes the same plan. Resolve title support
+        varies slightly by build, so unavailable controls are logged and skipped
+        without sacrificing the assembled picture or audio.
+        FFmpeg 审片与此处共用同一方案；不同 Resolve 版本缺失的控件会友好降级。
+        """
+        raw_items = self.graphics_plan.get("items")
+        items = raw_items if isinstance(raw_items, list) else []
+        if not items:
+            return []
+        # Resolve 21's public API does not expose a target video track for
+        # InsertFusionTitleIntoTimeline(). In real projects it inserted Text+ on
+        # V1 and rippled picture by five seconds while leaving audio untouched.
+        # The approved review master already contains the validated title design,
+        # so never mutate the editable picture with this unsafe call.
+        # Resolve 21 公开 API 无法指定 Text+ 目标轨；实测会插入 V1 并造成音画错位。
+        self.logger.warning(
+            "Skipping unsafe Resolve Text+ insertion; validated graphics are carried "
+            "by the approved review master, preventing picture/audio ripple drift."
+        )
+        return []
+        insert_title = getattr(self.timeline, "InsertFusionTitleIntoTimeline", None)
+        set_timecode = getattr(self.timeline, "SetCurrentTimecode", None)
+        if not callable(insert_title) or not callable(set_timecode):
+            self.logger.warning(
+                "当前 Resolve API 不支持自动插入 Text+；预览成片仍会渲染字卡 / "
+                "This Resolve API build cannot insert Text+; review graphics remain available"
+            )
+            return []
+        try:
+            video_tracks = int(self.timeline.GetTrackCount("video") or 0)
+        except Exception:
+            video_tracks = 0
+        add_track = getattr(self.timeline, "AddTrack", None)
+        if video_tracks < 2 and callable(add_track):
+            try:
+                add_track("video", {"index": 2})
+            except TypeError:
+                add_track("video")
+        try:
+            start_timecode = str(self.timeline.GetStartTimecode() or "01:00:00:00")
+        except Exception:
+            start_timecode = "01:00:00:00"
+
+        inserted: List[Any] = []
+        for index, raw in enumerate(items, start=1):
+            if not isinstance(raw, dict):
+                continue
+            text = " ".join(str(raw.get("text") or "").split())
+            if not text:
+                continue
+            try:
+                timeline_in = max(0.0, float(raw.get("timeline_in_sec", 0)))
+                timeline_out = max(
+                    timeline_in + 0.8,
+                    float(raw.get("timeline_out_sec", timeline_in + 2.5)),
+                )
+            except (TypeError, ValueError):
+                continue
+            timecode = self._offset_timecode(start_timecode, fps, timeline_in)
+            if set_timecode(timecode) is False:
+                self.logger.warning(
+                    "无法定位字卡 %s 到 %s / Could not seek graphic %s to %s",
+                    text, timecode, text, timecode,
+                )
+                continue
+            try:
+                title_item = insert_title("Text+")
+            except Exception as exc:
+                self.logger.warning(
+                    "插入 Text+ 失败：%s / Text+ insertion failed: %s", exc, exc
+                )
+                continue
+            if not title_item:
+                self.logger.warning(
+                    "Resolve 未返回 Text+ 条目：%s / Resolve returned no Text+ item", text
+                )
+                continue
+            inserted.append(title_item)
+            combined = text
+            subtitle = " ".join(str(raw.get("subtitle") or "").split())
+            if subtitle:
+                combined += "\n" + subtitle
+            set_name = getattr(title_item, "SetName", None)
+            if callable(set_name):
+                set_name(str(raw.get("graphic_id") or f"AI Graphic {index}"))
+            set_property = getattr(title_item, "SetProperty", None)
+            if callable(set_property):
+                duration_frames = max(
+                    1,
+                    int(
+                        (Decimal(str(timeline_out - timeline_in)) * fps).to_integral_value(
+                            rounding=ROUND_CEILING
+                        )
+                    ),
+                )
+                try:
+                    set_property("Duration", duration_frames)
+                except Exception:
+                    pass
+            comp = None
+            get_comp = getattr(title_item, "GetFusionCompByIndex", None)
+            if callable(get_comp):
+                try:
+                    comp = get_comp(1)
+                except Exception:
+                    comp = None
+            if comp is None:
+                self.logger.warning(
+                    "Text+ 没有可编辑 Fusion 合成：%s / Text+ has no editable Fusion comp", text
+                )
+                continue
+            try:
+                tools = comp.GetToolList(False, "TextPlus")
+            except Exception:
+                try:
+                    tools = comp.GetToolList()
+                except Exception:
+                    tools = {}
+            candidates = list(tools.values()) if isinstance(tools, dict) else list(tools or [])
+            text_tool = next(
+                (tool for tool in candidates if callable(getattr(tool, "SetInput", None))),
+                None,
+            )
+            if text_tool is None:
+                self.logger.warning(
+                    "无法找到 Text+ 文本工具：%s / Could not find Text+ text tool", text
+                )
+                continue
+            style = str(raw.get("style") or "minimal").casefold()
+            size = 0.085 if str(raw.get("kind") or "") in {"title_card", "end_card"} else 0.055
+            try:
+                text_tool.SetInput("StyledText", combined)
+                text_tool.SetInput("Font", "Segoe UI")
+                text_tool.SetInput("Style", "Bold" if style in {"bold_cinematic", "kinetic"} else "Regular")
+                text_tool.SetInput("Size", size)
+            except Exception as exc:
+                self.logger.warning(
+                    "Text+ 文本设置不完整：%s / Text+ controls were only partially applied: %s",
+                    exc, exc,
+                )
+        if inserted:
+            try:
+                track_count = int(self.timeline.GetTrackCount("video") or 0)
+                if track_count >= 2:
+                    self.timeline.SetTrackName("video", 2, "AI Graphics / AI 字卡")
+            except Exception:
+                pass
+            self.logger.info(
+                "已插入 %d 个可编辑 Text+ 字卡 / Inserted %d editable Text+ graphics",
+                len(inserted), len(inserted),
+            )
+        return inserted
+
+    def create_reviewed_delivery_timeline(self, preview_path: Path) -> Any:
+        """
+        Create a flattened Resolve delivery timeline from the approved rough cut.
+        从已通过盲审的低清成片创建 Resolve 最终交付时间线。
+
+        The source-by-source editable assembly remains in the project. The delivery
+        timeline uses the exact reviewed picture, typography, color and mixed audio,
+        preventing Resolve-only title ripple and color-pipeline drift after approval.
+
+        Parameters / 参数:
+            preview_path: Approved preview containing picture and mixed audio. /
+                已通过盲审、同时包含画面与混合音频的预览母版。
+        Returns / 返回:
+            Newly activated Resolve delivery timeline. / 新建并激活的交付时间线。
+        """
+        preview = Path(preview_path).expanduser().resolve()
+        if not preview.is_file():
+            raise ResolveExecutorError(f"Approved preview master not found: {preview}")
+        imported = self._import_media(preview)
+        media_item = imported[0] if len(imported) == 1 else None
+        if media_item is None:
+            matches = self._items_for_path(preview)
+            if len(matches) != 1:
+                raise ResolveExecutorError(
+                    f"Could not uniquely import approved preview master: {preview}"
+                )
+            media_item = matches[0]
+        set_property = getattr(media_item, "SetClipProperty", None)
+        if callable(set_property):
+            for key, value in (
+                ("Input Color Space", "Rec.709/Gamma 2.4"),
+                ("Input Gamma", "Gamma 2.4"),
+            ):
+                try:
+                    set_property(key, value)
+                except Exception:
+                    pass
+        existing_names = {
+            self._safe_name(self.project.GetTimelineByIndex(index), "")
+            for index in range(
+                1, self._safe_int_call(self.project, "GetTimelineCount") + 1
+            )
+        }
+        delivery_name = self._unique_name(
+            f"{self.timeline_name} Reviewed Master", existing_names
+        )
+        creator = getattr(self.media_pool, "CreateTimelineFromClips", None)
+        if not callable(creator):
+            raise ResolveExecutorError(
+                "This Resolve API cannot create the reviewed delivery timeline."
+            )
+        try:
+            delivery = creator(delivery_name, [media_item])
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"Could not create reviewed delivery timeline: {exc}"
+            ) from exc
+        if delivery is None:
+            raise ResolveExecutorError("Resolve returned no reviewed delivery timeline.")
+        try:
+            activated = self.project.SetCurrentTimeline(delivery)
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"Could not activate reviewed delivery timeline: {exc}"
+            ) from exc
+        if activated is False:
+            raise ResolveExecutorError(
+                "Resolve refused to activate the reviewed delivery timeline."
+            )
+        self.timeline = delivery
+        self.logger.info(
+            "Created reviewed Resolve delivery timeline '%s' from %s; the editable "
+            "source assembly remains preserved in the same project.",
+            delivery_name,
+            preview,
+        )
+        return delivery
+
+    def append_program_audio(
+        self,
+        fps: Decimal,
+        prepared: Sequence[Tuple[ClipDecision, Dict[str, Any]]],
+    ) -> Sequence[Any]:
+        """
+        Append the exact pre-conformed source-audio WAV to audio track 1.
+        将与画面剪点完全一致的预混原声 WAV 追加到音轨 1。
+
+        Parameters / 参数:
+            fps: Active timeline frame rate. / 当前时间线帧率。
+            prepared: Picture edits defining the frame-quantized program length. /
+                定义逐段帧舍入后成片时长的画面剪辑。
+        """
+        bed_text = str(self.audio_program.get("bed_file") or "").strip()
+        if not bed_text:
+            return []
+        return self._append_preconformed_audio(
+            Path(bed_text).expanduser().resolve(),
+            track_index=1,
+            fps=fps,
+            prepared=prepared,
+            label_cn="现场声",
+            label_en="production audio",
+        )
+
+    def _append_preconformed_audio(
+        self,
+        path: Path,
+        track_index: int,
+        fps: Decimal,
+        prepared: Sequence[Tuple[ClipDecision, Dict[str, Any]]],
+        label_cn: str,
+        label_en: str,
+    ) -> Sequence[Any]:
+        """
+        Import one non-looping WAV and align it to the timeline start frame.
+        导入一条禁止循环的 WAV，并对齐时间线起始帧。
+
+        Parameters / 参数:
+            path: Pre-conformed audio path. / 预混音频路径。
+            track_index: One-based Resolve audio track index. / Resolve 从 1 开始的音轨索引。
+            fps/prepared: Timeline rate and picture decisions. / 时间线帧率与画面决策。
+            label_cn/label_en: Bilingual log labels. / 双语日志标签。
+        """
+        if not path.is_file():
+            raise ResolveExecutorError(f"找不到{label_cn} / {label_en} not found: {path}")
+        imported = self._import_media(path)
+        if len(imported) == 1:
+            media_item = imported[0]
+        else:
+            matches = self._items_for_path(path)
+            if len(matches) != 1:
+                raise ResolveExecutorError(
+                    f"无法唯一导入{label_cn} / Could not uniquely import {label_en}: {path}"
+                )
+            media_item = matches[0]
+        program_frames = sum(
+            max(
+                1,
+                int(
+                    ((decision.cut_out_sec - decision.cut_in_sec) * fps).to_integral_value(
+                        rounding=ROUND_CEILING
+                    )
+                ),
+            )
+            for decision, _ in prepared
+        )
+        audio_seconds = self._probe_media_duration(path)
+        if audio_seconds <= 0:
+            raise ResolveExecutorError(f"无法读取{label_cn}时长 / Could not read {label_en} duration: {path}")
+        audio_frames = max(
+            1,
+            int(
+                (Decimal(str(audio_seconds)) * fps).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            ),
+        )
+        allowed_shortfall = max(2, len(prepared) + 1)
+        if audio_frames + allowed_shortfall < program_frames:
+            raise ResolveExecutorError(
+                f"{label_cn}短于最终时间线 / Pre-conformed {label_en} is shorter than the program."
+            )
+        try:
+            audio_tracks = int(self.timeline.GetTrackCount("audio") or 0)
+        except Exception:
+            audio_tracks = 0
+        add_track = getattr(self.timeline, "AddTrack", None)
+        while audio_tracks < track_index and callable(add_track):
+            if add_track("audio", "stereo") is False:
+                break
+            audio_tracks += 1
+        if audio_tracks < track_index:
+            raise ResolveExecutorError(
+                f"无法创建音轨 {track_index} / Could not create audio track {track_index}."
+            )
+        try:
+            record_frame = int(self.timeline.GetStartFrame() or 0)
+        except Exception:
+            record_frame = 0
+        segment_frames = min(audio_frames, program_frames)
+        clip_info = {
+            "mediaPoolItem": media_item,
+            "startFrame": 0,
+            "endFrame": segment_frames - 1,
+            "mediaType": 2,
+            "trackIndex": track_index,
+            "recordFrame": record_frame,
+        }
+        result = self.media_pool.AppendToTimeline([clip_info])
+        items = self._coerce_items(result)
+        if result is None or result is False or (not items and result is not True):
+            raise ResolveExecutorError(
+                f"Resolve 无法把{label_cn}追加到音轨 {track_index} / "
+                f"Could not append {label_en} to audio track {track_index}."
+            )
+        self.logger.info(
+            "已导入预混%s：%s（音轨 %d）/ Pre-conformed %s added on audio track %d",
+            label_cn,
+            path.name,
+            track_index,
+            label_en,
+            track_index,
+        )
+        return items
+
     def append_music_bed(
         self,
         fps: Decimal,
@@ -1266,7 +1752,11 @@ class DaVinciExecutor:
         并由 ``review_renderer`` 精确生成到可观看预览中。
         """
         voice_isolation = getattr(timeline_item, "SetVoiceIsolationState", None)
-        if decision.audio_cleanup != "none" and callable(voice_isolation):
+        if (
+            not str(self.audio_program.get("bed_file") or "").strip()
+            and decision.audio_cleanup != "none"
+            and callable(voice_isolation)
+        ):
             amount = 75.0 if decision.audio_cleanup == "strong" else 45.0
             try:
                 applied = voice_isolation({"isEnabled": True, "amount": amount})
@@ -1301,7 +1791,10 @@ class DaVinciExecutor:
                     exc,
                 )
 
-        if decision.volume_db != 0:
+        if (
+            not str(self.audio_program.get("bed_file") or "").strip()
+            and decision.volume_db != 0
+        ):
             self._apply_native_clip_volume(timeline_item, decision)
 
         color_values = {
@@ -1346,6 +1839,48 @@ class DaVinciExecutor:
                 except (IndexError, TypeError, ValueError):
                     self.logger.warning(
                         "忽略无效曝光/白平衡匹配 clip_id=%r / Invalid color match ignored",
+                        decision.clip_id,
+                    )
+            creative = decision.creative_grade or {}
+            if isinstance(creative, dict) and creative:
+                try:
+                    exposure_multiplier = 2.0 ** max(
+                        -0.5, min(0.5, float(creative.get("exposure_ev", 0)))
+                    )
+                    warmth = max(-1.0, min(1.0, float(creative.get("warmth", 0))))
+                    contrast = max(0.8, min(1.35, float(creative.get("contrast", 1))))
+                    saturation = max(0.65, min(1.35, float(creative.get("saturation", 1))))
+                    palette = str(creative.get("palette") or "natural").casefold()
+                    palette_gains = {
+                        "natural": (1.0, 1.0, 1.0),
+                        "teal_amber": (1.01, 1.0, 1.018),
+                        "cool_moonlight": (0.975, 1.0, 1.045),
+                        "warm_memory": (1.045, 1.0, 0.965),
+                        "desaturated_grit": (0.995, 1.0, 1.008),
+                        "neon_night": (1.018, 0.995, 1.04),
+                    }.get(palette, (1.0, 1.0, 1.0))
+                    slopes = [float(value) for value in str(cdl["Slope"]).split()]
+                    warmth_gains = [1.0 + 0.06 * warmth, 1.0, 1.0 - 0.06 * warmth]
+                    slopes = [
+                        max(
+                            0.25,
+                            min(
+                                4.0,
+                                slopes[index] * exposure_multiplier
+                                * warmth_gains[index] * palette_gains[index],
+                            ),
+                        )
+                        for index in range(3)
+                    ]
+                    cdl["Slope"] = " ".join(f"{value:.6f}" for value in slopes)
+                    cdl["Power"] = " ".join(
+                        f"{(1.0 / contrast):.6f}" for _ in range(3)
+                    )
+                    base_saturation = float(cdl.get("Saturation", "1"))
+                    cdl["Saturation"] = f"{max(0.5, min(2.0, base_saturation * saturation)):.6f}"
+                except (IndexError, TypeError, ValueError):
+                    self.logger.warning(
+                        "忽略无效导演创意调色 clip_id=%r / Invalid creative grade ignored",
                         decision.clip_id,
                     )
             try:
@@ -1403,6 +1938,7 @@ class DaVinciExecutor:
                 ),
                 "audio_cleanup": decision.audio_cleanup,
                 "color_look": decision.color_look,
+                "creative_grade": decision.creative_grade or {},
                 "motion": decision.motion,
                 "volume_db": self._decimal_text(decision.volume_db),
                 "drx_preset": decision.drx_preset,
@@ -2003,6 +2539,52 @@ class DaVinciExecutor:
         except Exception:
             return None
 
+    def _wait_for_scriptapp(
+        self,
+        module: Any,
+        launched_process: Optional[subprocess.Popen],
+    ) -> Any:
+        """
+        Poll Resolve's scripting bridge for one bounded startup attempt.
+        在一次有界启动尝试中轮询 Resolve 脚本桥接。
+
+        Parameters / 参数:
+            module: Imported ``DaVinciResolveScript`` module. / 已导入的脚本模块。
+            launched_process: Process owned by this executor, when applicable. /
+                若由本执行器启动，则为对应进程。
+        """
+        deadline = time.monotonic() + self.startup_timeout
+        resolve = self._try_scriptapp(module)
+        while resolve is None and time.monotonic() < deadline:
+            if launched_process is not None and launched_process.poll() is not None:
+                raise ResolveExecutorError(
+                    "Resolve 启动后提前退出。请手动打开 Resolve 检查启动报错。"
+                    " / Resolve exited during startup; open it manually to "
+                    "inspect the startup error."
+                )
+            time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
+            resolve = self._try_scriptapp(module)
+        return resolve
+
+    @staticmethod
+    def _stop_auto_started_resolve(process: subprocess.Popen) -> None:
+        """
+        Stop only a Resolve process owned by the current executor.
+        仅停止由当前执行器启动并持有的 Resolve 进程。
+        """
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+        except OSError as exc:
+            raise ResolveExecutorError(
+                f"无法重启自动启动的 Resolve / Could not restart auto-started Resolve: {exc}"
+            ) from exc
+
     @staticmethod
     def _launch_resolve(executable: Path) -> subprocess.Popen:
         """
@@ -2284,6 +2866,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--render-timeout", type=float, default=86400.0)
     parser.add_argument(
+        "--approved-preview",
+        help=(
+            "Blind-review-approved preview used as the final Resolve delivery master; "
+            "the editable source assembly is preserved on a separate timeline."
+        ),
+    )
+    parser.add_argument(
         "--macro-profile",
         help="Guarded PyAutoGUI profile for an API-unavailable post action.",
     )
@@ -2298,6 +2887,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=120.0,
         help="Seconds to wait for Resolve's scripting API after launch.",
+    )
+    parser.add_argument(
+        "--resolve-startup-attempts",
+        type=int,
+        default=3,
+        help="Bounded Resolve auto-start attempts, including the first launch.",
     )
     parser.add_argument(
         "--log-level",
@@ -2320,6 +2915,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             strict_fps=args.strict_fps,
             auto_start_resolve=not args.no_auto_start_resolve,
             startup_timeout=args.resolve_startup_timeout,
+            startup_attempts=args.resolve_startup_attempts,
             drx_root=args.drx_root,
             fairlight_preset=args.fairlight_preset,
             render_enabled=args.render,
@@ -2327,6 +2923,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             render_name=args.render_name,
             render_preset=args.render_preset,
             render_timeout=args.render_timeout,
+            approved_preview=args.approved_preview,
             macro_profile=args.macro_profile,
             macro_action=args.macro_action,
             logger=logger,

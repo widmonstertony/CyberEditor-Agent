@@ -154,6 +154,87 @@ class ResolveExecutorTests(unittest.TestCase):
         executor = DaVinciExecutor("timeline_cuts.json")
         self.assertEqual(executor._media_fps(NativeFpsItem()), Decimal("50"))
 
+    def test_graphics_plan_inserts_editable_text_plus(self):
+        class TextTool:
+            def __init__(self):
+                self.inputs = {}
+
+            def SetInput(self, key, value):
+                self.inputs[key] = value
+                return True
+
+        class FusionComp:
+            def __init__(self, tool):
+                self.tool = tool
+
+            def GetToolList(self, *_args):
+                return {"Text1": self.tool}
+
+        class TitleItem:
+            def __init__(self, tool):
+                self.tool = tool
+                self.name = ""
+                self.properties = {}
+
+            def SetName(self, name):
+                self.name = name
+                return True
+
+            def SetProperty(self, key, value):
+                self.properties[key] = value
+                return True
+
+            def GetFusionCompByIndex(self, _index):
+                return FusionComp(self.tool)
+
+        class GraphicsTimeline:
+            def __init__(self):
+                self.tool = TextTool()
+                self.title = TitleItem(self.tool)
+                self.timecodes = []
+                self.track_name = ""
+
+            def GetTrackCount(self, _kind):
+                return 1
+
+            def AddTrack(self, *_args):
+                return True
+
+            def GetStartTimecode(self):
+                return "01:00:00:00"
+
+            def SetCurrentTimecode(self, value):
+                self.timecodes.append(value)
+                return True
+
+            def InsertFusionTitleIntoTimeline(self, name):
+                self.inserted_name = name
+                return self.title
+
+            def SetTrackName(self, _kind, _index, value):
+                self.track_name = value
+                return True
+
+        timeline = GraphicsTimeline()
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.timeline = timeline
+        executor.graphics_plan = {
+            "items": [
+                {
+                    "graphic_id": "G1", "kind": "title_card",
+                    "timeline_in_sec": 2, "timeline_out_sec": 5,
+                    "text": "NIGHT SHIFT", "subtitle": "Ready is a ritual",
+                    "style": "bold_cinematic",
+                }
+            ]
+        }
+
+        inserted = executor.append_graphics_titles(Decimal("59.94006"))
+
+        self.assertEqual(inserted, [])
+        self.assertFalse(hasattr(timeline, "inserted_name"))
+        self.assertEqual(timeline.timecodes, [])
+
     def test_transient_untitled_project_is_replaced_with_named_project(self):
         transient = FakeProject()
         transient.name = "Untitled Project"
@@ -253,6 +334,18 @@ class ResolveExecutorTests(unittest.TestCase):
         timeline = executor.ensure_timeline()
 
         self.assertEqual(timeline.GetName(), "CyberEditor Timeline")
+
+    def test_existing_current_timeline_is_preserved_and_new_name_is_unique(self):
+        project = FakeProject()
+        project.timeline = FakeTimeline("CyberEditor Timeline", project.fps)
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.project = project
+        executor.media_pool = project.media_pool
+
+        timeline = executor.ensure_timeline()
+
+        self.assertEqual(timeline.GetName(), "CyberEditor Timeline (2)")
+        self.assertIs(project.GetCurrentTimeline(), timeline)
 
     def test_per_source_slog2_input_transform_is_applied(self):
         class MediaItem:
@@ -444,6 +537,37 @@ class ResolveExecutorTests(unittest.TestCase):
         self.assertEqual(item.properties["ZoomX"], 1.04)
         self.assertEqual(item.cdl["NodeIndex"], "1")
         self.assertIn("cross_dissolve", item.marker[-1])
+
+    def test_director_creative_grade_modifies_resolve_cdl(self):
+        class TimelineItem:
+            def __init__(self):
+                self.cdl = None
+
+            def SetCDL(self, value):
+                self.cdl = value
+                return True
+
+        item = TimelineItem()
+        decision = ClipDecision(
+            1,
+            "source.mp4",
+            Decimal("0"),
+            Decimal("3"),
+            "Payoff",
+            color_look="neutral",
+            creative_grade={
+                "palette": "warm_memory", "exposure_ev": 0.2,
+                "contrast": 1.12, "saturation": 1.08, "warmth": 0.3,
+            },
+        )
+
+        DaVinciExecutor("timeline_cuts.json").apply_clip_effects(item, decision)
+
+        self.assertIsNotNone(item.cdl)
+        red, _, blue = [float(value) for value in item.cdl["Slope"].split()]
+        self.assertGreater(red, blue)
+        self.assertAlmostEqual(float(item.cdl["Saturation"]), 1.02 * 1.08, places=4)
+        self.assertLess(float(item.cdl["Power"].split()[0]), 1.0)
 
     def test_native_ai_apis_and_drx_are_applied(self):
         class Graph:
@@ -696,6 +820,167 @@ class ResolveExecutorTests(unittest.TestCase):
 
             self.assertIs(result, expected)
             launch.assert_called_once_with(executable)
+
+    def test_connect_restarts_only_the_auto_started_process_when_script_server_dies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = root / "timeline_cuts.json"
+            plan.write_text("{}", encoding="utf-8")
+            executable = root / "Resolve.exe"
+            executable.touch()
+            expected = FakeResolve(FakeProject())
+            module = mock.Mock()
+            module.scriptapp.return_value = None
+            first_process = mock.Mock()
+            second_process = mock.Mock()
+            executor = DaVinciExecutor(
+                json_path=plan,
+                startup_timeout=5,
+                logger=logging.getLogger("test.resolve.restart"),
+            )
+
+            with (
+                mock.patch("src.resolve_executor.platform.system", return_value="Windows"),
+                mock.patch(
+                    "src.resolve_executor.get_resolve_registration",
+                    return_value={"installed": True, "version": "21"},
+                ),
+                mock.patch(
+                    "src.resolve_executor.find_resolve_executable",
+                    return_value=executable,
+                ),
+                mock.patch.object(executor, "_configure_resolve_library"),
+                mock.patch.object(
+                    executor,
+                    "_load_resolve_module",
+                    return_value=(module, [], []),
+                ),
+                mock.patch.object(executor, "_is_resolve_running", return_value=False),
+                mock.patch.object(
+                    executor,
+                    "_launch_resolve",
+                    side_effect=[first_process, second_process],
+                ) as launch,
+                mock.patch.object(
+                    executor,
+                    "_wait_for_scriptapp",
+                    side_effect=[None, expected],
+                ) as wait_for_api,
+                mock.patch.object(executor, "_stop_auto_started_resolve") as stop,
+                mock.patch("src.resolve_executor.time.sleep"),
+            ):
+                result = executor.connect()
+
+            self.assertIs(result, expected)
+            self.assertEqual(launch.call_count, 2)
+            stop.assert_called_once_with(first_process)
+            self.assertEqual(
+                wait_for_api.call_args_list,
+                [mock.call(module, first_process), mock.call(module, second_process)],
+            )
+
+    def test_connect_recovers_when_script_server_needs_two_restarts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = root / "timeline_cuts.json"
+            plan.write_text("{}", encoding="utf-8")
+            executable = root / "Resolve.exe"
+            executable.touch()
+            expected = FakeResolve(FakeProject())
+            module = mock.Mock()
+            module.scriptapp.return_value = None
+            processes = [mock.Mock(), mock.Mock(), mock.Mock()]
+            executor = DaVinciExecutor(
+                json_path=plan,
+                startup_timeout=5,
+                startup_attempts=3,
+                logger=logging.getLogger("test.resolve.multi_restart"),
+            )
+
+            with (
+                mock.patch("src.resolve_executor.platform.system", return_value="Windows"),
+                mock.patch(
+                    "src.resolve_executor.get_resolve_registration",
+                    return_value={"installed": True, "version": "21"},
+                ),
+                mock.patch(
+                    "src.resolve_executor.find_resolve_executable",
+                    return_value=executable,
+                ),
+                mock.patch.object(executor, "_configure_resolve_library"),
+                mock.patch.object(
+                    executor,
+                    "_load_resolve_module",
+                    return_value=(module, [], []),
+                ),
+                mock.patch.object(executor, "_is_resolve_running", return_value=False),
+                mock.patch.object(
+                    executor,
+                    "_launch_resolve",
+                    side_effect=processes,
+                ) as launch,
+                mock.patch.object(
+                    executor,
+                    "_wait_for_scriptapp",
+                    side_effect=[None, None, expected],
+                ) as wait_for_api,
+                mock.patch.object(executor, "_stop_auto_started_resolve") as stop,
+                mock.patch("src.resolve_executor.time.sleep"),
+            ):
+                result = executor.connect()
+
+            self.assertIs(result, expected)
+            self.assertEqual(launch.call_count, 3)
+            self.assertEqual(
+                stop.call_args_list,
+                [mock.call(processes[0]), mock.call(processes[1])],
+            )
+            self.assertEqual(
+                wait_for_api.call_args_list,
+                [
+                    mock.call(module, processes[0]),
+                    mock.call(module, processes[1]),
+                    mock.call(module, processes[2]),
+                ],
+            )
+
+    def test_preconformed_program_audio_makes_picture_video_only_and_uses_a1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            program = root / "program_audio.wav"
+            source.write_bytes(b"video")
+            program.write_bytes(b"audio")
+            executor = DaVinciExecutor(root / "timeline_cuts.json")
+            executor.audio_program = {"bed_file": str(program)}
+
+            class Item:
+                def GetClipProperty(self, name=None):
+                    values = {"FPS": "25", "File Path": str(source), "Clip Name": source.name}
+                    return values if name is None else values.get(name, "")
+
+            executor.media_pool = mock.Mock()
+            executor.timeline = mock.Mock()
+            executor.timeline.GetTrackCount.return_value = 1
+            executor.timeline.GetStartFrame.return_value = 0
+            executor.media_pool.AppendToTimeline.return_value = [object()]
+            decision = ClipDecision(1, str(source), Decimal("0"), Decimal("2"), "test")
+            with (
+                mock.patch.object(executor, "_index_media_pool", return_value=[]),
+                mock.patch.object(executor, "_resolve_media", return_value=(Item(), [])),
+                mock.patch.object(executor, "_configure_media_input_transform"),
+                mock.patch.object(executor, "_probe_media_duration", side_effect=[2.0, 2.0]),
+                mock.patch.object(executor, "_import_media", return_value=[object()]),
+            ):
+                prepared = executor.prepare_clips([decision], Decimal("25"))
+                appended = executor.append_program_audio(Decimal("25"), prepared)
+
+            self.assertEqual(prepared[0][1]["mediaType"], 1)
+            self.assertEqual(len(appended), 1)
+            audio_info = executor.media_pool.AppendToTimeline.call_args.args[0][0]
+            self.assertEqual(audio_info["mediaType"], 2)
+            self.assertEqual(audio_info["trackIndex"], 1)
+            self.assertEqual(audio_info["recordFrame"], 0)
 
 
 if __name__ == "__main__":

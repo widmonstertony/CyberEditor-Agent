@@ -19,8 +19,10 @@ from datetime import datetime, timezone
 import gc
 import json
 import logging
+import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -76,9 +78,9 @@ class MediaExtractor:
         device: str = "auto",
         language: Optional[str] = None,
         scene_threshold: float = 0.28,
-        sample_interval_sec: float = 2.0,
-        min_keyframe_gap_sec: float = 5.0,
-        max_keyframes: int = 240,
+        sample_interval_sec: float = 1.0,
+        min_keyframe_gap_sec: float = 1.0,
+        max_keyframes: int = 7200,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         """Initialize extraction policy without loading a model. / 初始化提取策略，但不加载模型。"""
@@ -175,7 +177,6 @@ class MediaExtractor:
             )
             transcription = {"language": None, "segments": []}
         segments = transcription["segments"]
-        self.write_srt(segments, srt_destination)
         self.logger.info(
             "Whisper 已卸载并清理缓存；开始 CPU 抽帧 / Whisper unloaded and cache cleared; starting CPU keyframes"
         )
@@ -212,10 +213,12 @@ class MediaExtractor:
         color_analysis["analysis_domain"] = (
             "encoded_log" if bool(source_color.get("is_log")) else "display_referred"
         )
-        duration = max(
-            float(video_metadata.get("duration_sec", 0.0)),
-            max((float(item["end_sec"]) for item in segments), default=0.0),
-        )
+        # Encoded media duration is authoritative. Whisper occasionally emits
+        # a final hallucinated segment beyond EOF; extending the asset duration
+        # to that text made downstream Resolve cuts request nonexistent frames.
+        duration = float(video_metadata.get("duration_sec", 0.0))
+        segments = self._clamp_segments_to_duration(segments, duration)
+        self.write_srt(segments, srt_destination)
 
         proxy_value = proxy_file_name or source.name
         payload: Dict[str, Any] = {
@@ -229,6 +232,14 @@ class MediaExtractor:
             "video": video_metadata,
             "source_color": source_color,
             "color_analysis": color_analysis,
+            "visual_sampling": {
+                "mode": "continuous_temporal_coverage",
+                "requested_interval_sec": self.sample_interval_sec,
+                "effective_min_gap_sec": self.min_keyframe_gap_sec,
+                "hard_cap": self.max_keyframes,
+                "saved_frame_count": len(keyframes),
+                "complete_source_span": True,
+            },
             "transcript": segments,
             "keyframes": keyframes,
         }
@@ -365,6 +376,12 @@ class MediaExtractor:
             effective_min_gap = max(
                 self.min_keyframe_gap_sec, coverage_gap
             )
+            # Full-coverage mode saves every configured temporal sample.  The
+            # hard cap only increases the interval for exceptionally long
+            # sources; a one-hour film at the default 1 fps stores every second.
+            # 完整覆盖模式保存每个时间采样；仅当超长素材触及硬上限时才自动放宽间隔。
+            # 默认 1 fps 时，一小时素材的每一秒都会留下视觉证据。
+            temporal_sampling_interval = effective_min_gap
 
             while timestamp <= duration and len(keyframes) < self.max_keyframes:
                 capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
@@ -382,15 +399,10 @@ class MediaExtractor:
                     else float(cv2.mean(cv2.absdiff(gray, previous_gray))[0])
                     / 255.0
                 )
-                # Scene changes capture visual events; a periodic 30-second
-                # floor also guarantees coverage of static interviews and
-                # long takes whose pixels do not change enough to cross the
-                # threshold. The director later selects a bounded, evenly
-                # distributed subset for each 10–15 minute request.
+                # Periodic samples provide complete temporal coverage; scene
+                # changes may add an earlier frame but never replace coverage.
                 since_last = timestamp - last_saved_at
-                periodic_due = since_last >= max(
-                    30.0, effective_min_gap
-                )
+                periodic_due = since_last >= temporal_sampling_interval
                 should_save = (
                     previous_gray is None
                     or periodic_due
@@ -561,20 +573,83 @@ class MediaExtractor:
             text = " ".join(str(segment.get("text", "")).split())
             if end <= start or not text:
                 continue
-            normalized.append(
-                {
-                    "id": int(segment.get("id", index)),
-                    "start_sec": round(start, 3),
-                    "end_sec": round(end, 3),
-                    "text": text,
-                }
+            duration = end - start
+            speech_units = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", text))
+            avg_logprob = segment.get("avg_logprob")
+            no_speech_prob = segment.get("no_speech_prob")
+            try:
+                avg_logprob_value = float(avg_logprob)
+            except (TypeError, ValueError):
+                avg_logprob_value = None
+            try:
+                no_speech_value = float(no_speech_prob)
+            except (TypeError, ValueError):
+                no_speech_value = None
+            # Whisper occasionally stretches a tiny hallucinated phrase across
+            # a long silent region. Such a range later makes the editor preserve
+            # silence as dialogue and ducks the score for many seconds.
+            # Whisper 偶尔会把极短幻听横跨很长静音；这会误导导演保留整段并压低配乐。
+            implausibly_sparse = (
+                (duration >= 8.0 and speech_units <= 4)
+                or (duration >= 10.0 and speech_units / max(duration, 0.001) < 0.45)
             )
+            low_confidence_silence = (
+                no_speech_value is not None
+                and avg_logprob_value is not None
+                and no_speech_value >= 0.80
+                and avg_logprob_value <= -0.50
+            )
+            if implausibly_sparse or low_confidence_silence:
+                continue
+            item: Dict[str, Any] = {
+                "id": int(segment.get("id", index)),
+                "start_sec": round(start, 3),
+                "end_sec": round(end, 3),
+                "text": text,
+            }
+            for key in ("avg_logprob", "no_speech_prob", "compression_ratio"):
+                value = segment.get(key)
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric):
+                    item[key] = round(numeric, 6)
+            normalized.append(item)
         if not normalized:
             raise ExtractionError(
                 "Whisper 没有生成有效台词。请检查音轨、语言或模型。"
                 " / Whisper produced no valid speech segments."
             )
         return normalized
+
+    @staticmethod
+    def _clamp_segments_to_duration(
+        segments: Sequence[Dict[str, Any]], duration_sec: float
+    ) -> List[Dict[str, Any]]:
+        """
+        Clamp Whisper timestamps to encoded media EOF and discard empty tails.
+        将 Whisper 时间戳限制在媒体真实结尾，并丢弃完全越界的幻觉尾句。
+
+        Parameters / 参数:
+            segments: Normalized Whisper segments. / 已规范化的字幕片段。
+            duration_sec: Authoritative encoded duration. / 编码媒体的真实时长。
+        """
+        if not math.isfinite(duration_sec) or duration_sec <= 0:
+            raise ExtractionError(
+                "媒体真实时长无效，无法校准字幕 / Invalid media duration for transcript clamping."
+            )
+        clamped: List[Dict[str, Any]] = []
+        for raw in segments:
+            start = max(0.0, float(raw.get("start_sec", 0.0)))
+            end = min(duration_sec, float(raw.get("end_sec", start)))
+            if start >= duration_sec or end - start < 0.05:
+                continue
+            item = dict(raw)
+            item["start_sec"] = round(start, 3)
+            item["end_sec"] = round(end, 3)
+            clamped.append(item)
+        return clamped
 
     @staticmethod
     def _write_jpeg_unicode_safe(
@@ -639,9 +714,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--language")
     parser.add_argument("--scene-threshold", type=float, default=0.28)
-    parser.add_argument("--sample-interval", type=float, default=2.0)
-    parser.add_argument("--min-keyframe-gap", type=float, default=5.0)
-    parser.add_argument("--max-keyframes", type=int, default=240)
+    parser.add_argument("--sample-interval", type=float, default=1.0)
+    parser.add_argument("--min-keyframe-gap", type=float, default=1.0)
+    parser.add_argument("--max-keyframes", type=int, default=7200)
     parser.add_argument(
         "--log-level",
         default="INFO",

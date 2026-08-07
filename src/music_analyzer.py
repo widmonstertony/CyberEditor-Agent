@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import gc
 import hashlib
 import json
 import logging
@@ -120,16 +121,163 @@ class MusicCandidateAcquirer:
         instrumental_only = (
             str(brief.get("vocal_policy") or "").casefold() == "instrumental_only"
         )
+        emotion_arc = " ".join(str(brief.get("emotion_arc") or "").split())
+        arc_text = emotion_arc.casefold()
+        needs_build = any(
+            token in arc_text
+            for token in (
+                "build", "rise", "rising", "crescendo", "swell", "peak",
+                "上升", "渐强", "推进", "高潮", "递进",
+            )
+        )
         for query in queries:
+            # Discovery engines work best with compact genre, mood, and usage
+            # terms. Exact BPM and the director's prose arc belong in ranking;
+            # appending them here can make a healthy search return no entries.
+            query = " ".join(query.split()[:14])
             if instrumental_only and not any(
                 token in query.casefold() for token in ("instrumental", "纯音乐", "no vocal")
             ):
-                query = f"{query} instrumental background music no vocals"
+                query = f"{query} instrumental no vocals"
+            if needs_build and "build" not in query.casefold():
+                query = f"{query} gradual build"
+            if len(query) > 110:
+                query = query[:110].rsplit(" ", 1)[0]
             key = query.casefold()
             if key not in seen:
                 seen.add(key)
                 result.append(query)
+        mood = " ".join(str(brief.get("mood") or "").split()[:6])
+        broad = (
+            f"{mood} cinematic instrumental"
+            if mood
+            else "cinematic documentary instrumental"
+        )
+        if broad.casefold() not in seen:
+            result.append(broad)
         return result[:6]
+
+    def _audited_cache_track_count(self) -> int:
+        """
+        Count reusable files from a previous explicitly audited yt-dlp run.
+        统计此前已有用户权利审计记录、可以安全复用的项目本地候选音乐。
+
+        A transient search failure must not erase or overwrite a valid local
+        library. Both the managed manifest and its rights audit are required,
+        and accepted paths must remain inside the cache directory.
+        """
+        library_path = self.cache_dir / "library.json"
+        audit_path = self.cache_dir / "rights_audit.json"
+        try:
+            library = json.loads(library_path.read_text(encoding="utf-8-sig"))
+            audit = json.loads(audit_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if not isinstance(library, dict) or not library.get("managed_provider_cache"):
+            return 0
+        if not isinstance(audit, dict) or audit.get("provider") != "yt_dlp_unverified":
+            return 0
+        tracks = library.get("tracks")
+        if not isinstance(tracks, list):
+            return 0
+        count = 0
+        for item in tracks:
+            if not isinstance(item, dict) or item.get("provider") != "yt_dlp_unverified":
+                continue
+            file_name = str(item.get("file") or "").strip()
+            if not file_name:
+                continue
+            candidate = (self.cache_dir / file_name).resolve()
+            try:
+                candidate.relative_to(self.cache_dir)
+            except ValueError:
+                continue
+            if candidate.is_file() and candidate.suffix.casefold() in AUDIO_SUFFIXES:
+                count += 1
+        return count
+
+    def _reuse_audited_cache(self, reason: str) -> Optional[Path]:
+        """Reuse an audited cache after provider failure. / 来源暂时失败时复用已审计缓存。"""
+        count = self._audited_cache_track_count()
+        if not count:
+            return None
+        self.logger.warning(
+            "%s; reusing %d previously audited project tracks",
+            reason,
+            count,
+        )
+        return self.cache_dir
+
+    @staticmethod
+    def _summarize_energy_arc(energy_curve: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Summarize a track's energy shape for director-side score matching.
+        汇总曲目的能量走势，供导演按情绪弧线选曲。
+
+        Parameters / 参数:
+            energy_curve: Time-ordered ``time_sec``/``dbfs`` samples. /
+                按时间排列的 ``time_sec``/``dbfs`` 采样。
+        """
+        samples: List[tuple[float, float]] = []
+        for raw in energy_curve:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                timestamp = float(raw.get("time_sec", 0))
+                energy = float(raw.get("dbfs", -120))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(timestamp) and math.isfinite(energy):
+                samples.append((timestamp, energy))
+        samples.sort(key=lambda item: item[0])
+        if not samples:
+            return {
+                "trend": "unknown", "start_dbfs": -120.0,
+                "middle_dbfs": -120.0, "end_dbfs": -120.0,
+                "end_vs_start_db": 0.0, "contrast_db": 0.0,
+                "peak_time_ratio": 0.0, "build_score": 0.0,
+            }
+        group_size = max(1, len(samples) // 3)
+        first = samples[:group_size]
+        middle_start = max(0, (len(samples) - group_size) // 2)
+        middle = samples[middle_start:middle_start + group_size]
+        final = samples[-group_size:]
+
+        def mean(values: Sequence[tuple[float, float]]) -> float:
+            return sum(value for _, value in values) / max(1, len(values))
+
+        start_db = mean(first)
+        middle_db = mean(middle)
+        end_db = mean(final)
+        delta = end_db - start_db
+        trend = "rising" if delta >= 2.0 else ("falling" if delta <= -2.0 else "flat")
+        ordered = sorted(value for _, value in samples)
+        low_index = int(round((len(ordered) - 1) * 0.10))
+        high_index = int(round((len(ordered) - 1) * 0.90))
+        contrast = ordered[high_index] - ordered[low_index]
+        peak_time = max(samples, key=lambda item: item[1])[0]
+        duration = max(samples[-1][0], 1e-6)
+        peak_ratio = min(1.0, max(0.0, peak_time / duration))
+        # A useful build combines a louder final third, real dynamics, and a
+        # peak that happens after the midpoint. Each component is bounded.
+        delta_component = min(1.0, max(0.0, (delta + 1.0) / 7.0))
+        contrast_component = min(1.0, max(0.0, contrast / 12.0))
+        late_peak_component = min(1.0, max(0.0, (peak_ratio - 0.35) / 0.50))
+        build_score = (
+            0.50 * delta_component
+            + 0.25 * contrast_component
+            + 0.25 * late_peak_component
+        )
+        return {
+            "trend": trend,
+            "start_dbfs": round(start_db, 2),
+            "middle_dbfs": round(middle_db, 2),
+            "end_dbfs": round(end_db, 2),
+            "end_vs_start_db": round(delta, 2),
+            "contrast_db": round(contrast, 2),
+            "peak_time_ratio": round(peak_ratio, 3),
+            "build_score": round(build_score, 3),
+        }
 
     @staticmethod
     def _classify_search_entry(entry: Dict[str, Any]) -> Dict[str, bool]:
@@ -260,16 +408,24 @@ class MusicCandidateAcquirer:
                 metadata.append(item)
 
         if not metadata:
+            cached = self._reuse_audited_cache(
+                "online search returned no candidates"
+            )
+            if cached is not None:
+                return cached
             raise MusicAnalysisError(
                 "在线检索没有返回候选。请检查网络与 yt-dlp。 / Online search returned no candidates."
             )
+        # Download modest oversupply so the post-download vocal audit can
+        # reject mislabeled "instrumental" tracks without emptying the pool.
+        download_limit = max(1, min(12, int(math.ceil(limit * 1.5))))
         manifest_tracks: List[Dict[str, Any]] = []
-        for index, item in enumerate(metadata[: max(1, min(12, limit))], start=1):
+        for index, item in enumerate(metadata[:download_limit], start=1):
             url = str(item["source_url"])
             self.logger.info(
                 "下载候选配乐 %d/%d：%s / Downloading music candidate",
                 index,
-                min(len(metadata), limit),
+                min(len(metadata), download_limit),
                 item.get("title") or url,
             )
             command = [
@@ -330,6 +486,11 @@ class MusicCandidateAcquirer:
                 "rights_claim": rights_claim.strip(),
             })
         if not manifest_tracks:
+            cached = self._reuse_audited_cache(
+                "every new candidate download failed"
+            )
+            if cached is not None:
+                return cached
             raise MusicAnalysisError(
                 "候选音频均下载失败 / Every candidate audio download failed."
             )
@@ -458,13 +619,155 @@ class LicensedMusicAnalyzer:
     查找用户授权的音频，并在 CPU 上提取剪辑所需的音乐特征。
     """
 
-    def __init__(self, library: os.PathLike, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        library: os.PathLike,
+        logger: Optional[logging.Logger] = None,
+        vocal_audit_model: str = "small",
+        vocal_audit_device: str = "auto",
+    ) -> None:
         """Validate a music-library root without importing librosa. / 校验曲库根目录，但暂不导入 librosa。"""
         self.library = Path(library).expanduser().resolve()
         if not self.library.is_dir():
             raise MusicAnalysisError(f"配乐目录不存在 / Music library not found: {self.library}")
         self.logger = logger or logging.getLogger(LOGGER_NAME)
+        self.vocal_audit_model = str(vocal_audit_model or "small").strip()
+        self.vocal_audit_device = str(vocal_audit_device or "auto").strip()
         self._manifest = self._load_manifest()
+
+    @staticmethod
+    def _classify_whisper_vocals(transcription: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert Whisper confidence fields into a conservative vocal audit.
+        根据 Whisper 置信度字段生成保守的人声审计结果。
+
+        Metadata saying "instrumental" is not evidence about the waveform.
+        Repeated producer tags, speech, and intelligible singing are rejected;
+        low-confidence musical hallucinations are retained as non-vocal.
+        """
+        credible: List[Dict[str, Any]] = []
+        strong_count = 0
+        vocal_seconds = 0.0
+        segments = transcription.get("segments")
+        for raw in segments if isinstance(segments, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            text = " ".join(str(raw.get("text") or "").split())
+            if not text:
+                continue
+            try:
+                start = max(0.0, float(raw.get("start", 0) or 0))
+                end = max(start, float(raw.get("end", start) or start))
+                no_speech = float(raw.get("no_speech_prob", 1) or 1)
+                logprob = float(raw.get("avg_logprob", -9) or -9)
+                compression = float(raw.get("compression_ratio", 99) or 99)
+            except (TypeError, ValueError):
+                continue
+            is_credible = (
+                no_speech <= 0.45
+                and logprob >= -0.90
+                and compression <= 2.40
+            )
+            if not is_credible:
+                continue
+            duration = min(10.0, max(0.0, end - start))
+            vocal_seconds += duration
+            if no_speech <= 0.20 and logprob >= -0.75:
+                strong_count += 1
+            credible.append({
+                "start_sec": round(start, 3),
+                "end_sec": round(end, 3),
+                "text": text[:160],
+                "no_speech_prob": round(no_speech, 4),
+                "avg_logprob": round(logprob, 4),
+            })
+        detected = (
+            len(credible) >= 2
+            or vocal_seconds >= 2.5
+            or strong_count >= 1
+        )
+        return {
+            "engine": "whisper-confidence-v1",
+            "vocal_detected": detected,
+            "credible_segment_count": len(credible),
+            "strong_segment_count": strong_count,
+            "credible_vocal_seconds": round(vocal_seconds, 3),
+            "transcript_excerpt": [item["text"] for item in credible[:6]],
+            "segments": credible[:12],
+        }
+
+    def _audit_instrumental_tracks(
+        self, tracks: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Run one serial Whisper model over candidate waveforms and reject vocals.
+        串行使用一个 Whisper 模型审听候选波形，并拒绝含人声的音乐。
+        """
+        try:
+            import torch
+            import whisper
+        except ImportError as exc:
+            raise MusicAnalysisError(
+                "无人声审计需要项目已有的 Whisper/PyTorch / Vocal audit requires Whisper and PyTorch."
+            ) from exc
+        device = self.vocal_audit_device
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = None
+        accepted: List[Dict[str, Any]] = []
+        try:
+            self.logger.info(
+                "加载 Whisper %s 到 %s 进行真实音频人声审计 / Loading Whisper vocal auditor",
+                self.vocal_audit_model,
+                device,
+            )
+            model = whisper.load_model(self.vocal_audit_model, device=device)
+            for index, raw in enumerate(tracks, start=1):
+                item = dict(raw)
+                self.logger.info(
+                    "人声审计 %d/%d：%s / Vocal audit",
+                    index,
+                    len(tracks),
+                    item.get("title") or item.get("file_name"),
+                )
+                try:
+                    transcription = model.transcribe(
+                        str(item["file_name"]),
+                        verbose=False,
+                        fp16=device.startswith("cuda"),
+                        temperature=0.0,
+                        condition_on_previous_text=False,
+                    )
+                except Exception as exc:
+                    raise MusicAnalysisError(
+                        f"候选音乐人声审计失败 / Vocal audit failed for {item.get('title')}: {exc}"
+                    ) from exc
+                audit = self._classify_whisper_vocals(transcription)
+                item["vocal_audit"] = audit
+                if audit["vocal_detected"]:
+                    self.logger.warning(
+                        "拒绝检测到人声的候选：%s（%s）/ Rejecting candidate with detected vocals",
+                        item.get("title") or item.get("file_name"),
+                        "; ".join(audit.get("transcript_excerpt") or [])[:240],
+                    )
+                    continue
+                accepted.append(item)
+        finally:
+            if model is not None:
+                del model
+            gc.collect()
+            if device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except (AttributeError, RuntimeError):
+                    pass
+        if not accepted:
+            raise MusicAnalysisError(
+                "所有候选音乐都检测到人声；已拒绝生成错误配乐。请扩大搜索后重试。 / "
+                "Every candidate contained detected vocals; broaden the search and retry."
+            )
+        return accepted
 
     def _load_manifest(self) -> Dict[str, Dict[str, Any]]:
         """Load optional rights metadata keyed by relative path. / 按相对路径读取可选权利元数据。"""
@@ -700,6 +1003,7 @@ class LicensedMusicAnalyzer:
             "downbeats_sec": [round(value, 4) for value in downbeats],
             "sections": sections,
             "energy_curve": energy_curve,
+            "energy_profile": MusicCandidateAcquirer._summarize_energy_arc(energy_curve),
             "key": key,
             "mode": mode,
             "key_confidence": key_confidence,
@@ -729,8 +1033,14 @@ class LicensedMusicAnalyzer:
         tracks = self.rank(self.discover(), combined_query)
         if not tracks:
             raise MusicAnalysisError(f"曲库中没有受支持的音频 / No supported audio in: {self.library}")
-        analyzed: List[Dict[str, Any]] = []
         maximum = max(1, min(32, int(limit)))
+        instrumental_only = (
+            str(brief.get("vocal_policy") or "").casefold() == "instrumental_only"
+        )
+        if instrumental_only:
+            audit_limit = min(len(tracks), max(maximum * 2, 12))
+            tracks = self._audit_instrumental_tracks(tracks[:audit_limit])
+        analyzed: List[Dict[str, Any]] = []
         for index, track in enumerate(tracks[:maximum], start=1):
             self.logger.info(
                 "CPU 音乐听诊 %d/%d：%s / CPU music analysis",
@@ -740,16 +1050,45 @@ class LicensedMusicAnalyzer:
         tempo = brief.get("tempo_bpm") if isinstance(brief.get("tempo_bpm"), dict) else {}
         tempo_min = float(tempo.get("min", 0) or 0)
         tempo_max = float(tempo.get("max", 999) or 999)
+        desired_arc = " ".join(str(brief.get("emotion_arc") or "").split()).casefold()
+        requires_build = any(
+            token in desired_arc
+            for token in (
+                "build", "rise", "rising", "crescendo", "swell", "peak",
+                "上升", "渐强", "推进", "高潮", "递进",
+            )
+        )
         for item in analyzed:
             bpm = float(item.get("tempo_bpm", 0) or 0)
+            tempo_in_range = tempo_min <= bpm <= tempo_max
+            tempo_center = (tempo_min + tempo_max) / 2.0
+            tempo_half_range = max(10.0, (tempo_max - tempo_min) / 2.0)
+            tempo_score = max(0.0, 1.0 - abs(bpm - tempo_center) / tempo_half_range)
+            profile = item.get("energy_profile") if isinstance(item.get("energy_profile"), dict) else {}
+            build_score = float(profile.get("build_score", 0) or 0)
+            energy_arc_match = (
+                not requires_build
+                or str(profile.get("trend") or "") == "rising"
+                or build_score >= 0.55
+            )
+            keyword_score = int(item.get("search_score", 0))
             item["director_match"] = {
-                "tempo_in_range": tempo_min <= bpm <= tempo_max,
-                "keyword_score": int(item.get("search_score", 0)),
+                "tempo_in_range": tempo_in_range,
+                "tempo_score": round(tempo_score, 3),
+                "energy_arc_match": energy_arc_match,
+                "energy_build_score": round(build_score, 3),
+                "keyword_score": keyword_score,
+                "total_score": round(
+                    keyword_score + (3.0 if tempo_in_range else tempo_score)
+                    + (4.0 if energy_arc_match else build_score),
+                    3,
+                ),
             }
         analyzed.sort(
             key=lambda item: (
+                -float(item["director_match"]["total_score"]),
                 not bool(item["director_match"]["tempo_in_range"]),
-                -int(item["director_match"]["keyword_score"]),
+                not bool(item["director_match"]["energy_arc_match"]),
             )
         )
         payload = {
@@ -788,6 +1127,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jamendo-client-id", default="")
     parser.add_argument("--rights-confirmed", action="store_true")
     parser.add_argument("--rights-claim", default="")
+    parser.add_argument(
+        "--vocal-audit-model",
+        default="small",
+        help="Whisper model used to verify instrumental candidates / 无人声审计模型",
+    )
+    parser.add_argument(
+        "--vocal-audit-device",
+        default="auto",
+        choices=("auto", "cpu", "cuda"),
+        help="Device for the serial vocal-audit stage / 串行人声审计设备",
+    )
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser
 
@@ -817,7 +1167,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.rights_confirmed,
                     args.rights_claim,
                 )
-        LicensedMusicAnalyzer(library, logger).run(
+        LicensedMusicAnalyzer(
+            library,
+            logger,
+            vocal_audit_model=args.vocal_audit_model,
+            vocal_audit_device=args.vocal_audit_device,
+        ).run(
             args.output, args.query, args.limit, brief
         )
         return 0

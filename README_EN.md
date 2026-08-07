@@ -23,6 +23,40 @@ repository root. You can also launch it from PowerShell:
 .\.venv\Scripts\python.exe gui.py
 ```
 
+## Local Web Studio
+
+After installation, double-click `launch_web.bat` or run:
+
+```powershell
+.\.venv\Scripts\python.exe web.py
+```
+
+The browser opens `http://127.0.0.1:8765/`. Web Studio shares the desktop
+application's `WorkflowOptions` and strict-serial `main.py` orchestrator. It
+supports multi-video/folder selection, a creative brief, automatic hardware
+tuning, Ollama/Resolve health, live logs, stage progress, safe cancellation,
+and in-browser playback of review and final renders. The resident server uses
+only the Python standard library and never imports Torch, Whisper, OpenCV, or
+Resolve, so it retains no model VRAM.
+
+Browsers cannot read arbitrary local absolute paths. On a local Windows host,
+CyberEditor opens a native server-side multi-file/folder picker, avoiding a
+second upload or copy of hundreds of gigabytes of 4K media. Remote deployments
+can enter absolute paths on the Windows host or its mounted storage. Resolve,
+Ollama, FFmpeg, and the media must exist on the machine running Web Studio; a
+generic cloud-hosted static page cannot directly control Resolve on a home PC.
+
+The default bind is loopback-only. LAN, workstation, or reverse-proxy
+deployments require a token of at least 16 characters:
+
+```powershell
+.\.venv\Scripts\python.exe web.py --host 0.0.0.0 --port 8765 --token "replace-with-a-long-random-token" --no-browser
+```
+
+Enter the same token through the top-right **Access token** control on the first
+remote visit. Prefer a trusted LAN, VPN, or authenticated HTTPS reverse proxy;
+never expose Resolve scripting or this service directly to the public Internet.
+
 The bilingual desktop UI can multi-select any number of videos or recursively
 load a media folder. It also includes Whisper and Ollama settings, resumable
 workflow modes, Resolve controls, a watchable preview render, live logs, stage
@@ -36,10 +70,16 @@ the local gate completes setup, development, payoff, and ending without forcing
 every source file into the movie or repeating an action/countdown to fill time.
 
 The full workflow does not merely concatenate every file. Each source is
-transcribed and sampled into time-distributed real frames. A vision model
-first writes a project-wide treatment with theme, four story beats, target
-runtime, color intent, and music mood. It then reviews each 10–15 minute window
-with both images and speech. A second global-director pass keeps only the
+transcribed and sampled continuously at one saved frame per second by default,
+allowing the vision model to understand setup, action, reaction, and
+payoff rather than merely naming objects. A vision model first writes a
+project-wide treatment with theme, four story beats, target runtime, an
+executable color bible, and music mood. It then reviews every saved one-fps image
+and the dialogue in order. Ollama cannot accept thousands of images from an hour
+in one request, so 16-second transport batches overlap by two seconds on each side.
+No second representative-frame selection occurs, and a rolling identity, location,
+action, emotion, and unresolved-intention summary crosses every batch boundary.
+A second global-director pass keeps only the
 minority of shots that serve that treatment. Local validation enforces actual
 source order and in-file timecode, plus per-shot and total-runtime limits. It
 plans cuts/dissolves/fades, audio cleanup, creative looks, gentle push-ins,
@@ -48,10 +88,83 @@ the two-director pipeline. The result can include an editable
 Resolve timeline, an immediately watchable FFmpeg 1080p review, and a final
 movie rendered by Resolve's Deliver pipeline.
 
+The global director now creates a **picture lock before music spotting**. Every
+selected shot must state its narrative function, the new information it gives
+the viewer, its exact source trim, audio intent, and music-edit role. Dialogue
+about microphones, filters, blocking, or repeated takes receives an advisory
+`production_context_hint`, but is never automatically cut or muted. The director
+alone decides whether to exclude it, preserve it, use it as natural texture, mix
+it with music, or mute it; the executor faithfully applies `audio_intent`.
+An evidence-first event contract, a supervising-editor pass, and a context-isolated
+blind viewer now audit the picture before lock. The blind viewer never receives the
+treatment, intended takeaway, shot-role labels, or editor rationale, so it cannot use
+the director's explanation to excuse an unintelligible cut. These reviews
+separates observed action from an inferred next event: lining up is not a
+departure, and a countdown or forward lean is not proof that riders left. If a
+requested event was never filmed, it is recorded in
+`absent_or_unproven_events` and the director must adapt the thesis to an honest
+story the footage can prove. Every shot supplies an `evidence_claim` and a
+`connection_to_previous`. After this review, Python validates bounds and format
+only; it no longer pads beats, semantically removes shots, reorders the edit, or
+score-trims the director's picture lock.
+
+The supervising model also receives a quantitative draft report: dialogue share,
+average shot length, static-shot share, repeated narrative/music roles, and graphic
+count. It must name concrete problems and actual changes instead of rubber-stamping
+the first assembly. For a sub-two-minute film that is not explicitly dialogue-led,
+only dialogue that changes viewer understanding or reveals character should normally
+survive; one concise exchange is usually enough for routine technical logistics, and
+zero to two graphics is the default. When visual variety is weak, the director should
+make a shorter film instead of padding it with production chatter, repeated actions,
+or packaging titles. These remain professional review signals for the supervising
+editor. Python still does not choose replacement shots, but it rejects a plan whose
+declared form, evidence, audible speech, and blind-viewer result contradict one another.
+
+The review does not trust the model's prose self-assessment. The program measures
+the sequence it actually returned. A plan explicitly authored as a visual/music
+montage is sent back to the same AI director when preserved speech still exceeds
+55%; any non-interview, non-evidence-supported dialogue structure is rejected above
+72% audible speech; production chatter must match a proven BTS contract; more than
+75% of selected shots remain static despite available movement,
+four consecutive shots repeat one narrative/music function, no
+escalation/contrast/payoff exists, or shot scale is severely monotonous. The 55%
+cap is not mechanically applied to interviews, observational documentaries, or
+behind-the-scenes stories genuinely driven by conversation. A
+`teaser_then_chronological` treatment may also echo its climax in the opening tease.
+
+Python never chooses, deletes, or mutes replacement shots. It retains the best
+complete AI-authored proposal and requests a second recut only when the preceding
+one made measurable progress. JSON-stage advisories may still be recorded, but the
+actual rendered rough cut must subsequently pass the isolated viewer test. After two
+failed rendered-film feedback recuts, the workflow stops before Resolve instead of
+publishing another known-incoherent final movie. Candidate ledgers
+now expose exact merged `speech_ranges` and usable `silent_ranges`; a silent trim
+inside a dialogue-bearing source is no longer miscounted as full-length speech.
+All actually audible speech still counts: `natural_texture` preserves voices and
+cannot be used to disguise retained dialogue.
+
+Structural Whisper silence hallucinations are filtered during new extraction and
+when loading an existing `raw_data.json`. A three-character phrase incorrectly
+stretched across many seconds no longer classifies the whole range as dialogue or
+ducks the music bed for that false duration.
+Mixed VRAM/RAM inference with 27B Q8 or 70B can take more than 30 minutes for a
+single global assembly request. The orchestrator therefore defaults to a
+7,200-second (two-hour) Ollama read timeout while emitting honest elapsed-time
+heartbeats every 15 seconds. CLI users may override it with
+`--ollama-timeout`.
+Only after that validated picture lock exists does the music director place
+cues against real shot boundaries and exact dialogue regions. The CPU renderer
+then performs sample-accurate ducking and refuses to publish a silent or nearly
+silent music bed. Optional title cards, chapters, lower thirds, and end cards
+from `graphics_plan` are rendered in both the FFmpeg review and Resolve Text+.
+Typography is used to clarify or deliberately stylize a coherent edit; it is
+not allowed to disguise weak shot selection.
+
 Online music uses an authoritative manifest: stale downloads cannot masquerade
 as user-supplied tracks, and interview, podcast, narration, and show-like results
-are rejected before download and again before analysis. One global creative
-grade is applied across the film. Exposure/white-balance measurements made in
+are rejected before download and again before analysis. One global palette is
+applied across the film, with bounded exposure, contrast, saturation, and warmth
+progression for opening, development, payoff, and ending. Exposure/white-balance measurements made in
 encoded S-Log space are never incorrectly applied after the technical input
 transform, preventing per-shot brightness and color drift.
 
@@ -70,7 +183,11 @@ accounts for Chinese, long context, instruction following, and quantization
 instead of using file size alone. Auto mode never downloads a multi-gigabyte
 model without consent or changes media properties based on hardware
 performance. A 16 GB VRAM + 64 GB RAM machine defaults to the slower quality
-profile: Whisper `large-v3`, 10-minute chunks, and a 16K context.
+profile: Whisper `large-v3`, 10-minute chunks, and a 32K context. Every editable
+candidate is considered by the text director: the complete compact ledger is sent
+in one request when it fits, while longer projects use chronological director-review
+pages followed by global assembly. Python no longer discards candidates with a fixed
+Top-21/28 shortlist, and `timeline_cuts.json` records the ids reviewed on each page.
 
 At UI startup, an installed but stopped local Ollama service is launched
 automatically without loading a model or consuming model VRAM. Resolve is found
@@ -195,7 +312,7 @@ text-only global assembly. Only one model is resident, without loading a second
 `scripts\configure_pagefile_admin.cmd` and run it as Administrator to keep a
 4–8 GB C: page file and add a 32–48 GB D: page file. It never reboots Windows.
 
-## Six-stage two-director finishing pipeline
+## Eight-stage evidence-first finishing pipeline
 
 The implementation now follows this strict serial chain:
 
@@ -209,21 +326,42 @@ The implementation now follows this strict serial chain:
 3. **Retrieval and analysis (CPU)**: choose a local licensed library, Jamendo with
    verifiable license URLs, or the explicitly confirmed yt-dlp any-online mode.
    Librosa/FFmpeg extracts BPM, beats, strong beats, approximate downbeats, energy
-   sections, key, dynamic range, and EBU R128 LUFS into `music_analysis.json`.
-4. **Final direction**: Qwen3.6 reloads, reviews 10–15 minute image/speech windows,
-   and performs cross-source story and multi-cue assembly against analyzed tracks.
+   sections, whole-track energy trend, peak position, key, dynamic range, and EBU
+   R128 LUFS into `music_analysis.json`. Ranking combines BPM, semantic relevance,
+   and whether the measured curve can deliver the requested build or climax.
+4. **Whole-footage audit and evidence contract**: Qwen3.6 reloads and reviews every saved one-fps visual sample
+   and transcript in order. Overlapping 16-second batches only satisfy the context
+   window; they do not discard intermediate samples, and a rolling continuity summary
+   carries whole-source understanding into cross-source story assembly. Before shot
+   selection, an evidence role must cite real `candidate_id` values for the subject,
+   goal, state changes, and final observed state. Fewer than three audited state changes
+   cannot support a causal/BTS claim; the system must choose an honest character vignette
+   or mood montage instead.
    Dynamic shot limits range from 10-second B-roll to complete 45-second interview
-   thoughts. Visual-only out-points may snap ±0.25 seconds to a beat; dialogue and
-   closing thoughts are never truncated for rhythm.
-5. **Music-bed conform and Resolve execution**: after Qwen unloads, FFmpeg trims
+   thoughts. Picture selection assigns natural-sound, on-beat, phrase-start, build,
+   payoff-hit, or release roles; local validation grounds two to six sync points in
+   measured strong beats/downbeats. Normal visual shifts are bounded to ±0.45 seconds
+   and payoff hits to ±0.75 seconds; interview dialogue is never truncated for rhythm.
+5. **Picture assembly and blind-viewer gate**: after picture assembly and supervising
+   review, a context-isolated prompt sees only literal shot observations and audible
+   dialogue. It does not see the treatment, role labels, intended takeaway, or editor
+   rationale. It must independently explain subject, goal, progression, changed ending
+   state, and meaning; coherence and the relevant causal/visual payoff score must reach 7/10.
+6. **Music-bed conform and rough-cut render**: after Qwen unloads, FFmpeg trims
    one to three cues, applies fades, loudness matching and dialogue ducking, and
-   writes deterministic `music_bed.wav`. Resolve imports this one file on A2, then
+   writes deterministic `music_bed.wav`, then renders a low-resolution review movie.
+7. **Rendered-film review and automatic recut**: the vision model watches the real
+   rough cut in chronological adaptive-frame batches, then combines literal visual
+   observations with audible-dialogue and music-placement maps. A failed review is
+   returned to the director for up to two automatic recuts. Continued failure blocks
+   Resolve and leaves `review/rough_cut_review.json` for diagnosis.
+8. **Resolve execution and export**: Resolve imports the final music bed on A2, then
    native APIs import picture media, use each source's native FPS,
    assemble clips, and apply Voice Isolation, basic CDL, `Stabilize()`,
    `CreateMagicMask()`, and `SmartReframe()`. User-exported DRX grades are applied
    through the node graph's `ApplyGradeFromDRX()`. Resolve 21 exposes stabilization
    and Magic Mask natively, so fragile coordinate macros are not the default.
-6. **Final export**: enable **Export final movie in Resolve** in the UI to create
+   Enable **Export final movie in Resolve** in the UI to create
    a Render Job, start it, log percentage progress, and validate completion. The
    current Deliver format/codec is preserved unless an existing Resolve render
    preset is entered.
@@ -272,6 +410,9 @@ and [model unloading](https://docs.ollama.com/faq#how-do-i-keep-a-model-loaded-i
 CyberEditor-Agent/
 ├─ gui.py                        # Windows desktop UI entry point
 ├─ launch_ui.bat                 # Double-click UI launcher
+├─ launch_web.bat                # Double-click local Web Studio launcher
+├─ web.py                        # Browser controller entry point
+├─ web/                          # Dependency-free HTML/CSS/JavaScript client
 ├─ main.py                       # Strict serial workflow orchestrator
 ├─ scripts/
 │  └─ install_windows.ps1        # Windows CPU/CUDA auto-installer
@@ -296,6 +437,7 @@ CyberEditor-Agent/
 │  ├─ music_analyzer.py          # Local/Jamendo/yt-dlp retrieval and CPU analysis
 │  ├─ music_bed.py               # Cue conform, fades, ducking, and bed render
 │  ├─ review_renderer.py         # Watchable FFmpeg preview and effects
+│  ├─ rough_cut_reviewer.py      # Rendered-film visual blind review and recut feedback
 │  ├─ resolve_macro.py           # Guarded optional PyAutoGUI fallback
 │  └─ resolve_executor.py        # Resolve assembly and effect mapping
 ├─ data/
@@ -603,10 +745,11 @@ out-point up, then subtracts one frame to match Resolve's inclusive `endFrame`.
 
 ## Robustness boundaries
 
-- The vision model does not decode every 4K pixel of every frame. Extraction
-  traverses every video and retains time-distributed, scene-change-aware
-  representative frames for windowed review. This balances long-form coverage
-  with local context and memory limits.
+- “Full review” means every saved one-fps visual sample plus all dialogue from
+  beginning to end, not every original frame of a 59.94 fps stream. A one-hour
+  source therefore sends about 3,600 images in overlapping batches with no
+  second sampling pass. This is the explicit boundary between complete temporal
+  coverage and a local VLM context window.
 - Resolve's public scripting API has no stable general transition-insertion
   method. The FFmpeg preview truly renders the AI transition, denoise, look,
   and motion plan. The editable Resolve timeline applies supported Voice

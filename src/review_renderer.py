@@ -53,6 +53,7 @@ class RenderClip(NamedTuple):
     volume_db: float = 0.0
     source_color: Optional[Dict[str, Any]] = None
     color_match: Optional[Dict[str, Any]] = None
+    creative_grade: Optional[Dict[str, Any]] = None
 
 
 class ReviewRenderer:
@@ -87,6 +88,7 @@ class ReviewRenderer:
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         self.color_pipeline: Dict[str, Any] = {}
         self.music_plan: Dict[str, Any] = {}
+        self.graphics_plan: Dict[str, Any] = {}
         self.technical_lut_path: Optional[Path] = None
         if self.width < 320 or self.height < 180:
             raise ReviewRenderError(
@@ -182,6 +184,8 @@ class ReviewRenderer:
         self.color_pipeline = pipeline if isinstance(pipeline, dict) else {}
         music = payload.get("music_plan")
         self.music_plan = music if isinstance(music, dict) else {}
+        graphics = payload.get("graphics_plan")
+        self.graphics_plan = graphics if isinstance(graphics, dict) else {}
 
         result: List[RenderClip] = []
         for index, item in enumerate(raw_clips):
@@ -237,7 +241,7 @@ class ReviewRenderer:
                         "static",
                     ),
                     volume_db=max(
-                        -24.0,
+                        -60.0,
                         min(
                             12.0,
                             self._finite(
@@ -253,6 +257,10 @@ class ReviewRenderer:
                     color_match=(
                         dict(item["color_match"])
                         if isinstance(item.get("color_match"), dict) else None
+                    ),
+                    creative_grade=(
+                        dict(item["creative_grade"])
+                        if isinstance(item.get("creative_grade"), dict) else None
                     ),
                 )
             )
@@ -321,6 +329,7 @@ class ReviewRenderer:
                 f"{self._technical_color_filter(clip)}"
                 f"{self._color_match_filter(clip)}"
                 f"{self._color_filter(clip.color_look)}"
+                f"{self._creative_grade_filter(clip)}"
                 f"{self._motion_filter(clip.motion, fps)}[v{index}]"
             )
             audio_chain = (
@@ -379,6 +388,21 @@ class ReviewRenderer:
             current_video = next_video
             current_audio = next_audio
             current_duration += durations[index] - transition_duration
+
+        graphics_items = (
+            self.graphics_plan.get("items", [])
+            if isinstance(self.graphics_plan.get("items"), list)
+            else []
+        )
+        for graphic_index, raw_graphic in enumerate(graphics_items):
+            if not isinstance(raw_graphic, dict):
+                continue
+            graphic_filter = self._graphics_filter(
+                raw_graphic, current_video, f"vg{graphic_index}"
+            )
+            if graphic_filter:
+                filters.append(graphic_filter)
+                current_video = f"vg{graphic_index}"
 
         final_audio = current_audio
         bed_path_text = str(self.music_plan.get("bed_file") or "").strip()
@@ -497,6 +521,7 @@ class ReviewRenderer:
                     self.logger.info(
                         "预览渲染 %d%% / Review render %d%%", percent, percent
                     )
+        process.stdout.close()
         return_code = process.wait()
         if return_code != 0:
             raise ReviewRenderError(
@@ -578,6 +603,123 @@ class ReviewRenderer:
             f"rr={self._number(gains[0])}:gg={self._number(gains[1])}:bb={self._number(gains[2])}"
             f",exposure=exposure={self._number(exposure)}"
         )
+
+    def _creative_grade_filter(self, clip: RenderClip) -> str:
+        """
+        Translate the director's color bible into bounded FFmpeg filters.
+        将导演调色圣经转换为受限的 FFmpeg 创意调色滤镜。
+
+        Technical log conversion and source matching are intentionally applied
+        before this creative layer. / 技术还原与素材匹配始终先于本创意层。
+        """
+        value = clip.creative_grade or {}
+        if not isinstance(value, dict) or not value:
+            return ""
+        try:
+            exposure = max(-0.5, min(0.5, float(value.get("exposure_ev", 0))))
+            contrast = max(0.8, min(1.35, float(value.get("contrast", 1))))
+            saturation = max(0.65, min(1.35, float(value.get("saturation", 1))))
+            warmth = max(-1.0, min(1.0, float(value.get("warmth", 0))))
+        except (TypeError, ValueError):
+            return ""
+        palette = str(value.get("palette") or "natural").casefold()
+        palette_balance = {
+            "natural": (0.0, 0.0, 0.0, 0.0),
+            "teal_amber": (-0.012, 0.022, 0.028, -0.018),
+            "cool_moonlight": (-0.025, 0.040, -0.010, 0.018),
+            "warm_memory": (0.035, -0.030, 0.018, -0.012),
+            "desaturated_grit": (-0.008, 0.010, 0.008, -0.006),
+            "neon_night": (0.010, 0.035, 0.020, 0.018),
+        }.get(palette, (0.0, 0.0, 0.0, 0.0))
+        shadow_red, shadow_blue, highlight_red, highlight_blue = palette_balance
+        shadow_red += 0.035 * warmth
+        shadow_blue -= 0.035 * warmth
+        highlight_red += 0.025 * warmth
+        highlight_blue -= 0.025 * warmth
+        return (
+            ",colorbalance="
+            f"rs={self._number(shadow_red)}:bs={self._number(shadow_blue)}:"
+            f"rh={self._number(highlight_red)}:bh={self._number(highlight_blue)}"
+            f",eq=contrast={self._number(contrast)}:saturation={self._number(saturation)}"
+            f",exposure=exposure={self._number(exposure)}"
+        )
+
+    @staticmethod
+    def _escape_drawtext(value: object) -> str:
+        """Escape one UTF-8 string for FFmpeg's drawtext option parser. / 转义 drawtext UTF-8 文本。"""
+        return (
+            str(value or "")
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace(":", "\\:")
+            .replace("%", "\\%")
+        )
+
+    def _graphics_filter(
+        self, graphic: Dict[str, Any], input_label: str, output_label: str
+    ) -> str:
+        """
+        Build one story-motivated title/chapter overlay for the review render.
+        为审片成片构建一个由故事驱动的标题或章节字卡。
+
+        Parameters / 参数:
+            graphic: Validated graphics-plan item. / 已校验的字卡条目。
+            input_label/output_label: FFmpeg graph labels. / FFmpeg 图标签。
+        """
+        try:
+            start = max(0.0, float(graphic.get("timeline_in_sec", 0)))
+            end = max(start + 0.2, float(graphic.get("timeline_out_sec", start + 2.5)))
+        except (TypeError, ValueError):
+            return ""
+        text = " ".join(str(graphic.get("text") or "").split())
+        if not text:
+            return ""
+        subtitle = " ".join(str(graphic.get("subtitle") or "").split())
+        kind = str(graphic.get("kind") or "chapter").casefold()
+        style = str(graphic.get("style") or "minimal").casefold()
+        font_candidates = (
+            Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyh.ttc",
+            Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeuib.ttf",
+        )
+        font_path = next((path for path in font_candidates if path.is_file()), None)
+        if font_path is not None:
+            escaped_font = font_path.as_posix().replace(":", "\\:").replace("'", "\\'")
+            font_option = f"fontfile='{escaped_font}'"
+        else:
+            font_option = "font='Segoe UI'"
+        enable = f"between(t,{self._number(start)},{self._number(end)})"
+        fade = min(0.35, max(0.12, (end - start) / 4.0))
+        fade_out_start = max(start + fade, end - fade)
+        alpha = (
+            f"if(lt(t,{self._number(start + fade)}),(t-{self._number(start)})/{self._number(fade)},"
+            f"if(lt(t,{self._number(fade_out_start)}),1,"
+            f"( {self._number(end)}-t)/{self._number(fade)}))"
+        ).replace(" ", "")
+        centered = kind in {"title_card", "end_card"}
+        main_size = 72 if centered else 48
+        sub_size = 32 if centered else 26
+        main_x = "(w-text_w)/2" if centered else "100"
+        main_y = "h*0.40" if centered else "h-220"
+        sub_x = "(w-text_w)/2" if centered else "104"
+        sub_y = "h*0.56" if centered else "h-152"
+        box_y = "ih*0.30" if centered else "ih-270"
+        box_h = "ih*0.38" if centered else "190"
+        box_alpha = "0.42" if style in {"bold_cinematic", "kinetic"} else "0.28"
+        accent = "0x35d0ba" if style == "kinetic" else "white"
+        chain = (
+            f"[{input_label}]drawbox=x=0:y={box_y}:w=iw:h={box_h}:"
+            f"color=black@{box_alpha}:t=fill:enable='{enable}',"
+            f"drawtext={font_option}:text='{self._escape_drawtext(text)}':"
+            f"fontcolor={accent}:fontsize={main_size}:x={main_x}:y={main_y}:"
+            f"borderw=1:bordercolor=black@0.7:alpha='{alpha}':enable='{enable}'"
+        )
+        if subtitle:
+            chain += (
+                f",drawtext={font_option}:text='{self._escape_drawtext(subtitle)}':"
+                f"fontcolor=white@0.92:fontsize={sub_size}:x={sub_x}:y={sub_y}:"
+                f"borderw=1:bordercolor=black@0.7:alpha='{alpha}':enable='{enable}'"
+            )
+        return chain + f"[{output_label}]"
 
     def _motion_filter(self, motion: str, fps: float) -> str:
         if motion != "gentle_push_in":

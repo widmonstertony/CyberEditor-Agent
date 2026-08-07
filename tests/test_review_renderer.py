@@ -1,7 +1,10 @@
 """Tests for FFmpeg review graph construction without running FFmpeg."""
 
 import logging
+import json
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -80,6 +83,98 @@ class ReviewRendererTests(unittest.TestCase):
             self.assertIn(str(bed.resolve()), command)
             self.assertIn("[musicbed]", graph)
             self.assertNotIn("afade=t=in", graph)
+
+    def test_director_color_bible_becomes_executable_filter(self):
+        renderer = ReviewRenderer("plan.json", "review.mp4")
+        clip = RenderClip(
+            "a.mp4", 0, 3,
+            creative_grade={
+                "palette": "cool_moonlight", "exposure_ev": -0.1,
+                "contrast": 1.08, "saturation": 0.92, "warmth": -0.25,
+            },
+        )
+
+        value = renderer._creative_grade_filter(clip)
+
+        self.assertIn("colorbalance=", value)
+        self.assertIn("eq=contrast=1.08:saturation=0.92", value)
+        self.assertIn("exposure=exposure=-0.1", value)
+
+    def test_graphics_plan_becomes_executable_drawtext_overlay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = root / "a.mp4"
+            media.touch()
+            renderer = ReviewRenderer(root / "plan.json", root / "review.mp4")
+            renderer.graphics_plan = {
+                "items": [
+                    {
+                        "kind": "title_card",
+                        "timeline_in_sec": 0.2,
+                        "timeline_out_sec": 2.8,
+                        "text": "NIGHT SHIFT",
+                        "subtitle": "Ready is a ritual",
+                        "style": "kinetic",
+                    }
+                ]
+            }
+
+            with mock.patch.object(renderer, "_has_audio", return_value=True):
+                _, graph, _ = renderer.build_command(
+                    "ffmpeg", "ffprobe", 25.0,
+                    [RenderClip(str(media), 0, 4, "cut", 0, "none")],
+                )
+
+            self.assertIn("drawtext=", graph)
+            self.assertIn("NIGHT SHIFT", graph)
+            self.assertIn("Ready is a ritual", graph)
+            self.assertIn("[vg0]", graph)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
+    def test_real_ffmpeg_renders_unicode_title_card(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            output = root / "review.mp4"
+            subprocess.run(
+                [
+                    str(shutil.which("ffmpeg")), "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "color=c=0x142033:s=640x360:r=25:d=2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+                ],
+                check=True,
+            )
+            plan = root / "timeline.json"
+            plan.write_text(
+                json.dumps(
+                    {
+                        "project_fps": 25,
+                        "clips": [
+                            {
+                                "file_name": str(source), "cut_in_sec": 0,
+                                "cut_out_sec": 2, "audio_cleanup": "none",
+                            }
+                        ],
+                        "graphics_plan": {
+                            "strategy": "clarify premise",
+                            "items": [
+                                {
+                                    "kind": "title_card", "timeline_in_sec": 0.1,
+                                    "timeline_out_sec": 1.8, "text": "夜行集结",
+                                    "subtitle": "NIGHT SHIFT", "style": "bold_cinematic",
+                                }
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = ReviewRenderer(plan, output, 640, 360).run()
+
+            self.assertEqual(result, output.resolve())
+            self.assertGreater(output.stat().st_size, 1000)
 
 
 if __name__ == "__main__":

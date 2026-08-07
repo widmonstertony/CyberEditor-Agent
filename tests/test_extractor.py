@@ -49,6 +49,49 @@ class MediaExtractorTests(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             MediaExtractor._normalize_segments([])
 
+    def test_normalize_drops_long_sparse_whisper_hallucination(self):
+        result = MediaExtractor._normalize_segments(
+            [
+                {
+                    "id": 1,
+                    "start": 59.68,
+                    "end": 75.92,
+                    "text": "难道是",
+                    "avg_logprob": -0.9,
+                    "no_speech_prob": 0.2,
+                },
+                {
+                    "id": 2,
+                    "start": 76.0,
+                    "end": 79.0,
+                    "text": "我们现在一起戴上头盔",
+                    "avg_logprob": -0.2,
+                    "no_speech_prob": 0.05,
+                },
+            ]
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "我们现在一起戴上头盔")
+        self.assertEqual(result[0]["avg_logprob"], -0.2)
+
+    def test_whisper_tail_is_clamped_to_real_media_duration(self):
+        result = MediaExtractor._clamp_segments_to_duration(
+            [
+                {"id": 1, "start_sec": 10.0, "end_sec": 14.0, "text": "tail"},
+                {"id": 2, "start_sec": 14.0, "end_sec": 16.0, "text": "hallucination"},
+            ],
+            12.5125,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["end_sec"], 12.512)
+
+    def test_default_visual_policy_is_full_one_fps_coverage(self):
+        self.assertEqual(self.extractor.sample_interval_sec, 1.0)
+        self.assertEqual(self.extractor.min_keyframe_gap_sec, 1.0)
+        self.assertEqual(self.extractor.max_keyframes, 7200)
+
     def test_write_srt_utf8(self):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "字幕.srt"

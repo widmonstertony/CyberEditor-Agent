@@ -44,6 +44,90 @@ class WorkflowError(RuntimeError):
     """Expected workflow orchestration failure. / 可预期的工作流调度错误。"""
 
 
+class WindowsSleepInhibitor:
+    """
+    Keep Windows awake while a long workflow owns the current process.
+    在长时间工作流占用当前进程期间阻止 Windows 因空闲而睡眠。
+
+    ``SetThreadExecutionState`` changes no persistent power-plan setting. The
+    request is scoped to this orchestrator thread and is explicitly cleared on
+    success, failure, or cancellation. Keeping the display awake also protects
+    Resolve UI automation and PyAutoGUI actions later in the pipeline.
+    """
+
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+    ES_CONTINUOUS = 0x80000000
+
+    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+        """Store the logger and inactive state. / 保存日志器与未激活状态。"""
+        self.logger = logger or logging.getLogger(LOGGER_NAME)
+        self.active = False
+
+    @staticmethod
+    def _is_supported() -> bool:
+        """Return whether the Windows execution-state API is available. / 判断 Windows 防睡眠 API 是否可用。"""
+        return os.name == "nt"
+
+    @staticmethod
+    def _set_execution_state(flags: int) -> int:
+        """Call the native execution-state API. / 调用 Windows 原生执行状态 API。"""
+        import ctypes
+
+        setter = ctypes.WinDLL("kernel32", use_last_error=True).SetThreadExecutionState
+        setter.argtypes = (ctypes.c_ulong,)
+        setter.restype = ctypes.c_ulong
+        return int(setter(flags))
+
+    def __enter__(self) -> "WindowsSleepInhibitor":
+        """Request system/display wakefulness for this thread. / 请求本线程保持系统与显示器唤醒。"""
+        if not self._is_supported():
+            return self
+        flags = self.ES_CONTINUOUS | self.ES_SYSTEM_REQUIRED | self.ES_DISPLAY_REQUIRED
+        try:
+            self.active = bool(self._set_execution_state(flags))
+        except (AttributeError, OSError) as exc:
+            self.logger.warning(
+                "Windows 防睡眠请求失败，工作流仍会继续：%s / "
+                "Could not inhibit Windows sleep; workflow will continue: %s",
+                exc,
+                exc,
+            )
+            return self
+        if self.active:
+            self.logger.info(
+                "工作流期间已阻止 Windows 自动睡眠并保持显示器唤醒 / "
+                "Windows sleep and display idle timeout inhibited during workflow"
+            )
+        else:
+            self.logger.warning(
+                "Windows 拒绝了防睡眠请求；请临时检查电源设置 / "
+                "Windows rejected the sleep-inhibition request"
+            )
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        """Restore normal Windows idle behavior on every exit path. / 无论成功或异常退出都恢复正常空闲策略。"""
+        if not self.active:
+            return
+        try:
+            restored = bool(self._set_execution_state(self.ES_CONTINUOUS))
+        except (AttributeError, OSError) as restore_error:
+            self.logger.warning(
+                "恢复 Windows 电源状态请求失败：%s / Failed to restore execution state: %s",
+                restore_error,
+                restore_error,
+            )
+        else:
+            if restored:
+                self.logger.info(
+                    "工作流结束，已恢复 Windows 正常电源策略 / "
+                    "Workflow ended; normal Windows idle policy restored"
+                )
+        finally:
+            self.active = False
+
+
 class WorkflowLock:
     """
     Prevent two local workflows from competing for the same GPU/data directory.
@@ -182,6 +266,70 @@ class WorkflowOrchestrator:
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         self.active_process: Optional[subprocess.Popen] = None
 
+    @staticmethod
+    def _has_continuous_visual_review(raw_data: Path) -> bool:
+        """
+        Validate full-span visual review metadata for every source asset.
+        验证每条源素材都包含覆盖完整时长的连续视觉审片元数据。
+
+        Legacy extraction stored only occasional scene thumbnails. It remains
+        a valid archive, but is insufficient for the current director, which
+        reviews every one-second temporal sample in sequence.
+        """
+        try:
+            payload = json.loads(raw_data.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        assets = payload.get("assets") if isinstance(payload, dict) else None
+        if not isinstance(assets, list) or not assets:
+            return False
+        for asset in assets:
+            if not isinstance(asset, dict):
+                return False
+            sampling = asset.get("visual_sampling")
+            keyframes = asset.get("keyframes")
+            if not isinstance(sampling, dict) or not isinstance(keyframes, list):
+                return False
+            try:
+                interval = float(sampling.get("requested_interval_sec"))
+                saved = int(sampling.get("saved_frame_count"))
+            except (TypeError, ValueError):
+                return False
+            if (
+                sampling.get("mode") != "continuous_temporal_coverage"
+                or sampling.get("complete_source_span") is not True
+                or interval <= 0
+                or interval > 1.05
+                or saved <= 0
+                or saved != len(keyframes)
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _has_reusable_candidate_audit(timeline_cuts: Path) -> bool:
+        """
+        Return whether a prior full visual pass can be safely reused.
+        判断既有计划是否包含可复用的完整视觉候选审计。
+
+        Parameters / 参数:
+            timeline_cuts: Existing final director handoff. / 既有最终导演交接文件。
+        """
+        try:
+            payload = json.loads(timeline_cuts.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        audit = payload.get("candidate_audit") if isinstance(payload, dict) else None
+        review = payload.get("visual_review") if isinstance(payload, dict) else None
+        return (
+            isinstance(audit, list)
+            and bool(audit)
+            and isinstance(review, dict)
+            and review.get("mode") == "continuous_all_saved_samples"
+            and review.get("candidate_audit_complete") is True
+            and int(review.get("candidate_audit_version", 0) or 0) >= 2
+        )
+
     def run(self, args: argparse.Namespace) -> None:
         """
         Execute selected stages and verify every handoff artifact.
@@ -190,10 +338,29 @@ class WorkflowOrchestrator:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         raw_data = self.data_dir / "raw_data.json"
         timeline_cuts = self.data_dir / "timeline_cuts.json"
+        preview_path: Optional[Path] = None
         lock_path = self.data_dir / ".cybereditor.lock"
 
         explicit_videos = self._argument_list(getattr(args, "video", None))
         explicit_proxies = self._argument_list(getattr(args, "proxy", None))
+        if args.skip_extraction and not args.skip_director:
+            self._require_file(raw_data, "跳过提取时需要现有 raw_data.json")
+            if not self._has_continuous_visual_review(raw_data):
+                has_sources = bool(
+                    explicit_videos or getattr(args, "input_folder", None)
+                )
+                if not has_sources:
+                    raise WorkflowError(
+                        "现有 raw_data.json 来自旧版稀疏审片，且没有提供源素材，无法自动升级。"
+                        "请重新选择素材并运行完整流程。 / Existing extraction uses legacy sparse "
+                        "review data and no source media was supplied; select the media and run again."
+                    )
+                args.skip_extraction = False
+                self.logger.warning(
+                    "检测到旧版稀疏审片数据；已自动取消 --skip-extraction，将按完整时长每秒重新审片。"
+                    " / Legacy sparse visual data detected; extraction will rerun automatically "
+                    "with full-span one-second coverage."
+                )
         sources: List[Path] = []
         proxy_map: Dict[Path, Path] = {}
         if not args.skip_extraction:
@@ -216,8 +383,13 @@ class WorkflowOrchestrator:
             self._require_file(
                 timeline_cuts, "跳过导演时需要现有 timeline_cuts.json"
             )
+        reuse_visual_audit = bool(
+            args.skip_extraction
+            and not args.skip_director
+            and self._has_reusable_candidate_audit(timeline_cuts)
+        )
 
-        with WorkflowLock(lock_path):
+        with WorkflowLock(lock_path), WindowsSleepInhibitor(self.logger):
             self.logger.info(
                 "串行工作流启动；任意时刻最多一个重型阶段 / Serial workflow started; one heavy stage at a time"
             )
@@ -309,11 +481,14 @@ class WorkflowOrchestrator:
             music_analysis = self.data_dir / "music_analysis.json"
             music_cache = self.data_dir / "music-candidates"
             music_bed = self.data_dir / "music" / "music_bed.wav"
+            program_audio = self.data_dir / "audio" / "program_audio.wav"
             provider = str(getattr(args, "music_provider", "off") or "off")
             # Preserve older CLI/UI integrations: supplying a local folder means
             # local-provider mode even when the new flag is absent.
             if provider == "off" and getattr(args, "music_folder", None):
                 provider = "local"
+            final_director_command: Optional[List[str]] = None
+            bed_command: Optional[List[str]] = None
 
             if not args.skip_director:
                 try:
@@ -457,6 +632,13 @@ class WorkflowOrchestrator:
                     command.extend(["--creative-brief", args.creative_brief.strip()])
                 if provider != "off":
                     command.extend(["--music-analysis", str(music_analysis)])
+                if reuse_visual_audit:
+                    command.append("--reassemble-existing")
+                    self.logger.info(
+                        "检测到完整视觉候选审计；最终导演将直接重组，不重复逐秒看图 / "
+                        "Reusable visual audit found; final director will reassemble without re-reviewing frames"
+                    )
+                final_director_command = list(command)
                 try:
                     self._run_stage("最终 AI 导演 / Final AI director", command)
                 finally:
@@ -493,6 +675,35 @@ class WorkflowOrchestrator:
                     # A valid no-music creative decision intentionally produces no WAV.
                     self._release_barrier("FFmpeg CPU music-bed conform")
 
+            needs_program_audio = not (
+                bool(args.skip_director)
+                and bool(args.skip_resolve)
+                and bool(getattr(args, "skip_preview", True))
+            )
+            if needs_program_audio:
+                self._require_file(
+                    timeline_cuts, "现场声合成需要现有 timeline_cuts.json"
+                )
+                program_audio_command = [
+                    self.python_executable,
+                    "-m",
+                    "src.program_audio",
+                    "--timeline",
+                    str(timeline_cuts),
+                    "--output",
+                    str(program_audio),
+                    "--log-level",
+                    args.log_level,
+                ]
+                self._run_stage(
+                    "逐剪点现场声预混 / Frame-faithful production-audio conform",
+                    program_audio_command,
+                )
+                self._require_file(
+                    program_audio, "现场声阶段未生成 program_audio.wav"
+                )
+                self._release_barrier("FFmpeg CPU production-audio conform")
+
             # Programmatic callers created before preview support have no
             # ``skip_preview`` attribute; keep those integrations backward
             # compatible. The CLI parser always supplies its explicit default.
@@ -500,7 +711,7 @@ class WorkflowOrchestrator:
                 preview_path = self.data_dir / "review" / str(
                     getattr(args, "preview_name", "CyberEditor_preview.mp4")
                 )
-                command = [
+                preview_command = [
                     self.python_executable,
                     "-m",
                     "src.review_renderer",
@@ -515,8 +726,128 @@ class WorkflowOrchestrator:
                     "--log-level",
                     args.log_level,
                 ]
-                self._run_stage("预览成片 / Preview render", command)
+                self._run_stage("预览成片 / Preview render", preview_command)
                 self._require_file(preview_path, "预览渲染未生成输出文件")
+
+                preview_review_enabled = (
+                    hasattr(args, "skip_preview_review")
+                    and not bool(getattr(args, "skip_preview_review", False))
+                    and not bool(args.skip_director)
+                    and final_director_command is not None
+                )
+                if preview_review_enabled:
+                    review_path = self.data_dir / "review" / "rough_cut_review.json"
+                    max_feedback_recuts = max(
+                        0, min(3, int(getattr(args, "preview_review_rounds", 2)))
+                    )
+                    for review_round in range(max_feedback_recuts + 1):
+                        review_command = [
+                            self.python_executable,
+                            "-m",
+                            "src.rough_cut_reviewer",
+                            "--preview",
+                            str(preview_path),
+                            "--timeline",
+                            str(timeline_cuts),
+                            "--output",
+                            str(review_path),
+                            "--model",
+                            args.ollama_model,
+                            "--text-model",
+                            args.director_model or args.ollama_model,
+                            "--ollama-url",
+                            args.ollama_url,
+                            "--num-ctx",
+                            str(args.num_ctx),
+                            "--timeout",
+                            str(args.ollama_timeout),
+                            "--log-level",
+                            args.log_level,
+                        ]
+                        try:
+                            self._run_stage(
+                                f"低清成片盲审 {review_round + 1}/{max_feedback_recuts + 1}"
+                                " / Rendered rough-cut blind review",
+                                review_command,
+                            )
+                        finally:
+                            self._force_ollama_unload(args.ollama_model, args.ollama_url)
+                            if args.director_model and args.director_model != args.ollama_model:
+                                self._force_ollama_unload(args.director_model, args.ollama_url)
+                        self._require_file(review_path, "低清成片盲审未生成 JSON")
+                        try:
+                            review_payload = json.loads(
+                                review_path.read_text(encoding="utf-8-sig")
+                            )
+                        except (OSError, ValueError) as exc:
+                            raise WorkflowError(
+                                f"无法读取低清成片盲审 / Cannot read rough-cut review: {exc}"
+                            ) from exc
+                        if bool(review_payload.get("passes")):
+                            self.logger.info(
+                                "低清成片通过陌生观众盲审，可进入 Resolve / "
+                                "Rendered rough cut passed blind review; Resolve is now allowed"
+                            )
+                            break
+                        if review_round >= max_feedback_recuts:
+                            blind = review_payload.get("blind_review")
+                            reason = (
+                                blind.get("reason")
+                                if isinstance(blind, dict) else "blind review failed"
+                            )
+                            raise WorkflowError(
+                                "低清成片经过自动重剪后仍无法让陌生观众理解，已阻止 Resolve "
+                                "继续渲染坏成片。请查看审片报告："
+                                f"{review_path}。原因：{reason} / Rendered rough cut still failed "
+                                "the blind viewer after automatic recuts; Resolve was blocked."
+                            )
+
+                        self.logger.warning(
+                            "低清成片盲审未通过，正在把真实成片反馈交回导演重剪 %d/%d / "
+                            "Rendered rough cut failed; returning actual-film feedback for recut %d/%d",
+                            review_round + 1,
+                            max_feedback_recuts,
+                            review_round + 1,
+                            max_feedback_recuts,
+                        )
+                        recut_command = list(final_director_command)
+                        if "--reassemble-existing" not in recut_command:
+                            recut_command.append("--reassemble-existing")
+                        recut_command.extend(["--rough-cut-feedback", str(review_path)])
+                        try:
+                            self._run_stage(
+                                f"成片反馈重剪 {review_round + 1}/{max_feedback_recuts}"
+                                " / Rough-cut feedback recut",
+                                recut_command,
+                            )
+                        finally:
+                            self._force_ollama_unload(args.ollama_model, args.ollama_url)
+                            if args.director_model and args.director_model != args.ollama_model:
+                                self._force_ollama_unload(args.director_model, args.ollama_url)
+                        self._require_file(
+                            timeline_cuts, "成片反馈重剪未生成 timeline_cuts.json"
+                        )
+                        self._release_barrier("Ollama rough-cut feedback recut")
+                        if bed_command is not None:
+                            self._run_stage(
+                                "重剪音乐床合成 / Recut music-bed conform",
+                                bed_command,
+                            )
+                            self._release_barrier("FFmpeg recut music-bed conform")
+                        self._run_stage(
+                            "重剪现场声预混 / Recut production-audio conform",
+                            program_audio_command,
+                        )
+                        self._require_file(
+                            program_audio, "重剪现场声阶段未生成 program_audio.wav"
+                        )
+                        self._release_barrier("FFmpeg recut production-audio conform")
+                        self._run_stage(
+                            "重剪预览成片 / Recut preview render", preview_command
+                        )
+                        self._require_file(
+                            preview_path, "重剪预览渲染未生成输出文件"
+                        )
 
             if not args.skip_resolve:
                 media_root = (
@@ -541,6 +872,8 @@ class WorkflowOrchestrator:
                 ]
                 if args.strict_fps:
                     command.append("--strict-fps")
+                if preview_path is not None and preview_path.is_file():
+                    command.extend(["--approved-preview", str(preview_path)])
                 drx_root = str(getattr(args, "drx_root", "") or "").strip()
                 if drx_root:
                     command.extend(["--drx-root", drx_root])
@@ -592,6 +925,59 @@ class WorkflowOrchestrator:
                         ]
                     )
                 self._run_stage("执行 / Resolve", command)
+                if (
+                    bool(getattr(args, "render_final", False))
+                    and preview_path is not None
+                    and preview_path.is_file()
+                ):
+                    configured_render_dir = str(
+                        getattr(args, "render_dir", "") or ""
+                    ).strip()
+                    final_dir = (
+                        Path(configured_render_dir).expanduser().resolve()
+                        if configured_render_dir
+                        else (self.data_dir / "final").resolve()
+                    )
+                    render_name = str(
+                        getattr(args, "render_name", "CyberEditor_final")
+                        or "CyberEditor_final"
+                    )
+                    rendered_candidates = [
+                        path
+                        for path in final_dir.glob(f"{render_name}.*")
+                        if path.is_file()
+                        and path.suffix.casefold()
+                        in {".mov", ".mp4", ".mxf", ".avi", ".mkv"}
+                    ]
+                    if not rendered_candidates:
+                        raise WorkflowError(
+                            f"Resolve reported success but no final media file was found in {final_dir}."
+                        )
+                    final_export = max(
+                        rendered_candidates,
+                        key=lambda path: path.stat().st_mtime_ns,
+                    )
+                    final_qa_path = self.data_dir / "review" / "final_output_qa.json"
+                    self._run_stage(
+                        "最终导出一致性验收 / Final export consistency QA",
+                        [
+                            self.python_executable,
+                            "-m",
+                            "src.final_output_qa",
+                            "--final",
+                            str(final_export),
+                            "--approved",
+                            str(preview_path),
+                            "--output",
+                            str(final_qa_path),
+                            "--log-level",
+                            args.log_level,
+                        ],
+                    )
+                    self._require_file(
+                        final_qa_path,
+                        "Resolve 最终导出未生成一致性 QA 报告",
+                    )
 
             self.logger.info(
                 "全部所选阶段完成 / All selected stages completed"
@@ -622,17 +1008,40 @@ class WorkflowOrchestrator:
             )
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
+        environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
         self.logger.info("=" * 72)
         self.logger.info("开始阶段：%s / Starting stage: %s", display_name, display_name)
         self.logger.info("命令 / Command: %s", subprocess.list2cmdline(list(command)))
         started = time.monotonic()
+        stage_output_path = self.data_dir / "stage_output.log"
         try:
-            self.active_process = subprocess.Popen(
-                list(command),
-                cwd=str(self.project_root),
-                env=environment,
-            )
-            return_code = self.active_process.wait()
+            stage_output_path.parent.mkdir(parents=True, exist_ok=True)
+            with stage_output_path.open("a", encoding="utf-8", newline="") as transcript:
+                transcript.write(
+                    f"\n{'=' * 72}\n{display_name}\n"
+                    f"{subprocess.list2cmdline(list(command))}\n"
+                )
+                transcript.flush()
+                self.active_process = subprocess.Popen(
+                    list(command),
+                    cwd=str(self.project_root),
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                assert self.active_process.stdout is not None
+                for line in self.active_process.stdout:
+                    transcript.write(line)
+                    transcript.flush()
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                self.active_process.stdout.close()
+                return_code = self.active_process.wait()
         except KeyboardInterrupt:
             self.logger.warning(
                 "正在终止阶段：%s / Terminating stage: %s",
@@ -658,7 +1067,8 @@ class WorkflowOrchestrator:
         if return_code != 0:
             raise WorkflowError(
                 f"阶段 {display_name} 失败，退出码 {return_code}。"
-                f" / Stage failed with exit code {return_code}."
+                f"完整子进程日志：{stage_output_path} / "
+                f"Stage failed with exit code {return_code}; full child log: {stage_output_path}"
             )
         self.logger.info(
             "阶段完成：%s，耗时 %.1f 分钟 / Stage complete: %s, %.1f minutes",
@@ -860,8 +1270,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--whisper-device", default="auto")
     parser.add_argument("--language")
     parser.add_argument("--scene-threshold", type=float, default=0.28)
-    parser.add_argument("--sample-interval", type=float, default=2.0)
-    parser.add_argument("--max-keyframes", type=int, default=240)
+    parser.add_argument(
+        "--sample-interval", type=float, default=1.0,
+        help="连续视觉审片采样间隔；默认每秒一帧 / full-review sampling interval",
+    )
+    parser.add_argument(
+        "--max-keyframes", type=int, default=7200,
+        help="每个素材的视觉证据硬上限 / per-source visual evidence cap",
+    )
     parser.add_argument("--ollama-model", default="qwen3.6:27b-mtp-q8_0")
     parser.add_argument(
         "--director-model",
@@ -894,7 +1310,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="确认任意在线音频的下载、改编和使用权及平台条款 / confirm rights and platform terms",
     )
     parser.add_argument("--music-rights-claim", default="")
-    parser.add_argument("--ollama-timeout", type=int, default=1800)
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        default=7200,
+        help=(
+            "单次 Ollama 导演请求读取超时秒数；默认 7200，适合 27B/70B 混合内存慢推理 / "
+            "per-request Ollama read timeout in seconds; default 7200 for slow mixed-memory inference"
+        ),
+    )
     parser.add_argument("--timeline-name", default="CyberEditor Timeline")
     parser.add_argument("--project-name", default="CyberEditor Project")
     parser.add_argument("--strict-fps", action="store_true")
@@ -924,6 +1348,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--preview-width", type=int, default=1920)
     parser.add_argument("--preview-height", type=int, default=1080)
+    parser.add_argument(
+        "--skip-preview-review",
+        action="store_true",
+        help=(
+            "跳过低清成片的多模态陌生观众盲审（不推荐） / "
+            "skip multimodal blind review of the rendered rough cut"
+        ),
+    )
+    parser.add_argument(
+        "--preview-review-rounds",
+        type=int,
+        default=2,
+        help="低清成片盲审失败后的最大自动重剪次数 / maximum rendered-preview recuts",
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",
