@@ -4,7 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark light">
-  <title>CyberEditor Agent — Web Studio</title>
+  <meta name="description" content="CyberEditor Agent local-first AI editing application. The hosted interface connects directly to source code running on this computer.">
+  <title>CyberEditor Agent — Local AI Editing App</title>
   <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
@@ -20,7 +21,6 @@
     </div>
     <div class="top-actions">
       <div class="privacy-pill"><span class="pulse"></span><span data-i18n="localFirst">LOCAL FIRST</span></div>
-      <div id="demoPill" class="privacy-pill demo-pill" hidden><span data-i18n="demoMode">SOURCE DEMO</span></div>
       <label class="compact-select">
         <span class="sr-only" data-i18n="theme">主题</span>
         <select id="themeSelect" aria-label="Theme">
@@ -41,6 +41,19 @@
   </header>
 
   <main class="shell">
+    <section id="localConnection" class="remote-connection local-connection" hidden>
+      <div class="remote-copy">
+        <span class="pulse"></span>
+        <div>
+          <small data-i18n="localApp">REAL LOCAL APP</small>
+          <strong id="localConnectionStatus" data-i18n="localConnecting">正在连接这台电脑上的 CyberEditor companion…</strong>
+        </div>
+      </div>
+      <code>127.0.0.1:8765</code>
+      <button id="retryLocal" class="button ghost small" type="button" data-i18n="retryLocal">重新连接</button>
+      <a class="button ghost small" href="https://github.com/widmonstertony/CyberEditor-Agent" target="_blank" rel="noopener noreferrer" data-i18n="getSource">获取源码与启动器 ↗</a>
+    </section>
+
     <section id="remoteConnection" class="remote-connection" hidden>
       <div class="remote-copy">
         <span class="pulse"></span>

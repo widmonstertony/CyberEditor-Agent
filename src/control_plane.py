@@ -598,7 +598,12 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; media-src 'self' blob:; img-src 'self' data:; connect-src 'self'")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; style-src 'self'; script-src 'self'; "
+            "media-src 'self' blob:; img-src 'self' data:; "
+            "connect-src 'self' http://127.0.0.1:8765 http://localhost:8765",
+        )
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)

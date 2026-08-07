@@ -39,6 +39,8 @@ and in-browser playback of review and final renders. The resident server uses
 only the Python standard library and never imports Torch, Whisper, OpenCV, or
 Resolve, so it retains no model VRAM.
 
+The same real local service can power [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/). On Windows, double-click `launch_companion.bat` (`web.py --no-browser`) and reconnect from the hosted page. That UI calls `http://127.0.0.1:8765` directly. The loopback server accepts only the reviewed `tonytan.me` and local-development origins with CORS/Private Network Access preflights. Native media selection, environment detection, Ollama models, workflow start/stop, logs, and outputs all come from this repository's real `WorkflowManager`; EC2 receives neither RAW media, model traffic, nor execution commands.
+
 Browsers cannot read arbitrary local absolute paths. On a local Windows host,
 CyberEditor opens a native server-side multi-file/folder picker, avoiding a
 second upload or copy of hundreds of gigabytes of 4K media. In this single-PC
@@ -78,7 +80,7 @@ Any browser ─HTTPS─> Cloud Control Plane <─outbound HTTPS polling─ Windo
   persistent Render/Railway-style service, not a static site or ephemeral
   serverless function.
 
-The public source experience is [tonytan.me/cybereditor/?demo=1](https://tonytan.me/cybereditor/?demo=1). It reuses this repository's Web Studio with a deterministic browser adapter for media selection, environment state, workflow progress, and safe cancellation. It reads no token and never claims to process real media. Remove `?demo=1` to reach the token-protected control plane; the Windows worker still makes outbound HTTPS connections only.
+The default public entry, [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/), is the real Local App mode and connects directly to the loopback companion on this computer. Use `?remote=1` for the token-protected cloud control plane when controlling an outbound Windows worker from another device. The old browser fake-data demo has been removed.
 
 That instance is managed by the Caddy, systemd, restricted-sudo, and atomic-release definitions in `Personal-Website/ops`. A merge to protected `main` lets its isolated GitHub runner deploy only the reviewed control-plane package. The host caps previews at 512 MiB and prunes artifacts after seven days; RAW media, transcripts, evidence frames, Ollama, and Resolve stay on the workstation.
 
@@ -461,6 +463,7 @@ CyberEditor-Agent/
 ├─ gui.py                        # Windows desktop UI entry point
 ├─ launch_ui.bat                 # Double-click UI launcher
 ├─ launch_web.bat                # Double-click local Web Studio launcher
+├─ launch_companion.bat / .command # Loopback companion for the hosted UI
 ├─ web.py                        # Browser controller entry point
 ├─ control_plane.py              # Deployable cloud control-plane entry point
 ├─ worker.py                     # Outbound Windows worker entry point

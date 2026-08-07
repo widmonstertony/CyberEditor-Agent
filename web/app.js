@@ -5,8 +5,10 @@ const state = {
   config: {}, environment: null, videos: [], lastLogId: 0, polling: null,
   workerPolling: null, mode: "local", workers: [], workerId: "", jobId: ""
 };
-const demoMode = new URLSearchParams(window.location.search).get("demo") === "1";
-const demoState = { startedAt: 0, stopped: false };
+const pageParameters = new URLSearchParams(window.location.search);
+const hostedPortfolio = ["tonytan.me", "www.tonytan.me"].includes(window.location.hostname);
+const localCompanionMode = hostedPortfolio && pageParameters.get("remote") !== "1";
+const localCompanionBase = "http://127.0.0.1:8765/";
 
 const copy = {
   zh: {
@@ -29,7 +31,9 @@ const copy = {
     remoteControl: "远程控制 · 本机执行", waitingWorker: "正在等待本机 Worker 连接…", executionComputer: "执行电脑",
     refreshWorkers: "刷新电脑", workerOnline: "{name} 在线 · 素材与 AI 留在此电脑", workerOffline: "{name} 离线",
     noWorkers: "尚无本机 Worker；请先在 Windows 电脑运行 worker.py", chooseWorker: "请选择一台在线执行电脑",
-    pickerRemote: "选择框会在所选 Windows 电脑上打开；RAW 素材不会上传云端。", demoMode: "源码演示"
+    pickerRemote: "选择框会在所选 Windows 电脑上打开；RAW 素材不会上传云端。",
+    localApp: "真实本机应用", localConnecting: "正在连接这台电脑上的 CyberEditor companion…", localConnected: "已连接本机源码与 AI 工作流",
+    localDisconnected: "尚未连接。请在本机源码目录运行 launch_companion.command（macOS）或 launch_companion.bat（Windows）。", retryLocal: "重新连接", getSource: "获取源码与启动器 ↗"
   },
   en: {
     tagline: "Local · Private · Strict-serial AI editing", localFirst: "LOCAL FIRST", theme: "Theme", language: "Language",
@@ -51,7 +55,9 @@ const copy = {
     remoteControl: "REMOTE CONTROL · LOCAL EXECUTION", waitingWorker: "Waiting for a local worker…", executionComputer: "Execution PC",
     refreshWorkers: "Refresh PCs", workerOnline: "{name} online · media and AI stay on this PC", workerOffline: "{name} offline",
     noWorkers: "No local worker yet; run worker.py on the Windows PC first", chooseWorker: "Choose an online execution PC",
-    pickerRemote: "The picker opens on the selected Windows PC; RAW media is never uploaded.", demoMode: "SOURCE DEMO"
+    pickerRemote: "The picker opens on the selected Windows PC; RAW media is never uploaded.",
+    localApp: "REAL LOCAL APP", localConnecting: "Connecting to the CyberEditor companion on this computer…", localConnected: "Connected to the local source and AI workflow",
+    localDisconnected: "Not connected. Run launch_companion.command on macOS or launch_companion.bat on Windows from the source folder.", retryLocal: "Reconnect", getSource: "Get source and launcher ↗"
   }
 };
 
@@ -67,43 +73,22 @@ function translate() {
 }
 
 function token() { return sessionStorage.getItem("cybereditor-token") || ""; }
-function demoResponse(path, options) {
-  const route = path.split("?", 1)[0];
-  if (route === "/api/capabilities") return { ok: true, mode: "remote", picker: "worker", preview_relay: true };
-  if (route === "/api/config") return { ok: true, config: { flow: "full", camera_profile: "auto", videos: [], data_dir: "data/ui-run", fps_mode: "auto", project_fps: 29.97, whisper_model: "large-v3", num_ctx: 16384, chunk_minutes: 12, music_provider: "off", render_preview: true, render_final: true, strict_fps: true, skip_resolve: false, ollama_model: "qwen3.6:27b-mtp-q8_0", director_model: "qwen3.6:27b-mtp-q8_0" } };
-  if (route === "/api/workers") return { ok: true, workers: [{ worker_id: "tony-edit-workstation", name: "Tony's Windows editing PC", online: true, status: demoState.startedAt ? "busy" : "online" }] };
-  if (route === "/api/environment") return { ok: true, environment: { python: { version: "3.11.9" }, ffmpeg: { ok: true }, hardware: { torch_cuda: true, torch_available: true, torch_version: "2.9", gpu: "NVIDIA RTX · local worker", vram_gb: 16, ram_gb: 64, cpu_threads: 24 }, ollama: { ok: true, models: [{ name: "qwen3.6:27b-mtp-q8_0" }] }, resolve: { installed: true, version: "Studio", user_registered: true }, recommendation: { whisper_model: "large-v3", num_ctx: 16384, chunk_minutes: 12, ollama_model: "qwen3.6:27b-mtp-q8_0", director_model: "qwen3.6:27b-mtp-q8_0" } } };
-  if (route === "/api/picker") {
-    const request = JSON.parse(options.body || "{}");
-    return { ok: true, paths: request.kind === "folder" ? ["D:\\CyberEditor\\NightRide"] : ["D:\\CyberEditor\\NightRide\\A001.MP4", "D:\\CyberEditor\\NightRide\\A002.MP4", "D:\\CyberEditor\\NightRide\\A003.MP4"] };
-  }
-  if (route === "/api/workflow/start") { demoState.startedAt = Date.now(); demoState.stopped = false; return { ok: true, job_id: "source-demo", state: "running", stage: "proxy-and-evidence", progress: 2, running: true, logs: [{ id: 1, level: "info", message: "Demo: local worker accepted three source clips; RAW media remains on the PC." }], last_log_id: 1 }; }
-  if (route === "/api/workflow/stop") { demoState.stopped = true; return { ok: true, job_id: "source-demo", state: "stopped", stage: "stopped", progress: 0, running: false, logs: [{ id: 99, level: "warning", message: "Demo workflow stopped safely; the worker released local resources." }], last_log_id: 99 }; }
-  if (route === "/api/status") {
-    const since = Number(new URL(path, "http://demo.local").searchParams.get("since") || 0);
-    if (!demoState.startedAt) return { ok: true, state: "idle", stage: "ready", progress: 0, running: false, logs: [], last_log_id: 0 };
-    if (demoState.stopped) return { ok: true, job_id: "source-demo", state: "stopped", stage: "stopped", progress: 0, running: false, logs: [], last_log_id: 99 };
-    const elapsed = Math.min(18, (Date.now() - demoState.startedAt) / 1000);
-    const progress = Math.min(100, Math.round(elapsed / 18 * 100));
-    const stages = ["proxy-and-evidence", "whisper-transcription", "visual-director", "music-analysis", "picture-lock", "resolve-render"];
-    const index = Math.min(stages.length - 1, Math.floor(progress / 18));
-    const finished = progress >= 100;
-    const logId = index + 2;
-    return { ok: true, job_id: "source-demo", state: finished ? "succeeded" : "running", stage: finished ? "complete" : stages[index], progress, running: !finished, elapsed_sec: elapsed, logs: since < logId ? [{ id: logId, level: "info", message: `Demo stage ${index + 1}/${stages.length}: ${stages[index]} (executes on the selected local worker).` }] : [], last_log_id: logId };
-  }
-  if (route === "/api/outputs") return { ok: true, outputs: [] };
-  throw new Error(`Unsupported demo endpoint: ${route}`);
+function apiUrl(path) {
+  const base = localCompanionMode ? localCompanionBase : document.baseURI;
+  return new URL(path.replace(/^\/+/, ""), base);
 }
 async function api(path, options = {}) {
-  if (demoMode) {
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    return demoResponse(path, options);
-  }
   const headers = { "Accept": "application/json", ...(options.headers || {}) };
   if (token()) headers["X-CyberEditor-Token"] = token();
   if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
-  const url = new URL(path.replace(/^\/+/, ""), document.baseURI);
-  const response = await fetch(url, { ...options, headers });
+  const url = apiUrl(path);
+  let response;
+  try {
+    response = await fetch(url, { ...options, headers, cache: "no-store" });
+  } catch (error) {
+    if (localCompanionMode) throw new Error(t("localDisconnected"));
+    throw error;
+  }
   let payload;
   try { payload = await response.json(); } catch { payload = { ok: false, error: `HTTP ${response.status}` }; }
   if (!response.ok || payload.ok === false) {
@@ -183,13 +168,17 @@ function updateMediaSummary() {
   else { $("#mediaSummary").textContent = t("noMedia"); $("#mediaDetail").textContent = t(state.mode === "remote" ? "pickerRemote" : "pickerLocal"); }
 }
 
-function populateModels(models, selected, directorSelected) {
-  const names = models.map((item) => item.name);
-  [[$("#ollamaModel"), selected], [$("#directorModel"), directorSelected || selected]].forEach(([select, wanted]) => {
+function populateModels(models, selected, directorSelected, recommendation = {}) {
+  const names = models.map((item) => item.name).filter(Boolean);
+  [
+    [$("#ollamaModel"), selected, recommendation.ollama_model],
+    [$("#directorModel"), directorSelected || selected, recommendation.director_model],
+  ].forEach(([select, wanted, recommended]) => {
     select.textContent = "";
-    const values = [...new Set([wanted, ...names].filter(Boolean))];
+    const chosen = names.includes(wanted) ? wanted : (names.includes(recommended) ? recommended : (names[0] || wanted));
+    const values = names.length ? names : [wanted].filter(Boolean);
     values.forEach((name) => { const option = document.createElement("option"); option.value = name; option.textContent = name; select.append(option); });
-    if (wanted) select.value = wanted;
+    if (chosen) select.value = chosen;
   });
 }
 
@@ -205,7 +194,7 @@ async function refreshEnvironment() {
     const resolveReady = Boolean(env.resolve && env.resolve.installed);
     const resolveText = resolveReady ? `${env.resolve.version || "Registered"}${env.resolve.user_registered ? " · Studio" : ""}` : "Not found";
     health("resolve", resolveText, resolveReady ? "ok" : "bad");
-    populateModels(models, state.config.ollama_model, state.config.director_model);
+    populateModels(models, state.config.ollama_model, state.config.director_model, env.recommendation || {});
     $("#hardwareSummary").textContent = `${hw.gpu || "GPU unknown"} · ${hw.vram_gb || 0} GB VRAM · ${hw.ram_gb || 0} GB RAM · ${hw.cpu_threads || 0}T`;
   } catch (error) { toast(error.message, true); }
 }
@@ -305,7 +294,7 @@ async function refreshOutputs() {
       button.className = "button secondary small"; button.textContent = t("play");
       button.addEventListener("click", async () => {
         try {
-          const url = new URL(String(output.url || "").replace(/^\/+/, ""), document.baseURI);
+          const url = apiUrl(String(output.url || ""));
           const response = await fetch(url, { headers: { "X-CyberEditor-Token": token() }, cache: "no-store" });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const objectUrl = URL.createObjectURL(await response.blob());
@@ -337,21 +326,34 @@ function bind() {
   });
   $("#tokenButton").addEventListener("click", () => { $("#tokenInput").value = token(); $("#tokenDialog").showModal(); });
   $("#saveToken").addEventListener("click", () => { sessionStorage.setItem("cybereditor-token", $("#tokenInput").value.trim()); setTimeout(initialize, 0); });
-  $("#demoPill").hidden = !demoMode;
-  if (demoMode) $("#tokenButton").hidden = true;
+  $("#localConnection").hidden = !localCompanionMode;
+  if (localCompanionMode) {
+    $("#localConnectionStatus").textContent = t("localConnecting");
+    $("#retryLocal").addEventListener("click", initialize);
+  }
 }
 
 let initialized = false;
 async function initialize() {
   try {
     const capabilities = await api("/api/capabilities"); state.mode = capabilities.mode || "local";
+    if (localCompanionMode) {
+      $("#localConnection").classList.add("is-connected");
+      $("#localConnectionStatus").textContent = t("localConnected");
+    }
     $("#remoteConnection").hidden = state.mode !== "remote";
     const payload = await api("/api/config"); hydrate(payload.config); translate();
     if (state.mode === "remote") await refreshWorkers();
     await Promise.all([refreshEnvironment(), poll(), refreshOutputs()]);
     if (!state.polling) state.polling = setInterval(poll, 1000);
     if (state.mode === "remote" && !state.workerPolling) state.workerPolling = setInterval(() => refreshWorkers().catch(() => {}), 5000);
-  } catch (error) { if (!$("#tokenDialog").open) toast(error.message, true); }
+  } catch (error) {
+    if (localCompanionMode) {
+      $("#localConnection").classList.remove("is-connected");
+      $("#localConnectionStatus").textContent = t("localDisconnected");
+    }
+    if (!$("#tokenDialog").open) toast(error.message, true);
+  }
 }
 
 document.addEventListener("DOMContentLoaded", () => { bind(); translate(); initialize(); initialized = true; });
