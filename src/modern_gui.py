@@ -50,6 +50,7 @@ from .gui import (
     RuntimeServiceError,
 )
 from .ui_i18n import (
+    TRANSLATIONS,
     detect_system_language,
     resolve_language,
     translate,
@@ -445,6 +446,7 @@ class ModernCyberEditorApp:
         self.status_value_labels: Dict[str, ctk.CTkLabel] = {}
         self.log_history = ""
         self.stage_key = "ready_stage"
+        self.ai_progress_text: Optional[str] = None
         self.failure_code = 0
         self.progress_value = 0.0
 
@@ -1505,11 +1507,14 @@ class ModernCyberEditorApp:
         gpu = gpu.replace(" with Max-Q Design", " Max-Q").replace("NVIDIA ", "")
         vram = float(self.detected_hardware.get("vram_gb") or 0)
         gpu_text = f"{gpu} {vram:g} GB" if vram else gpu
-        torch_mode = (
-            "PyTorch CUDA"
-            if bool(self.detected_hardware.get("torch_cuda"))
-            else "PyTorch CPU"
-        )
+        if bool(self.detected_hardware.get("torch_cuda")):
+            torch_mode = "PyTorch CUDA"
+        elif bool(self.detected_hardware.get("torch_available")):
+            torch_mode = "PyTorch CPU"
+        elif bool(self.detected_hardware.get("torch_probe_failed")):
+            torch_mode = self.t("pytorch_probe_failed")
+        else:
+            torch_mode = self.t("pytorch_not_installed")
         prefix = (
             f"{gpu_text}  ·  RAM {ram:g} GB  ·  "
             f"CPU {threads}T  ·  {torch_mode}"
@@ -1731,6 +1736,8 @@ class ModernCyberEditorApp:
             results["CUDA"] = (
                 False, self.t("gpu_cpu_only", version=version)
             )
+        elif bool(torch_runtime.get("torch_probe_failed")):
+            results["CUDA"] = (False, self.t("gpu_probe_failed"))
         else:
             results["CUDA"] = (False, self.t("not_installed"))
         recommendation = recommend_automatic_settings(hardware, models)
@@ -1790,6 +1797,13 @@ class ModernCyberEditorApp:
         self._append_log(
             f"{self.t('hardware_log')}: {self._hardware_description()}\n"
         )
+        if bool(hardware.get("torch_probe_failed")):
+            probe_error = " ".join(
+                str(hardware.get("torch_error") or "unknown error").split()
+            )[:300]
+            self._append_log(
+                f"PyTorch/CUDA probe: {probe_error}\n"
+            )
         if self.profile_key == "auto":
             self._append_log(
                 f"{self.t('settings_applied')}: "
@@ -1997,6 +2011,8 @@ class ModernCyberEditorApp:
         finished_options = self.active_options
         self.process = None
         self.active_options = None
+        self.ai_progress_text = None
+        self._set_progress_indeterminate(False)
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         if return_code == 0:
@@ -2016,7 +2032,37 @@ class ModernCyberEditorApp:
 
     def _update_stage_from_log(self, line: str) -> None:
         """Map orchestrator markers to coarse progress. / 将调度器标记映射为粗粒度进度。"""
-        if "Starting stage:" in line:
+        progress_match = re.search(
+            r"AI_PROGRESS state=(\w+) activity=([a-z0-9_]+) elapsed=(\d+) "
+            r"attempt=(\d+)/(\d+)",
+            line,
+        )
+        if progress_match:
+            state, activity, elapsed, attempt, attempt_total = progress_match.groups()
+            if state in {"start", "working"}:
+                elapsed_seconds = int(elapsed)
+                elapsed_text = f"{elapsed_seconds // 60:02d}:{elapsed_seconds % 60:02d}"
+                activity_text = self.t(
+                    f"ai_activity_{activity}"
+                    if f"ai_activity_{activity}" in TRANSLATIONS[self.active_language]
+                    else "ai_activity_director_generation"
+                )
+                self.ai_progress_text = self.t(
+                    "ai_working",
+                    activity=activity_text,
+                    elapsed=elapsed_text,
+                    attempt=attempt,
+                    total=attempt_total,
+                )
+                self._set_progress_indeterminate(True)
+                if hasattr(self, "stage_label"):
+                    self.stage_label.configure(text=self.ai_progress_text)
+            else:
+                self.ai_progress_text = None
+                self._set_progress_indeterminate(False)
+                if hasattr(self, "stage_label"):
+                    self.stage_label.configure(text=self._stage_text())
+        elif "Starting stage:" in line:
             if "Extract" in line:
                 self._set_progress(0.12)
                 self._set_stage("extracting")
@@ -2049,9 +2095,26 @@ class ModernCyberEditorApp:
 
     def _set_progress(self, value: float) -> None:
         """Set and retain normalized progress. / 设置并保存归一化进度。"""
+        self._set_progress_indeterminate(False)
         self.progress_value = max(0.0, min(1.0, float(value)))
         if hasattr(self, "progress"):
             self.progress.set(self.progress_value)
+
+    def _set_progress_indeterminate(self, active: bool) -> None:
+        """Animate progress when Ollama cannot expose a reliable percentage. / Ollama 无可靠百分比时显示流动进度。"""
+        if not hasattr(self, "progress"):
+            return
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="indeterminate" if active else "determinate")
+            if active:
+                self.progress.start()
+            else:
+                self.progress.set(self.progress_value)
+        except (AttributeError, tk.TclError):
+            # Older CustomTkinter builds still retain the coarse stage value.
+            # 旧版 CustomTkinter 不支持模式切换时仍保留阶段进度。
+            pass
 
     def _set_stage(self, key: str) -> None:
         """Set a canonical stage key and refresh text. / 设置规范阶段键并刷新文字。"""
@@ -2061,6 +2124,8 @@ class ModernCyberEditorApp:
 
     def _stage_text(self) -> str:
         """Return localized text for the current stage. / 返回当前阶段的本地化文本。"""
+        if self.ai_progress_text:
+            return self.ai_progress_text
         if self.stage_key == "failed":
             return self.t("failed", code=self.failure_code)
         return self.t(self.stage_key)

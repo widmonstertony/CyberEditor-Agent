@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title>CyberEditor Agent — Web Studio</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">C//</div>
+      <div>
+        <h1>CyberEditor <span>Agent</span></h1>
+        <p data-i18n="tagline">本地 · 隐私 · 严格串行 AI 剪辑</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <div class="privacy-pill"><span class="pulse"></span><span data-i18n="localFirst">LOCAL FIRST</span></div>
+      <label class="compact-select">
+        <span class="sr-only" data-i18n="theme">主题</span>
+        <select id="themeSelect" aria-label="Theme">
+          <option value="system">跟随系统</option>
+          <option value="dark">深色</option>
+          <option value="light">浅色</option>
+        </select>
+      </label>
+      <label class="compact-select">
+        <span class="sr-only" data-i18n="language">语言</span>
+        <select id="languageSelect" aria-label="Language">
+          <option value="zh">中文</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+      <button id="tokenButton" class="button ghost small" type="button" data-i18n="accessToken">访问令牌</button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="health-grid" aria-label="Environment status">
+      <article class="health-card" data-health="python"><small>PYTHON</small><strong>检测中…</strong></article>
+      <article class="health-card" data-health="ffmpeg"><small>FFMPEG</small><strong>检测中…</strong></article>
+      <article class="health-card" data-health="cuda"><small>PYTORCH / CUDA</small><strong>检测中…</strong></article>
+      <article class="health-card" data-health="ollama"><small>OLLAMA</small><strong>检测中…</strong></article>
+      <article class="health-card" data-health="resolve"><small>DAVINCI</small><strong>检测中…</strong></article>
+    </section>
+
+    <div class="workspace-grid">
+      <section class="panel configuration">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow" data-i18n="projectSetup">PROJECT SETUP</p>
+            <h2 data-i18n="projectMedia">项目与素材</h2>
+          </div>
+          <button id="applyAutoButton" class="button ghost small" type="button" data-i18n="applyAuto">应用自动配置</button>
+        </div>
+
+        <form id="workflowForm" novalidate>
+          <div class="field-row two">
+            <label class="field">
+              <span data-i18n="workflowMode">工作流模式</span>
+              <select id="flow" name="flow">
+                <option value="full">完整流程</option>
+                <option value="director">从 AI 导演继续</option>
+                <option value="resolve">仅执行 Resolve</option>
+              </select>
+            </label>
+            <label class="field">
+              <span data-i18n="cameraProfile">相机色彩</span>
+              <select id="cameraProfile" name="camera_profile">
+                <option value="auto">自动识别 Sony XML / 元数据</option>
+                <option value="sony_pp8_slog3_sgamut3cine">Sony PP8 · S-Log3 / S-Gamut3.Cine</option>
+                <option value="rec709">Rec.709</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field">
+            <span data-i18n="creativeBrief">成片主题 / AI 导演要求（可选）</span>
+            <textarea id="creativeBrief" name="creative_brief" rows="4" data-i18n-placeholder="briefPlaceholder" placeholder="例如：剪成一支有明确起承转合的夜骑短片，强调人物准备、机械细节和最终集结。留空则 AI 自由发现主题。"></textarea>
+            <em data-i18n="briefHelp">这是导演最高优先级的创作意图；留空不等于随机拼接。</em>
+          </label>
+
+          <div class="media-picker">
+            <div class="picker-copy">
+              <span data-i18n="sourceMedia">源视频素材</span>
+              <strong id="mediaSummary" data-i18n="noMedia">尚未选择素材</strong>
+              <small id="mediaDetail" data-i18n="pickerLocal">本机模式会打开 Windows 原生选择器；远程部署可填写服务器路径。</small>
+            </div>
+            <div class="picker-actions">
+              <button id="pickVideos" class="button secondary" type="button" data-i18n="chooseVideos">选择多个视频</button>
+              <button id="pickFolder" class="button secondary" type="button" data-i18n="chooseFolder">选择文件夹</button>
+            </div>
+          </div>
+
+          <details class="server-paths">
+            <summary data-i18n="serverPaths">服务器路径 / 高级输入</summary>
+            <label class="field">
+              <span data-i18n="videoPaths">视频绝对路径（每行一个）</span>
+              <textarea id="videoPaths" rows="4" spellcheck="false"></textarea>
+            </label>
+            <label class="field">
+              <span data-i18n="folderPath">素材文件夹路径</span>
+              <input id="inputFolder" type="text" spellcheck="false" placeholder="F:\MEDIA\PROJECT">
+            </label>
+          </details>
+
+          <div class="field-row two">
+            <label class="field">
+              <span data-i18n="dataDir">运行数据目录</span>
+              <input id="dataDir" type="text" value="data/ui-run" spellcheck="false">
+            </label>
+            <label class="field">
+              <span data-i18n="fps">项目 FPS</span>
+              <select id="fpsMode">
+                <option value="auto">自动读取源素材</option>
+                <option value="23.976">23.976</option>
+                <option value="24">24</option>
+                <option value="25">25</option>
+                <option value="29.97">29.97</option>
+                <option value="30">30</option>
+                <option value="50">50</option>
+                <option value="59.94">59.94</option>
+                <option value="60">60</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="section-divider"><span data-i18n="aiHardware">AI 与硬件</span></div>
+          <div class="field-row two">
+            <label class="field">
+              <span data-i18n="visionModel">视觉 / Ollama 模型</span>
+              <select id="ollamaModel"></select>
+            </label>
+            <label class="field">
+              <span data-i18n="directorModel">文本导演模型</span>
+              <select id="directorModel"></select>
+            </label>
+          </div>
+          <div class="field-row three">
+            <label class="field"><span>Whisper</span><select id="whisperModel"><option>base</option><option>small</option><option>turbo</option><option>large-v3</option></select></label>
+            <label class="field"><span data-i18n="context">上下文</span><select id="numCtx"><option value="4096">4K</option><option value="8192">8K</option><option value="16384">16K</option><option value="32768">32K</option><option value="65536">64K</option></select></label>
+            <label class="field"><span data-i18n="chunk">分块分钟</span><select id="chunkMinutes"><option value="10">10</option><option value="12">12</option><option value="15">15</option></select></label>
+          </div>
+          <p id="hardwareSummary" class="hardware-summary" data-i18n="detectingHardware">正在检测硬件并计算质量优先配置…</p>
+
+          <details class="advanced-card">
+            <summary data-i18n="musicOutput">配乐与输出</summary>
+            <div class="field-row two">
+              <label class="field">
+                <span data-i18n="musicSource">音乐来源</span>
+                <select id="musicProvider">
+                  <option value="off">关闭</option>
+                  <option value="local">本地授权曲库</option>
+                  <option value="jamendo">Jamendo</option>
+                  <option value="yt_dlp">任意在线音频（需确认版权）</option>
+                </select>
+              </label>
+              <label class="field"><span data-i18n="musicFolder">本地音乐目录</span><input id="musicFolder" type="text" spellcheck="false"></label>
+            </div>
+            <label class="consent"><input id="musicRights" type="checkbox"><span data-i18n="rightsWarning">我确认拥有下载、改编、同步和发布所选音乐的权利，并自行遵守来源平台条款。</span></label>
+            <div class="switch-grid">
+              <label class="switch"><input id="sendResolve" type="checkbox"><span></span><b data-i18n="sendResolve">发送至 DaVinci Resolve</b></label>
+              <label class="switch"><input id="renderPreview" type="checkbox" checked><span></span><b data-i18n="renderPreview">生成审片预览</b></label>
+              <label class="switch"><input id="renderFinal" type="checkbox"><span></span><b data-i18n="renderFinal">Resolve 最终渲染</b></label>
+              <label class="switch"><input id="strictFps" type="checkbox" checked><span></span><b data-i18n="strictFps">严格匹配 FPS</b></label>
+            </div>
+          </details>
+        </form>
+      </section>
+
+      <section class="panel mission">
+        <div class="panel-heading mission-heading">
+          <div>
+            <p class="eyebrow" data-i18n="missionControl">MISSION CONTROL</p>
+            <h2 data-i18n="taskCenter">任务中心</h2>
+          </div>
+          <span class="serial-badge">SERIAL / VRAM SAFE</span>
+        </div>
+
+        <div class="run-status">
+          <div>
+            <h3 id="stageTitle" data-i18n="ready">准备就绪</h3>
+            <p id="stageSubtitle" data-i18n="readyHelp">选择素材后启动；任意时刻只运行一个重型模块。</p>
+          </div>
+          <span id="elapsed">00:00:00</span>
+        </div>
+        <div class="progress-track"><div id="progressBar"></div></div>
+
+        <div class="log-shell">
+          <div class="log-toolbar">
+            <span data-i18n="liveLog">实时日志</span>
+            <button id="clearLog" type="button" data-i18n="clear">清空</button>
+          </div>
+          <pre id="liveLog" aria-live="polite"></pre>
+        </div>
+
+        <div class="run-actions">
+          <button id="startButton" class="button primary" type="button"><span data-i18n="start">开始串行工作流</span></button>
+          <button id="stopButton" class="button danger" type="button" disabled data-i18n="stop">停止</button>
+        </div>
+
+        <div class="output-heading">
+          <div><p class="eyebrow">OUTPUT</p><h3 data-i18n="outputPreview">成片与预览</h3></div>
+          <button id="refreshOutputs" class="button ghost small" type="button" data-i18n="refresh">刷新</button>
+        </div>
+        <div id="outputList" class="output-list"><p class="empty" data-i18n="noOutput">完成工作流后可在这里直接播放成片。</p></div>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="tokenDialog">
+    <form method="dialog" class="dialog-card">
+      <h3 data-i18n="accessToken">访问令牌</h3>
+      <p data-i18n="tokenHelp">仅当服务部署到局域网或远程 Windows 主机时需要。令牌只保存在当前浏览器。</p>
+      <label class="field"><span>Token</span><input id="tokenInput" type="password" autocomplete="off"></label>
+      <div class="dialog-actions"><button value="cancel" class="button ghost" data-i18n="cancel">取消</button><button id="saveToken" value="default" class="button primary" data-i18n="save">保存</button></div>
+    </form>
+  </dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

@@ -196,7 +196,7 @@ class ProgramAudioRenderer:
                 chain.append("loudnorm=I=-18:TP=-2:LRA=11")
                 gain = min(3.0, max(-3.0, gain))
             else:
-                gain = min(6.0, max(-24.0, gain))
+                gain = min(6.0, max(-60.0, gain))
             if abs(gain) >= 0.01:
                 chain.append(f"volume={gain:.3f}dB")
             chain.extend(

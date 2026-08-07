@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from main import (
+    build_parser,
     WindowsSleepInhibitor,
     WorkflowError,
     WorkflowLock,
@@ -20,6 +21,10 @@ from main import (
 
 class OrchestratorTests(unittest.TestCase):
     """Exercise orchestration without launching heavy dependencies."""
+
+    def test_default_ollama_timeout_allows_slow_mixed_memory_directing(self):
+        args = build_parser().parse_args([])
+        self.assertEqual(args.ollama_timeout, 7200)
 
     def test_stage_waits_for_child_success(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -43,11 +48,30 @@ class OrchestratorTests(unittest.TestCase):
                 data_dir=root / "data",
                 logger=logging.getLogger("test.orchestrator"),
             )
-            with self.assertRaises(WorkflowError):
+            with self.assertRaisesRegex(WorkflowError, "stage_output.log"):
                 orchestrator._run_stage(
                     "unit",
                     [sys.executable, "-c", "raise SystemExit(7)"],
                 )
+
+    def test_stage_persists_child_output_for_postmortem(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            orchestrator = WorkflowOrchestrator(
+                project_root=root,
+                data_dir=root / "data",
+                logger=logging.getLogger("test.orchestrator.output"),
+            )
+            orchestrator._run_stage(
+                "diagnostic",
+                [sys.executable, "-c", "print('child diagnostic sentinel')"],
+            )
+
+            transcript = (root / "data" / "stage_output.log").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("diagnostic", transcript)
+            self.assertIn("child diagnostic sentinel", transcript)
 
     def test_lock_is_exclusive_and_removed(self):
         with tempfile.TemporaryDirectory() as temporary:

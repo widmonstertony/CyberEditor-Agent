@@ -402,30 +402,58 @@ def detect_torch_runtime() -> Dict[str, object]:
         "str(torch.__version__),'torch_cuda':ready,'torch_device':name}))\n"
         "except Exception as exc:\n"
         " print(json.dumps({'torch_available':False,'torch_version':'',"
-        "'torch_cuda':False,'torch_device':'','torch_error':str(exc)}))\n"
+        "'torch_cuda':False,'torch_device':'','torch_error':str(exc),"
+        "'torch_error_type':type(exc).__name__}))\n"
     )
-    try:
-        result = subprocess.run(
-            [console_python_executable(sys.executable), "-c", script],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=25,
-            check=False,
-            creationflags=_hidden_creation_flags(),
-            env=build_runtime_environment(),
-        )
-        payload = json.loads(result.stdout.strip().splitlines()[-1])
-        if isinstance(payload, dict):
-            return payload
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        pass
+    interpreter = console_python_executable(sys.executable)
+    last_error = ""
+    # CUDA DLL initialization can transiently race Windows Defender, driver
+    # startup, or another process releasing the GPU. A second disposable probe
+    # is cheap and avoids permanently downgrading automatic settings to CPU.
+    # CUDA DLL 初始化可能与 Defender、驱动启动或其他进程释放 GPU 短暂冲突；
+    # 使用第二个一次性探针，避免把瞬时失败永久误报成“未安装”。
+    for _attempt in range(2):
+        try:
+            result = subprocess.run(
+                [interpreter, "-c", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=45,
+                check=False,
+                creationflags=_hidden_creation_flags(),
+                env=build_runtime_environment(),
+            )
+            stdout = str(result.stdout or "").strip()
+            if not stdout:
+                last_error = str(result.stderr or "").strip() or (
+                    f"PyTorch probe exited with code {getattr(result, 'returncode', '?')}"
+                )
+                continue
+            payload = json.loads(stdout.splitlines()[-1])
+            if not isinstance(payload, dict):
+                last_error = "PyTorch probe returned a non-object JSON value."
+                continue
+            payload["torch_python"] = interpreter
+            error_type = str(payload.get("torch_error_type") or "")
+            if bool(payload.get("torch_available")):
+                payload["torch_probe_failed"] = False
+                return payload
+            if error_type == "ModuleNotFoundError":
+                payload["torch_probe_failed"] = False
+                return payload
+            last_error = str(payload.get("torch_error") or error_type or "Unknown import error")
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
     return {
         "torch_available": False,
         "torch_version": "",
         "torch_cuda": False,
         "torch_device": "",
+        "torch_probe_failed": True,
+        "torch_error": last_error or "PyTorch probe returned no result.",
+        "torch_python": interpreter,
     }
 
 
@@ -1817,11 +1845,14 @@ class CyberEditorApp:
         vram = float(self.detected_hardware.get("vram_gb") or 0)
         gpu_text = f"{gpu} {vram:g}GB" if vram > 0 else gpu
         prefix = f"{gpu_text} • RAM {ram:g}GB • CPU {threads}T"
-        torch_mode = (
-            "PyTorch CUDA"
-            if bool(self.detected_hardware.get("torch_cuda"))
-            else "PyTorch CPU"
-        )
+        if bool(self.detected_hardware.get("torch_cuda")):
+            torch_mode = "PyTorch CUDA"
+        elif bool(self.detected_hardware.get("torch_available")):
+            torch_mode = "PyTorch CPU"
+        elif bool(self.detected_hardware.get("torch_probe_failed")):
+            torch_mode = "PyTorch probe failed"
+        else:
+            torch_mode = "PyTorch not installed"
         prefix = f"{prefix} • {torch_mode}"
         return f"{prefix}\n↳ {suffix}" if suffix else prefix
 

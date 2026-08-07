@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from src.music_bed import MusicBedRenderer
+from src.music_bed import MusicBedError, MusicBedRenderer
 
 
 class MusicBedRendererTests(unittest.TestCase):
@@ -65,13 +65,18 @@ class MusicBedRendererTests(unittest.TestCase):
             )
 
             def fake_run(command, **kwargs):
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_bytes(b"wav")
+                rendered = Path(command[-1])
+                rendered.parent.mkdir(parents=True, exist_ok=True)
+                rendered.write_bytes(b"wav")
                 return mock.Mock(returncode=0, stderr="")
 
             with mock.patch("src.music_bed.shutil.which", return_value="ffmpeg"), mock.patch(
                 "src.music_bed.subprocess.run", side_effect=fake_run
-            ) as run:
+            ) as run, mock.patch.object(
+                MusicBedRenderer, "_measure_peak_db", return_value=-6.0
+            ), mock.patch.object(
+                MusicBedRenderer, "_measure_integrated_lufs", return_value=-23.0
+            ):
                 result = MusicBedRenderer(timeline, output).render()
 
             self.assertEqual(result, output.resolve())
@@ -80,9 +85,53 @@ class MusicBedRendererTests(unittest.TestCase):
             self.assertIn("eval=frame", graph)
             self.assertIn("0.35481339", graph)
             self.assertIn("volume=0", graph)
+            self.assertIn("loudnorm=I=-23:TP=-2:LRA=11", graph)
             updated = json.loads(timeline.read_text(encoding="utf-8"))
             self.assertEqual(updated["music_plan"]["bed_file"], str(output.resolve()))
             self.assertTrue(output.with_suffix(".audit.json").is_file())
+
+    def test_silent_render_is_rejected_before_replacing_previous_bed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            track = root / "track.wav"
+            track.write_bytes(b"source")
+            output = root / "music_bed.wav"
+            output.write_bytes(b"previous-good-bed")
+            timeline = root / "timeline.json"
+            timeline.write_text(
+                json.dumps(
+                    {
+                        "clips": [{"cut_in_sec": 0, "cut_out_sec": 2}],
+                        "music_plan": {
+                            "silence_regions": [],
+                            "cues": [
+                                {
+                                    "file_name": str(track), "timeline_in_sec": 0,
+                                    "timeline_out_sec": 2, "track_in_sec": 0,
+                                    "track_out_sec": 2,
+                                }
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_run(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"all-zero-wav")
+                return mock.Mock(returncode=0, stderr="")
+
+            with mock.patch("src.music_bed.shutil.which", return_value="ffmpeg"), mock.patch(
+                "src.music_bed.subprocess.run", side_effect=fake_run
+            ), mock.patch.object(
+                MusicBedRenderer, "_measure_peak_db", return_value=float("-inf")
+            ), mock.patch.object(
+                MusicBedRenderer, "_measure_integrated_lufs", return_value=-23.0
+            ):
+                with self.assertRaises(MusicBedError):
+                    MusicBedRenderer(timeline, output).render()
+
+            self.assertEqual(output.read_bytes(), b"previous-good-bed")
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg integration test")
     def test_real_ffmpeg_renders_two_overlapping_cues(self):

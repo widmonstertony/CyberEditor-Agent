@@ -49,6 +49,32 @@ class MediaExtractorTests(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             MediaExtractor._normalize_segments([])
 
+    def test_normalize_drops_long_sparse_whisper_hallucination(self):
+        result = MediaExtractor._normalize_segments(
+            [
+                {
+                    "id": 1,
+                    "start": 59.68,
+                    "end": 75.92,
+                    "text": "难道是",
+                    "avg_logprob": -0.9,
+                    "no_speech_prob": 0.2,
+                },
+                {
+                    "id": 2,
+                    "start": 76.0,
+                    "end": 79.0,
+                    "text": "我们现在一起戴上头盔",
+                    "avg_logprob": -0.2,
+                    "no_speech_prob": 0.05,
+                },
+            ]
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "我们现在一起戴上头盔")
+        self.assertEqual(result[0]["avg_logprob"], -0.2)
+
     def test_whisper_tail_is_clamped_to_real_media_duration(self):
         result = MediaExtractor._clamp_segments_to_duration(
             [

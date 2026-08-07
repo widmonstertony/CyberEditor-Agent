@@ -22,6 +22,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -572,14 +573,49 @@ class MediaExtractor:
             text = " ".join(str(segment.get("text", "")).split())
             if end <= start or not text:
                 continue
-            normalized.append(
-                {
-                    "id": int(segment.get("id", index)),
-                    "start_sec": round(start, 3),
-                    "end_sec": round(end, 3),
-                    "text": text,
-                }
+            duration = end - start
+            speech_units = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", text))
+            avg_logprob = segment.get("avg_logprob")
+            no_speech_prob = segment.get("no_speech_prob")
+            try:
+                avg_logprob_value = float(avg_logprob)
+            except (TypeError, ValueError):
+                avg_logprob_value = None
+            try:
+                no_speech_value = float(no_speech_prob)
+            except (TypeError, ValueError):
+                no_speech_value = None
+            # Whisper occasionally stretches a tiny hallucinated phrase across
+            # a long silent region. Such a range later makes the editor preserve
+            # silence as dialogue and ducks the score for many seconds.
+            # Whisper 偶尔会把极短幻听横跨很长静音；这会误导导演保留整段并压低配乐。
+            implausibly_sparse = (
+                (duration >= 8.0 and speech_units <= 4)
+                or (duration >= 10.0 and speech_units / max(duration, 0.001) < 0.45)
             )
+            low_confidence_silence = (
+                no_speech_value is not None
+                and avg_logprob_value is not None
+                and no_speech_value >= 0.80
+                and avg_logprob_value <= -0.50
+            )
+            if implausibly_sparse or low_confidence_silence:
+                continue
+            item: Dict[str, Any] = {
+                "id": int(segment.get("id", index)),
+                "start_sec": round(start, 3),
+                "end_sec": round(end, 3),
+                "text": text,
+            }
+            for key in ("avg_logprob", "no_speech_prob", "compression_ratio"):
+                value = segment.get(key)
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric):
+                    item[key] = round(numeric, 6)
+            normalized.append(item)
         if not normalized:
             raise ExtractionError(
                 "Whisper 没有生成有效台词。请检查音轨、语言或模型。"

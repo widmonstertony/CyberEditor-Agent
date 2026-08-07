@@ -57,6 +57,36 @@ class WorkflowOptionsTests(unittest.TestCase):
                 run.call_args.args[0][0], str(python.resolve())
             )
 
+    def test_torch_detection_retries_transient_probe_failure(self) -> None:
+        failed = mock.Mock(stdout="", stderr="transient CUDA DLL initialization", returncode=1)
+        succeeded = mock.Mock(
+            stdout=(
+                '{"torch_available":true,"torch_version":"test+cu",'
+                '"torch_cuda":true,"torch_device":"Test GPU"}\n'
+            ),
+            stderr="",
+            returncode=0,
+        )
+
+        with mock.patch(
+            "src.gui.subprocess.run", side_effect=[failed, succeeded]
+        ) as run:
+            runtime = detect_torch_runtime()
+
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(runtime["torch_cuda"])
+        self.assertFalse(runtime["torch_probe_failed"])
+
+    def test_torch_probe_failure_is_not_reported_as_missing_package(self) -> None:
+        failed = mock.Mock(stdout="", stderr="driver still initializing", returncode=1)
+
+        with mock.patch("src.gui.subprocess.run", return_value=failed):
+            runtime = detect_torch_runtime()
+
+        self.assertFalse(runtime["torch_available"])
+        self.assertTrue(runtime["torch_probe_failed"])
+        self.assertIn("driver still initializing", runtime["torch_error"])
+
     def test_full_workflow_builds_expected_flags(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

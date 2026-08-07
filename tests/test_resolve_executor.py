@@ -154,6 +154,87 @@ class ResolveExecutorTests(unittest.TestCase):
         executor = DaVinciExecutor("timeline_cuts.json")
         self.assertEqual(executor._media_fps(NativeFpsItem()), Decimal("50"))
 
+    def test_graphics_plan_inserts_editable_text_plus(self):
+        class TextTool:
+            def __init__(self):
+                self.inputs = {}
+
+            def SetInput(self, key, value):
+                self.inputs[key] = value
+                return True
+
+        class FusionComp:
+            def __init__(self, tool):
+                self.tool = tool
+
+            def GetToolList(self, *_args):
+                return {"Text1": self.tool}
+
+        class TitleItem:
+            def __init__(self, tool):
+                self.tool = tool
+                self.name = ""
+                self.properties = {}
+
+            def SetName(self, name):
+                self.name = name
+                return True
+
+            def SetProperty(self, key, value):
+                self.properties[key] = value
+                return True
+
+            def GetFusionCompByIndex(self, _index):
+                return FusionComp(self.tool)
+
+        class GraphicsTimeline:
+            def __init__(self):
+                self.tool = TextTool()
+                self.title = TitleItem(self.tool)
+                self.timecodes = []
+                self.track_name = ""
+
+            def GetTrackCount(self, _kind):
+                return 1
+
+            def AddTrack(self, *_args):
+                return True
+
+            def GetStartTimecode(self):
+                return "01:00:00:00"
+
+            def SetCurrentTimecode(self, value):
+                self.timecodes.append(value)
+                return True
+
+            def InsertFusionTitleIntoTimeline(self, name):
+                self.inserted_name = name
+                return self.title
+
+            def SetTrackName(self, _kind, _index, value):
+                self.track_name = value
+                return True
+
+        timeline = GraphicsTimeline()
+        executor = DaVinciExecutor("timeline_cuts.json")
+        executor.timeline = timeline
+        executor.graphics_plan = {
+            "items": [
+                {
+                    "graphic_id": "G1", "kind": "title_card",
+                    "timeline_in_sec": 2, "timeline_out_sec": 5,
+                    "text": "NIGHT SHIFT", "subtitle": "Ready is a ritual",
+                    "style": "bold_cinematic",
+                }
+            ]
+        }
+
+        inserted = executor.append_graphics_titles(Decimal("59.94006"))
+
+        self.assertEqual(inserted, [])
+        self.assertFalse(hasattr(timeline, "inserted_name"))
+        self.assertEqual(timeline.timecodes, [])
+
     def test_transient_untitled_project_is_replaced_with_named_project(self):
         transient = FakeProject()
         transient.name = "Untitled Project"
@@ -796,6 +877,71 @@ class ResolveExecutorTests(unittest.TestCase):
             self.assertEqual(
                 wait_for_api.call_args_list,
                 [mock.call(module, first_process), mock.call(module, second_process)],
+            )
+
+    def test_connect_recovers_when_script_server_needs_two_restarts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = root / "timeline_cuts.json"
+            plan.write_text("{}", encoding="utf-8")
+            executable = root / "Resolve.exe"
+            executable.touch()
+            expected = FakeResolve(FakeProject())
+            module = mock.Mock()
+            module.scriptapp.return_value = None
+            processes = [mock.Mock(), mock.Mock(), mock.Mock()]
+            executor = DaVinciExecutor(
+                json_path=plan,
+                startup_timeout=5,
+                startup_attempts=3,
+                logger=logging.getLogger("test.resolve.multi_restart"),
+            )
+
+            with (
+                mock.patch("src.resolve_executor.platform.system", return_value="Windows"),
+                mock.patch(
+                    "src.resolve_executor.get_resolve_registration",
+                    return_value={"installed": True, "version": "21"},
+                ),
+                mock.patch(
+                    "src.resolve_executor.find_resolve_executable",
+                    return_value=executable,
+                ),
+                mock.patch.object(executor, "_configure_resolve_library"),
+                mock.patch.object(
+                    executor,
+                    "_load_resolve_module",
+                    return_value=(module, [], []),
+                ),
+                mock.patch.object(executor, "_is_resolve_running", return_value=False),
+                mock.patch.object(
+                    executor,
+                    "_launch_resolve",
+                    side_effect=processes,
+                ) as launch,
+                mock.patch.object(
+                    executor,
+                    "_wait_for_scriptapp",
+                    side_effect=[None, None, expected],
+                ) as wait_for_api,
+                mock.patch.object(executor, "_stop_auto_started_resolve") as stop,
+                mock.patch("src.resolve_executor.time.sleep"),
+            ):
+                result = executor.connect()
+
+            self.assertIs(result, expected)
+            self.assertEqual(launch.call_count, 3)
+            self.assertEqual(
+                stop.call_args_list,
+                [mock.call(processes[0]), mock.call(processes[1])],
+            )
+            self.assertEqual(
+                wait_for_api.call_args_list,
+                [
+                    mock.call(module, processes[0]),
+                    mock.call(module, processes[1]),
+                    mock.call(module, processes[2]),
+                ],
             )
 
     def test_preconformed_program_audio_makes_picture_video_only_and_uses_a1(self):

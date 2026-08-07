@@ -25,12 +25,14 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
 
 LOGGER_NAME = "cybereditor.director"
 DIRECTOR_CHECKPOINT_VERSION = 1
-DIRECTOR_PROMPT_VERSION = "2026-08-03.5-continuous-full-review"
+DIRECTOR_PROMPT_VERSION = "2026-08-05.7-evidence-contract-blind-viewer"
 
 COLOR_BIBLE_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -83,6 +85,15 @@ TREATMENT_SCHEMA: Dict[str, Any] = {
         "title": {"type": "string", "minLength": 1},
         "logline": {"type": "string", "minLength": 1},
         "central_theme": {"type": "string", "minLength": 1},
+        "viewer_takeaway": {"type": "string", "minLength": 1},
+        "edit_style": {
+            "type": "string",
+            "enum": [
+                "narrative_documentary", "kinetic_montage", "atmospheric_poem",
+                "dialogue_led", "hybrid_cinematic",
+            ],
+        },
+        "typography_intent": {"type": "string", "minLength": 1},
         "chronology_policy": {
             "type": "string",
             "enum": ["strict_chronological", "teaser_then_chronological"],
@@ -154,7 +165,8 @@ TREATMENT_SCHEMA: Dict[str, Any] = {
         },
     },
     "required": [
-        "title", "logline", "central_theme", "chronology_policy",
+        "title", "logline", "central_theme", "viewer_takeaway", "edit_style",
+        "typography_intent", "chronology_policy",
         "target_duration_sec", "opening_beat", "development_beat",
         "payoff_beat", "ending_beat", "color_intent", "creative_look", "color_bible",
         "music_mood", "music_energy_arc", "music_search_queries",
@@ -163,6 +175,47 @@ TREATMENT_SCHEMA: Dict[str, Any] = {
         "music_silence_strategy", "music_license_intent",
         "editorial_rules", "story_anchors",
     ],
+    "additionalProperties": False,
+}
+
+GRAPHICS_PLAN_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "strategy": {"type": "string", "minLength": 1},
+        "items": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "graphic_id": {"type": "string", "minLength": 1},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["title_card", "chapter", "lower_third", "end_card"],
+                    },
+                    "anchor_candidate_id": {"type": "string", "minLength": 1},
+                    "placement": {
+                        "type": "string",
+                        "enum": ["clip_start", "clip_middle", "clip_end"],
+                    },
+                    "duration_sec": {"type": "number", "minimum": 0.8, "maximum": 6},
+                    "text": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "subtitle": {"type": "string", "maxLength": 140},
+                    "style": {
+                        "type": "string",
+                        "enum": ["minimal", "bold_cinematic", "kinetic", "editorial"],
+                    },
+                    "purpose": {"type": "string", "minLength": 1, "maxLength": 240},
+                },
+                "required": [
+                    "graphic_id", "kind", "anchor_candidate_id", "placement",
+                    "duration_sec", "text", "subtitle", "style", "purpose",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["strategy", "items"],
     "additionalProperties": False,
 }
 
@@ -182,7 +235,7 @@ DECISION_SCHEMA: Dict[str, Any] = {
                         "minimum": 0,
                         "maximum": 1,
                     },
-                    "volume_db": {"type": "number", "minimum": -24, "maximum": 12},
+                    "volume_db": {"type": "number", "minimum": -60, "maximum": 12},
                     "drx_preset": {
                         "type": "string",
                         "enum": [
@@ -292,7 +345,7 @@ CANDIDATE_SCHEMA: Dict[str, Any] = {
                         "type": "string",
                         "enum": ["static", "gentle_push_in"],
                     },
-                    "volume_db": {"type": "number", "minimum": -24, "maximum": 12},
+                    "volume_db": {"type": "number", "minimum": -60, "maximum": 12},
                     "drx_preset": {
                         "type": "string",
                         "enum": [
@@ -343,6 +396,15 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "project_summary": {"type": "string"},
+        "viewer_takeaway": {"type": "string", "minLength": 1},
+        "editorial_style": {
+            "type": "string",
+            "enum": [
+                "narrative_documentary", "kinetic_montage", "atmospheric_poem",
+                "dialogue_led", "hybrid_cinematic",
+            ],
+        },
+        "graphics_plan": GRAPHICS_PLAN_SCHEMA,
         "music_plan": {
             "type": "object",
             "properties": {
@@ -422,7 +484,26 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "candidate_id": {"type": "string", "minLength": 1},
-                    "reason_for_position": {"type": "string"},
+                    "trim_in_sec": {"type": "number", "minimum": 0},
+                    "trim_out_sec": {"type": "number", "minimum": 0},
+                    "narrative_function": {
+                        "type": "string",
+                        "enum": [
+                            "hook", "context", "escalation", "contrast",
+                            "payoff", "closure",
+                        ],
+                    },
+                    "viewer_information": {"type": "string", "minLength": 1},
+                    "reason_for_position": {"type": "string", "minLength": 1},
+                    "evidence_claim": {"type": "string", "minLength": 1},
+                    "connection_to_previous": {"type": "string", "minLength": 1},
+                    "audio_intent": {
+                        "type": "string",
+                        "enum": [
+                            "preserve_dialogue", "natural_texture",
+                            "mute_for_music", "mix_with_music",
+                        ],
+                    },
                     "music_edit_role": {
                         "type": "string",
                         "enum": [
@@ -451,7 +532,7 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
                         "type": "string",
                         "enum": ["static", "gentle_push_in"],
                     },
-                    "volume_db": {"type": "number", "minimum": -24, "maximum": 12},
+                    "volume_db": {"type": "number", "minimum": -60, "maximum": 12},
                     "drx_preset": {
                         "type": "string",
                         "enum": [
@@ -476,12 +557,20 @@ SEQUENCE_SCHEMA: Dict[str, Any] = {
                     },
                     "smart_reframe": {"type": "boolean"},
                 },
-                "required": ["candidate_id", "music_edit_role"],
+                "required": [
+                    "candidate_id", "trim_in_sec", "trim_out_sec",
+                    "narrative_function", "viewer_information",
+                    "reason_for_position", "evidence_claim",
+                    "connection_to_previous", "audio_intent", "music_edit_role",
+                ],
                 "additionalProperties": False,
             },
         },
     },
-    "required": ["project_summary", "music_plan", "sequence"],
+    "required": [
+        "project_summary", "viewer_takeaway", "editorial_style",
+        "graphics_plan", "music_plan", "sequence",
+    ],
     "additionalProperties": False,
 }
 
@@ -496,9 +585,56 @@ SEQUENCE_SELECTION_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "project_summary": SEQUENCE_SCHEMA["properties"]["project_summary"],
+        "viewer_takeaway": SEQUENCE_SCHEMA["properties"]["viewer_takeaway"],
+        "editorial_style": SEQUENCE_SCHEMA["properties"]["editorial_style"],
+        "graphics_plan": SEQUENCE_SCHEMA["properties"]["graphics_plan"],
         "sequence": SEQUENCE_SCHEMA["properties"]["sequence"],
     },
-    "required": ["project_summary", "sequence"],
+    "required": [
+        "project_summary", "viewer_takeaway", "editorial_style",
+        "graphics_plan", "sequence",
+    ],
+    "additionalProperties": False,
+}
+
+SUPERVISING_EDITOR_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        **SEQUENCE_SELECTION_SCHEMA["properties"],
+        "review": {
+            "type": "object",
+            "properties": {
+                "clarity_score": {"type": "integer", "minimum": 1, "maximum": 10},
+                "pacing_score": {"type": "integer", "minimum": 1, "maximum": 10},
+                "visual_storytelling_score": {"type": "integer", "minimum": 1, "maximum": 10},
+                "rhythm_score": {"type": "integer", "minimum": 1, "maximum": 10},
+                "problems_found": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "minItems": 1,
+                    "maxItems": 10,
+                },
+                "changes_made": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "minItems": 1,
+                    "maxItems": 10,
+                },
+                "dialogue_strategy": {"type": "string", "minLength": 1, "maxLength": 800},
+                "rhythm_strategy": {"type": "string", "minLength": 1, "maxLength": 800},
+            },
+            "required": [
+                "clarity_score", "pacing_score", "visual_storytelling_score",
+                "rhythm_score", "problems_found", "changes_made",
+                "dialogue_strategy", "rhythm_strategy",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    "required": [
+        *SEQUENCE_SELECTION_SCHEMA["required"],
+        "review",
+    ],
     "additionalProperties": False,
 }
 
@@ -546,10 +682,124 @@ COVERAGE_SYNOPSIS_SCHEMA: Dict[str, Any] = {
             "items": {"type": "string", "minLength": 1, "maxLength": 300},
             "maxItems": 10,
         },
+        "observed_ending": {"type": "string", "minLength": 1, "maxLength": 600},
+        "absent_or_unproven_events": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 300},
+            "maxItems": 12,
+        },
+        "honest_adaptation": {"type": "string", "minLength": 1, "maxLength": 800},
     },
     "required": [
         "whole_footage_summary", "discovered_central_theme", "character_threads",
-        "event_timeline", "visual_motifs", "continuity_risks",
+        "event_timeline", "visual_motifs", "continuity_risks", "observed_ending",
+        "absent_or_unproven_events", "honest_adaptation",
+    ],
+    "additionalProperties": False,
+}
+
+NARRATIVE_CONTRACT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "narrative_mode": {
+            "type": "string",
+            "enum": [
+                "causal_story", "dialogue_scene", "character_vignette",
+                "mood_montage", "bts_process",
+            ],
+        },
+        "premise": {"type": "string", "minLength": 1, "maxLength": 500},
+        "subject": {"type": "string", "minLength": 1, "maxLength": 300},
+        "observed_goal": {"type": "string", "minLength": 1, "maxLength": 500},
+        "has_causal_arc": {"type": "boolean"},
+        "causal_chain": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string", "minLength": 1},
+                    "observed_fact": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "state_before": {"type": "string", "minLength": 1, "maxLength": 300},
+                    "state_after": {"type": "string", "minLength": 1, "maxLength": 300},
+                    "story_consequence": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "evidence_type": {
+                        "type": "string",
+                        "enum": ["visual", "audible", "both"],
+                    },
+                },
+                "required": [
+                    "candidate_id", "observed_fact", "state_before", "state_after",
+                    "story_consequence", "evidence_type",
+                ],
+                "additionalProperties": False,
+            },
+            "minItems": 1,
+            "maxItems": 8,
+        },
+        "final_observed_state": {"type": "string", "minLength": 1, "maxLength": 500},
+        "unsupported_promises": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 300},
+            "maxItems": 12,
+        },
+        "dialogue_policy": {
+            "type": "string",
+            "enum": [
+                "story_dialogue_only", "sparse_character_lines",
+                "natural_texture_only", "mute_production_chatter", "dialogue_led",
+            ],
+        },
+        "success_criteria": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 300},
+            "minItems": 3,
+            "maxItems": 6,
+        },
+        "recommended_duration_sec": {"type": "number", "minimum": 10, "maximum": 600},
+    },
+    "required": [
+        "narrative_mode", "premise", "subject", "observed_goal", "has_causal_arc",
+        "causal_chain", "final_observed_state", "unsupported_promises",
+        "dialogue_policy", "success_criteria", "recommended_duration_sec",
+    ],
+    "additionalProperties": False,
+}
+
+BLIND_VIEWER_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "literal_synopsis": {"type": "string", "minLength": 1, "maxLength": 900},
+        "subject": {"type": "string", "minLength": 1, "maxLength": 250},
+        "apparent_goal": {"type": "string", "minLength": 1, "maxLength": 350},
+        "progression": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 350},
+            "minItems": 1,
+            "maxItems": 8,
+        },
+        "ending": {"type": "string", "minLength": 1, "maxLength": 350},
+        "takeaway_guess": {"type": "string", "minLength": 1, "maxLength": 500},
+        "coherence_score": {"type": "integer", "minimum": 1, "maximum": 10},
+        "causal_clarity_score": {"type": "integer", "minimum": 1, "maximum": 10},
+        "visual_payoff_score": {"type": "integer", "minimum": 1, "maximum": 10},
+        "confusing_transitions": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 350},
+            "maxItems": 8,
+        },
+        "unsupported_or_unresolved_points": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 350},
+            "maxItems": 8,
+        },
+        "passes": {"type": "boolean"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 700},
+    },
+    "required": [
+        "literal_synopsis", "subject", "apparent_goal", "progression", "ending",
+        "takeaway_guess", "coherence_score", "causal_clarity_score",
+        "visual_payoff_score", "confusing_transitions",
+        "unsupported_or_unresolved_points", "passes", "reason",
     ],
     "additionalProperties": False,
 }
@@ -599,7 +849,7 @@ class AIDirector:
         chunk_minutes: float = 12.0,
         project_fps: float = 25.0,
         num_ctx: int = 8192,
-        timeout_sec: int = 1800,
+        timeout_sec: int = 7200,
         merge_gap_sec: float = 0.4,
         creative_brief: str = "",
         target_duration_sec: float = 0.0,
@@ -607,6 +857,7 @@ class AIDirector:
         music_folder: Optional[os.PathLike] = None,
         music_analysis: Optional[os.PathLike] = None,
         treatment_file: Optional[os.PathLike] = None,
+        rough_cut_feedback: Optional[os.PathLike] = None,
         session: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -669,6 +920,33 @@ class AIDirector:
             raise DirectorError(
                 f"导演初审文件不存在 / Director treatment not found: {self.treatment_path}"
             )
+        self.rough_cut_feedback_path = (
+            Path(rough_cut_feedback).expanduser().resolve()
+            if rough_cut_feedback else None
+        )
+        if (
+            self.rough_cut_feedback_path is not None
+            and not self.rough_cut_feedback_path.is_file()
+        ):
+            raise DirectorError(
+                "粗剪盲审文件不存在 / Rough-cut review not found: "
+                f"{self.rough_cut_feedback_path}"
+            )
+        self._rough_cut_feedback: Dict[str, Any] = {}
+        if self.rough_cut_feedback_path is not None:
+            try:
+                feedback = json.loads(
+                    self.rough_cut_feedback_path.read_text(encoding="utf-8-sig")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise DirectorError(
+                    f"无法读取粗剪盲审 / Cannot read rough-cut review: {exc}"
+                ) from exc
+            if not isinstance(feedback, dict):
+                raise DirectorError(
+                    "粗剪盲审根节点必须是对象 / Rough-cut review must be an object."
+                )
+            self._rough_cut_feedback = feedback
         self._music_analysis: Dict[str, Any] = {}
         self._active_treatment: Dict[str, Any] = {}
         self._active_target_duration_sec = 0.0
@@ -944,11 +1222,12 @@ class AIDirector:
             treatment_payload if isinstance(treatment_payload, dict) else {},
             assets,
         )
-        candidates = self.candidates_from_treatment(treatment, assets)
-        candidates.extend(
+        candidates = [
             dict(item) for item in audit
             if isinstance(item, dict) and not item.get("protected_story_anchor")
-        )
+        ]
+        if not candidates:
+            candidates = self.candidates_from_treatment(treatment, assets)
         candidates = self.merge_decisions(candidates)
         for index, candidate in enumerate(candidates, start=1):
             candidate["candidate_id"] = f"C{index:04d}"
@@ -1046,8 +1325,40 @@ class AIDirector:
         treatment = self.load_treatment(assets)
         self._active_treatment = treatment
         candidates = self._sanitize_candidate_bounds(
-            [dict(item) for item in audit if isinstance(item, dict)], assets
+            [
+                dict(item) for item in audit
+                if isinstance(item, dict) and not item.get("protected_story_anchor")
+            ],
+            assets,
         )
+        # A new treatment can select evidence that an older candidate audit did
+        # not promote. Reassembly must not silently make those story anchors
+        # unavailable to the editor. Keep the richer reviewed candidate when the
+        # ranges overlap; otherwise restore the treatment anchor to the pool.
+        treatment_candidates = self._sanitize_candidate_bounds(
+            self.candidates_from_treatment(treatment, assets), assets
+        )
+        added_treatment_candidates = 0
+        for anchor in treatment_candidates:
+            anchor_asset = str(anchor.get("asset_id") or "")
+            anchor_in = float(anchor.get("cut_in_sec", 0) or 0)
+            anchor_out = float(anchor.get("cut_out_sec", 0) or 0)
+            overlaps_existing = any(
+                str(item.get("asset_id") or "") == anchor_asset
+                and min(anchor_out, float(item.get("cut_out_sec", 0) or 0))
+                - max(anchor_in, float(item.get("cut_in_sec", 0) or 0))
+                >= 0.5
+                for item in candidates
+            )
+            if not overlaps_existing:
+                candidates.append(anchor)
+                added_treatment_candidates += 1
+        if added_treatment_candidates:
+            self.logger.info(
+                "Reassembly restored %d treatment anchors omitted by the reusable "
+                "candidate audit",
+                added_treatment_candidates,
+            )
         candidates = self._attach_candidate_dialogue(candidates, assets)
         candidates = sorted(
             candidates,
@@ -1065,6 +1376,7 @@ class AIDirector:
             final_clips = self.validate_sequence(
                 sequence_payload, candidates, treatment
             )
+            final_clips = self._attach_candidate_dialogue(final_clips, assets)
         finally:
             self.unload_model(self.text_model)
         program_duration = sum(
@@ -1080,8 +1392,8 @@ class AIDirector:
         )
         music_plan = self.enforce_dialogue_ducking(final_clips, music_plan)
         music_plan = self.enrich_music_sync_points(final_clips, music_plan)
-        final_clips = self.snap_visual_cuts_to_beats(
-            final_clips, music_plan, assets
+        graphics_plan = self.validate_graphics_plan(
+            sequence_payload.get("graphics_plan"), final_clips, treatment
         )
         music_plan["program_duration_sec"] = round(
             sum(
@@ -1121,6 +1433,18 @@ class AIDirector:
                 "project_summary": str(
                     sequence_payload.get("project_summary") or ""
                 ).strip(),
+                "viewer_takeaway": str(
+                    sequence_payload.get("viewer_takeaway")
+                    or treatment.get("viewer_takeaway")
+                    or ""
+                ).strip(),
+                "editorial_style": str(
+                    sequence_payload.get("editorial_style")
+                    or treatment.get("edit_style")
+                    or "hybrid_cinematic"
+                ),
+                "graphics_plan": graphics_plan,
+                "picture_lock_audit": sequence_payload.get("picture_lock_audit", {}),
                 "full_review_synopsis": sequence_payload.get(
                     "coverage_synopsis", {}
                 ),
@@ -1229,7 +1553,6 @@ class AIDirector:
             ] or self.discover_music_files()
             treatment = self.load_treatment(assets)
             self._active_treatment = treatment
-            candidates.extend(self.candidates_from_treatment(treatment, assets))
             for index, chunk in enumerate(chunks, start=1):
                 asset_id = str(chunk["asset_id"])
                 chunk["continuity_context"] = self._asset_continuity_summaries.get(
@@ -1338,6 +1661,7 @@ class AIDirector:
             final_clips = self.validate_sequence(
                 sequence_payload, candidates, treatment
             )
+            final_clips = self._attach_candidate_dialogue(final_clips, assets)
         finally:
             self.unload_model(self.model)
             if self.text_model.casefold() != self.model.casefold():
@@ -1352,7 +1676,9 @@ class AIDirector:
         )
         music_plan = self.enforce_dialogue_ducking(final_clips, music_plan)
         music_plan = self.enrich_music_sync_points(final_clips, music_plan)
-        final_clips = self.snap_visual_cuts_to_beats(final_clips, music_plan, assets)
+        graphics_plan = self.validate_graphics_plan(
+            sequence_payload.get("graphics_plan"), final_clips, treatment
+        )
         music_plan["program_duration_sec"] = round(
             sum(
                 max(
@@ -1419,6 +1745,18 @@ class AIDirector:
             "candidate_count": len(candidates),
             "candidate_audit": candidates,
             "project_summary": str(sequence_payload.get("project_summary") or "").strip(),
+            "viewer_takeaway": str(
+                sequence_payload.get("viewer_takeaway")
+                or treatment.get("viewer_takeaway")
+                or ""
+            ).strip(),
+            "editorial_style": str(
+                sequence_payload.get("editorial_style")
+                or treatment.get("edit_style")
+                or "hybrid_cinematic"
+            ),
+            "graphics_plan": graphics_plan,
+            "picture_lock_audit": sequence_payload.get("picture_lock_audit", {}),
             "full_review_synopsis": sequence_payload.get("coverage_synopsis", {}),
             "candidate_directing": sequence_payload.get("candidate_directing", {}),
             "director_treatment": treatment,
@@ -1511,7 +1849,10 @@ class AIDirector:
                             )
                             if float(segment["end_sec"]) > start_sec:
                                 bounded_transcript.append(segment)
-                        asset["transcript"] = bounded_transcript
+                        asset["transcript"] = self._sanitize_transcript_segments(
+                            bounded_transcript,
+                            f"assets[{index}]",
+                        )
                 self._validate_asset_data(asset, f"assets[{index}]")
                 for frame in asset.get("keyframes", []):
                     if not isinstance(frame, dict):
@@ -1566,6 +1907,76 @@ class AIDirector:
             previous_start = start
         payload["duration_sec"] = duration
         return payload
+
+    def _sanitize_transcript_segments(
+        self,
+        segments: Sequence[Dict[str, Any]],
+        source_label: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Remove high-confidence structural signs of Whisper silence hallucination.
+        删除具有明确结构特征的 Whisper 静音幻听。
+
+        Parameters / 参数:
+            segments: Timestamped Whisper segments. / 带时间戳的 Whisper 片段。
+            source_label: Human-readable source identifier for logging. / 日志素材标识。
+
+        The filter is deliberately conservative: it rejects only a tiny phrase
+        stretched across a long range, or a segment whose own Whisper metadata
+        identifies probable silence with poor log probability. Existing
+        ``raw_data.json`` is cleaned on load, so a director-only rerun benefits
+        without repeating GPU extraction.
+
+        过滤器刻意保守：只删除横跨长时间的极短词组，或 Whisper 元数据同时显示
+        高静音概率与低置信度的片段。旧 ``raw_data.json`` 在加载时也会获益。
+        """
+        kept: List[Dict[str, Any]] = []
+        rejected = 0
+        for raw in segments:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            text = " ".join(str(item.get("text") or "").split())
+            try:
+                start = float(item.get("start_sec", 0))
+                end = float(item.get("end_sec", start))
+            except (TypeError, ValueError):
+                kept.append(item)
+                continue
+            duration = max(0.0, end - start)
+            speech_units = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", text))
+            try:
+                avg_logprob = float(item.get("avg_logprob"))
+            except (TypeError, ValueError):
+                avg_logprob = None
+            try:
+                no_speech_prob = float(item.get("no_speech_prob"))
+            except (TypeError, ValueError):
+                no_speech_prob = None
+            implausibly_sparse = (
+                (duration >= 8.0 and speech_units <= 4)
+                or (duration >= 10.0 and speech_units / max(duration, 0.001) < 0.45)
+            )
+            low_confidence_silence = (
+                no_speech_prob is not None
+                and avg_logprob is not None
+                and no_speech_prob >= 0.80
+                and avg_logprob <= -0.50
+            )
+            if implausibly_sparse or low_confidence_silence:
+                rejected += 1
+                continue
+            kept.append(item)
+        if rejected:
+            self.logger.warning(
+                "%s 已过滤 %d 条长静音幻听字幕，防止误保留对白和错误压低配乐 / "
+                "%s: filtered %d long-silence transcript hallucinations",
+                source_label,
+                rejected,
+                source_label,
+                rejected,
+            )
+        return kept
 
     def _validate_asset_data(self, asset: Dict[str, Any], prefix: str) -> None:
         """
@@ -1699,17 +2110,906 @@ class AIDirector:
             cut_in = float(item.get("cut_in_sec", 0) or 0)
             cut_out = float(item.get("cut_out_sec", 0) or 0)
             overlaps: List[str] = []
+            ranges: List[Dict[str, Any]] = []
             for segment in transcripts.get(str(item.get("asset_id") or ""), []):
                 start = float(segment.get("start_sec", 0) or 0)
                 end = float(segment.get("end_sec", 0) or 0)
                 if min(cut_out, end) - max(cut_in, start) < 0.15:
                     continue
                 text = " ".join(str(segment.get("text") or "").split())
-                overlaps.append(f"[{max(cut_in, start):.1f}-{min(cut_out, end):.1f}] {text}")
+                overlap_start = max(cut_in, start)
+                overlap_end = min(cut_out, end)
+                overlaps.append(f"[{overlap_start:.1f}-{overlap_end:.1f}] {text}")
+                ranges.append(
+                    {
+                        "start_sec": round(overlap_start, 3),
+                        "end_sec": round(overlap_end, 3),
+                        "text": self._compact_prompt_text(text, 180),
+                    }
+                )
             item["has_dialogue"] = bool(overlaps)
             item["dialogue_excerpt"] = self._compact_prompt_text(" | ".join(overlaps), 320)
+            item["dialogue_ranges_sec"] = ranges
+            # This is evidence for the director, never an automatic edit rule.
+            # 此标记只向导演提示“可能是拍摄现场语境”，绝不自动裁切或静音。
+            item["production_context_hint"] = self._is_production_chatter(item)
             result.append(item)
         return result
+
+    def _normalize_coverage_synopsis(
+        self,
+        payload: Dict[str, Any],
+        treatment: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Normalize a compatible Ollama evidence audit into the canonical schema.
+        将 Ollama 的兼容型证据审计归一化为标准结构。
+
+        Qwen may return a semantically strong nested ``audit_report`` when the
+        schema-constrained attempt falls back to plain JSON. Preserve that work
+        instead of silently losing the critical absent-event fields.
+
+        当 Schema 模式回退为普通 JSON 时，Qwen 可能返回语义正确的嵌套
+        ``audit_report``；这里保留并标准化这些缺失事件证据。
+        """
+        canonical_keys = {
+            "whole_footage_summary", "discovered_central_theme",
+            "character_threads", "event_timeline", "visual_motifs",
+            "continuity_risks", "observed_ending",
+            "absent_or_unproven_events", "honest_adaptation",
+        }
+        if canonical_keys.issubset(payload):
+            normalized = dict(payload)
+            raw_absent = normalized.get("absent_or_unproven_events")
+            absent_events = [
+                " ".join(str(value).split())
+                for value in (raw_absent if isinstance(raw_absent, list) else [])
+                if str(value).strip()
+            ]
+            raw_risks = normalized.get("continuity_risks")
+            continuity_risks = [
+                " ".join(str(value).split())
+                for value in (raw_risks if isinstance(raw_risks, list) else [])
+                if str(value).strip()
+            ]
+            # Some compatible Qwen outputs put a clearly unsupported ending in
+            # continuity_risks while returning an empty absent-event list. The
+            # sequence prompt treats the latter as the hard factual boundary,
+            # so promote explicit negative evidence instead of losing it.
+            # 部分 Qwen 会把“未拍到结尾”只写进 continuity_risks；将明确否定证据
+            # 同步进硬边界，避免后续导演继续假设素材中存在该动作。
+            if not absent_events:
+                negative_tokens = (
+                    "not captured", "not shown", "no actual", "never shown",
+                    "unsupported", "does not show", "only shows", "未拍到",
+                    "没有拍", "未显示", "并未", "不支持", "只有准备",
+                )
+                absent_events = [
+                    risk for risk in continuity_risks
+                    if any(token in risk.casefold() for token in negative_tokens)
+                ]
+            normalized["continuity_risks"] = continuity_risks
+            normalized["absent_or_unproven_events"] = absent_events
+            return normalized
+
+        memory = payload.get("project_memory")
+        audit = payload.get("audit_report")
+        revised = payload.get("revised_treatment")
+        memory = memory if isinstance(memory, dict) else {}
+        audit = audit if isinstance(audit, dict) else {}
+        revised = revised if isinstance(revised, dict) else {}
+        raw_arcs = memory.get("narrative_arc_observed")
+        raw_arcs = raw_arcs if isinstance(raw_arcs, list) else []
+        arcs = [
+            " ".join(str(value).split())
+            for value in raw_arcs
+            if str(value).strip()
+        ]
+        characters = memory.get("characters")
+        character_threads = [
+            " ".join(str(value).split())
+            for value in (characters if isinstance(characters, list) else [])
+            if str(value).strip()
+        ]
+        absent = audit.get("absent_or_unproven_events")
+        absent_events = [
+            " ".join(str(value).split())
+            for value in (absent if isinstance(absent, list) else [])
+            if str(value).strip()
+        ]
+        continuity = memory.get("unresolved_intentions")
+        continuity_risks = [
+            " ".join(str(value).split())
+            for value in (continuity if isinstance(continuity, list) else [])
+            if str(value).strip()
+        ]
+        source_evidence = " ".join(str(audit.get("source_evidence") or "").split())
+        observed_ending = source_evidence or (arcs[-1] if arcs else "No distinct ending action was proven.")
+        summary_parts = [
+            " ".join(str(memory.get("location") or "").split()),
+            *arcs,
+        ]
+        raw_motifs = memory.get("visual_motifs")
+        raw_motifs = raw_motifs if isinstance(raw_motifs, list) else []
+        normalized = {
+            "whole_footage_summary": " ".join(
+                part for part in summary_parts if part
+            ) or str(payload.get("whole_footage_summary") or "Observed project footage."),
+            "discovered_central_theme": " ".join(
+                str(
+                    revised.get("central_theme")
+                    or payload.get("discovered_central_theme")
+                    or treatment.get("central_theme")
+                    or "Observed human behavior and visual progression."
+                ).split()
+            ),
+            "character_threads": character_threads,
+            "event_timeline": [
+                {
+                    "asset_id": "multi-source",
+                    "source_order": index,
+                    "event": event,
+                    "story_meaning": "Observed chronological project event.",
+                }
+                for index, event in enumerate(arcs)
+            ],
+            "visual_motifs": [
+                " ".join(str(value).split())
+                for value in raw_motifs
+                if str(value).strip()
+            ],
+            "continuity_risks": continuity_risks,
+            "observed_ending": observed_ending,
+            "absent_or_unproven_events": absent_events,
+            "honest_adaptation": " ".join(
+                str(
+                    audit.get("honest_adaptation")
+                    or revised.get("ending_beat")
+                    or "End on the strongest action actually observed."
+                ).split()
+            ),
+        }
+        if audit or revised:
+            self.logger.warning(
+                "Ollama 返回了兼容型嵌套证据审计，已标准化而未丢失缺失事件 / "
+                "Normalized compatible nested evidence audit without losing absent events"
+            )
+        return normalized
+
+    def _normalize_narrative_contract(
+        self,
+        payload: Dict[str, Any],
+        candidates: Sequence[Dict[str, Any]],
+        coverage_synopsis: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Validate evidence references and downgrade unsupported causal promises.
+        校验事件证据引用，并把无法证实的因果叙事降级为诚实的非剧情形式。
+
+        Parameters / 参数:
+            payload: Model-authored narrative contract. / 模型生成的叙事契约。
+            candidates: Complete editable evidence ledger. / 完整可剪证据表。
+            coverage_synopsis: Full-footage factual audit. / 全片事实审计。
+        """
+        valid_ids = {
+            str(item.get("candidate_id") or "")
+            for item in candidates if isinstance(item, dict)
+        }
+        chain: List[Dict[str, Any]] = []
+        seen_ids = set()
+        raw_chain = payload.get("causal_chain")
+        for raw in raw_chain if isinstance(raw_chain, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            candidate_id = str(raw.get("candidate_id") or "").strip()
+            if candidate_id not in valid_ids or candidate_id in seen_ids:
+                continue
+            seen_ids.add(candidate_id)
+            chain.append(dict(raw))
+
+        result = dict(payload)
+        result["causal_chain"] = chain
+        claimed_arc = bool(payload.get("has_causal_arc"))
+        timeline = coverage_synopsis.get("event_timeline")
+        observed_event_count = len(timeline) if isinstance(timeline, list) else 0
+        proven_arc = claimed_arc and len(chain) >= 3 and observed_event_count >= 3
+        result["has_causal_arc"] = proven_arc
+        mode = str(payload.get("narrative_mode") or "mood_montage")
+        if mode in {"causal_story", "bts_process"} and not proven_arc:
+            result["narrative_mode"] = "mood_montage"
+            result["contract_correction"] = (
+                "The requested causal/BTS form lacked three distinct candidate-cited and "
+                "chronologically audited state changes; it was downgraded to a truthful "
+                "mood montage."
+            )
+
+        absent = coverage_synopsis.get("absent_or_unproven_events")
+        unsupported = [
+            " ".join(str(value).split())
+            for value in (
+                payload.get("unsupported_promises")
+                if isinstance(payload.get("unsupported_promises"), list) else []
+            )
+            if str(value).strip()
+        ]
+        for value in absent if isinstance(absent, list) else []:
+            normalized = " ".join(str(value).split())
+            if normalized and normalized not in unsupported:
+                unsupported.append(normalized)
+        result["unsupported_promises"] = unsupported[:12]
+        try:
+            duration = float(payload.get("recommended_duration_sec", 0) or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration <= 0:
+            duration = min(90.0, max(15.0, self._active_target_duration_sec))
+        result["recommended_duration_sec"] = round(min(600.0, max(10.0, duration)), 1)
+        return result
+
+    def _request_narrative_contract(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        coverage_synopsis: Dict[str, Any],
+        treatment: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Convert footage evidence into a cited contract before editing begins.
+        在开始剪辑前，将素材事实转换为逐事件引用的叙事契约。
+
+        Parameters / 参数:
+            candidates: Compact complete candidate ledger. / 紧凑的完整候选表。
+            coverage_synopsis: Whole-footage evidence synthesis. / 全片证据汇总。
+            treatment: Preliminary creative hypothesis. / 初步创作假设。
+        """
+        previous_review = self._rough_cut_feedback or {}
+        prompt = (
+            "EVIDENCE-FIRST STORY CONTRACT. Act as an archivist/producer, not as the "
+            "editor who will later defend a cut. Reconcile the preliminary treatment with "
+            "the literal candidate evidence. Each causal_chain item must cite one supplied "
+            "candidate_id and describe a visible or audible state change. Three distinct "
+            "state changes are required before has_causal_arc may be true. Routine setup talk, "
+            "a pose, a countdown, readiness, or a title is not automatically a consequence. "
+            "If the evidence has no causal arc, choose mood_montage or character_vignette and "
+            "do not preserve explanatory production chatter merely to manufacture a story. "
+            "For bts_process, the chain must show an actual problem, attempt, and observed result. "
+            "Put every promised but unseen event in unsupported_promises. Define three to six "
+            "viewer-testable success criteria. The preliminary treatment is only a hypothesis "
+            "and must be rejected where evidence conflicts. Return JSON only.\n"
+            f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
+            f"PRELIMINARY TREATMENT: {json.dumps(treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"FULL-FOOTAGE AUDIT: {json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"PREVIOUS RENDERED ROUGH-CUT REVIEW: {json.dumps(previous_review, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"COMPLETE CANDIDATE EVIDENCE: {json.dumps(candidates, ensure_ascii=False, separators=(',', ':'))}"
+        )
+        if not self._request_has_capacity(
+            prompt,
+            NARRATIVE_CONTRACT_SCHEMA,
+            model=self.text_model,
+            reserve_output_tokens=1536,
+        ):
+            raise DirectorError(
+                "事件证据契约无法完整放入当前 Context；请提高 Context。"
+                " / Evidence-first narrative contract does not fit the current Context."
+            )
+        self.logger.info(
+            "正在建立逐事件证据契约 / Building cited event-by-event narrative contract"
+        )
+        payload = self._request_json(
+            prompt,
+            NARRATIVE_CONTRACT_SCHEMA,
+            model=self.text_model,
+            progress_activity="narrative_contract",
+        )
+        return self._normalize_narrative_contract(
+            payload, candidates, coverage_synopsis
+        )
+
+    @staticmethod
+    def _blind_storyboard(
+        payload: Dict[str, Any],
+        candidates: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Build what a stranger can literally see and hear, without director rationale.
+        构造陌生观众实际能看到和听到的故事板，不泄露导演阐述与自我辩护。
+        """
+        candidate_by_id = {
+            str(item.get("candidate_id") or ""): item
+            for item in candidates if isinstance(item, dict)
+        }
+        storyboard: List[Dict[str, Any]] = []
+        cursor = 0.0
+        for index, raw in enumerate(payload.get("sequence", []), start=1):
+            if not isinstance(raw, dict):
+                continue
+            candidate = candidate_by_id.get(str(raw.get("candidate_id") or ""), {})
+            try:
+                start = float(raw.get("trim_in_sec", candidate.get("cut_in_sec", 0)) or 0)
+                end = float(raw.get("trim_out_sec", candidate.get("cut_out_sec", start)) or start)
+            except (TypeError, ValueError):
+                continue
+            duration = max(0.0, end - start)
+            intent = str(raw.get("audio_intent") or "natural_texture").casefold()
+            audible_lines: List[str] = []
+            if intent != "mute_for_music":
+                ranges = candidate.get("dialogue_ranges_sec")
+                for segment in ranges if isinstance(ranges, list) else []:
+                    if not isinstance(segment, dict):
+                        continue
+                    try:
+                        seg_start = float(segment.get("start_sec", 0) or 0)
+                        seg_end = float(segment.get("end_sec", seg_start) or seg_start)
+                    except (TypeError, ValueError):
+                        continue
+                    if min(end, seg_end) - max(start, seg_start) >= 0.05:
+                        text = " ".join(str(segment.get("text") or "").split())
+                        if text:
+                            audible_lines.append(text)
+            storyboard.append(
+                {
+                    "shot": index,
+                    "timeline_in_sec": round(cursor, 3),
+                    "timeline_out_sec": round(cursor + duration, 3),
+                    "source": Path(str(candidate.get("file_name") or "")).name,
+                    "visual": " ".join(str(candidate.get("visual_summary") or "").split()),
+                    "action": " ".join(str(candidate.get("subject_action") or "").split()),
+                    "audible_dialogue": audible_lines,
+                    "transition": str(raw.get("transition_to_next") or "cut"),
+                }
+            )
+            cursor += duration
+        return storyboard
+
+    def _request_blind_viewer_review(
+        self,
+        payload: Dict[str, Any],
+        candidates: Sequence[Dict[str, Any]],
+        narrative_contract: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Ask a context-isolated stranger to explain the authored storyboard.
+        让隔离上下文的陌生观众仅凭成片故事板复述影片。
+
+        The prompt deliberately excludes the treatment, shot rationales, role labels,
+        and intended takeaway. / 提示刻意排除导演阐述、镜头理由、功能标签和目标主题。
+        """
+        storyboard = self._blind_storyboard(payload, candidates)
+        mode = str(narrative_contract.get("narrative_mode") or "causal_story")
+        prompt = (
+            "BLIND VIEWER TEST. You have never seen the creative brief, treatment, edit labels, "
+            "or editor explanations. Read only the literal chronological storyboard below and "
+            "report what an ordinary first-time viewer would understand. Do not infer off-screen "
+            "events and do not reward attractive labels. A coherent causal film must make subject, "
+            "goal, progression, and changed ending state legible. A mood montage need not have a "
+            "plot, but it must have a clear subject, deliberate visual/emotional progression, and "
+            "an earned payoff. Unrelated production conversations do not become a story because "
+            "they share a location. Set passes=true only when coherence is at least 7 and the "
+            "appropriate causal_clarity or visual_payoff score is at least 7. Return JSON only.\n"
+            f"DECLARED FORM ONLY: {mode}\n"
+            f"LITERAL STORYBOARD: {json.dumps(storyboard, ensure_ascii=False, separators=(',', ':'))}"
+        )
+        self.logger.info(
+            "正在进行隔离上下文的陌生观众盲审 / Running context-isolated blind-viewer test"
+        )
+        review = self._request_json(
+            prompt,
+            BLIND_VIEWER_SCHEMA,
+            model=self.text_model,
+            progress_activity="blind_viewer_review",
+        )
+        coherence = int(review.get("coherence_score", 0) or 0)
+        causal = int(review.get("causal_clarity_score", 0) or 0)
+        payoff = int(review.get("visual_payoff_score", 0) or 0)
+        form_score = payoff if mode in {"mood_montage", "character_vignette"} else causal
+        deterministic_pass = (
+            bool(review.get("passes"))
+            and coherence >= 7
+            and form_score >= 7
+            and not bool(review.get("unsupported_or_unresolved_points"))
+        )
+        review["model_passes"] = bool(review.get("passes"))
+        review["passes"] = deterministic_pass
+        review["declared_narrative_mode"] = mode
+        return review
+
+    @staticmethod
+    def _candidate_speech_intervals(
+        candidate: Dict[str, Any],
+    ) -> Optional[List[tuple[float, float]]]:
+        """
+        Return merged timestamped speech intervals for one candidate.
+        返回单个候选镜头中已合并的精确语音时间区间。
+
+        ``None`` means legacy data supplied only ``has_dialogue`` and therefore
+        has no exact timing. An empty list is intentionally different: it means
+        the extractor positively found no speech in this candidate.
+
+        ``None`` 表示旧数据只有 ``has_dialogue``、没有精确时间；空列表则表示提取器
+        已明确确认该候选镜头没有语音。两者不能混为一谈。
+        """
+        raw_ranges = candidate.get("dialogue_ranges_sec")
+        if not isinstance(raw_ranges, list):
+            return None
+        try:
+            candidate_in = float(candidate.get("cut_in_sec", 0) or 0)
+            candidate_out = float(
+                candidate.get("cut_out_sec", candidate_in) or candidate_in
+            )
+        except (TypeError, ValueError):
+            return []
+        intervals: List[tuple[float, float]] = []
+        for raw_range in raw_ranges:
+            if not isinstance(raw_range, dict):
+                continue
+            try:
+                start = max(candidate_in, float(raw_range.get("start_sec", candidate_in)))
+                end = min(candidate_out, float(raw_range.get("end_sec", candidate_out)))
+            except (TypeError, ValueError):
+                continue
+            if end - start >= 0.05:
+                intervals.append((start, end))
+        intervals.sort()
+        merged: List[List[float]] = []
+        for start, end in intervals:
+            if merged and start <= merged[-1][1] + 0.02:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return [(start, end) for start, end in merged]
+
+    @staticmethod
+    def _candidate_silent_intervals(
+        candidate: Dict[str, Any],
+        speech_intervals: Optional[Sequence[tuple[float, float]]],
+    ) -> List[tuple[float, float]]:
+        """
+        Return usable non-speech ranges inside a candidate.
+        返回候选镜头范围内可用于纯画面剪辑的无语音区间。
+
+        Parameters / 参数:
+            candidate: Candidate metadata with source bounds. / 带源时间边界的候选镜头。
+            speech_intervals: Exact merged speech ranges, or ``None`` for legacy
+                unknown timing. / 精确合并语音区间；旧数据未知时为 ``None``。
+        """
+        if speech_intervals is None:
+            return []
+        try:
+            candidate_in = float(candidate.get("cut_in_sec", 0) or 0)
+            candidate_out = float(
+                candidate.get("cut_out_sec", candidate_in) or candidate_in
+            )
+        except (TypeError, ValueError):
+            return []
+        cursor = candidate_in
+        silent: List[tuple[float, float]] = []
+        for start, end in speech_intervals:
+            if start - cursor >= 0.25:
+                silent.append((cursor, start))
+            cursor = max(cursor, end)
+        if candidate_out - cursor >= 0.25:
+            silent.append((cursor, candidate_out))
+        return silent
+
+    @staticmethod
+    def _picture_plan_metrics(
+        payload: Dict[str, Any],
+        candidates: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Measure a draft for the supervising editor without changing the cut.
+        为总剪辑师测量初稿；只报告，不修改导演剪辑。
+        """
+        candidate_by_id = {
+            str(item.get("candidate_id") or ""): item
+            for item in candidates
+            if isinstance(item, dict)
+        }
+        sequence = payload.get("sequence")
+        sequence = sequence if isinstance(sequence, list) else []
+        total_duration = 0.0
+        dialogue_duration = 0.0
+        production_chatter_duration = 0.0
+        long_dialogue_shots = 0
+        static_shots = 0
+        source_files = set()
+        functions: List[str] = []
+        music_roles: List[str] = []
+        shot_scales: List[str] = []
+        shot_audit: List[Dict[str, Any]] = []
+        for raw in sequence:
+            if not isinstance(raw, dict):
+                continue
+            candidate = candidate_by_id.get(str(raw.get("candidate_id") or ""), {})
+            try:
+                start = float(raw.get("trim_in_sec", candidate.get("cut_in_sec", 0)) or 0)
+                end = float(raw.get("trim_out_sec", candidate.get("cut_out_sec", start)) or start)
+            except (TypeError, ValueError):
+                continue
+            duration = max(0.0, end - start)
+            total_duration += duration
+            intent = str(raw.get("audio_intent") or "").casefold()
+            try:
+                volume_db = float(raw.get("volume_db", candidate.get("volume_db", 0)) or 0)
+            except (TypeError, ValueError):
+                volume_db = 0.0
+            effectively_muted = intent == "mute_for_music" or volume_db <= -45.0
+            source_speech_duration = 0.0
+            shot_dialogue_duration = 0.0
+            if bool(candidate.get("has_dialogue")):
+                exact_intervals = AIDirector._candidate_speech_intervals(candidate)
+                overlaps: List[tuple[float, float]] = []
+                if exact_intervals is not None:
+                    for speech_start, speech_end in exact_intervals:
+                        range_start = max(start, speech_start)
+                        range_end = min(end, speech_end)
+                        if range_end - range_start >= 0.05:
+                            overlaps.append((range_start, range_end))
+                if overlaps:
+                    overlaps.sort()
+                    merged_ranges: List[List[float]] = []
+                    for range_start, range_end in overlaps:
+                        if merged_ranges and range_start <= merged_ranges[-1][1] + 0.02:
+                            merged_ranges[-1][1] = max(merged_ranges[-1][1], range_end)
+                        else:
+                            merged_ranges.append([range_start, range_end])
+                    source_speech_duration = sum(
+                        range_end - range_start
+                        for range_start, range_end in merged_ranges
+                    )
+                elif exact_intervals is None:
+                    # Conservative compatibility fallback for legacy candidate
+                    # ledgers that know speech exists but have no timestamps.
+                    source_speech_duration = duration
+                # When exact intervals exist but do not overlap the selected
+                # trim, the trim is silent. The former fallback incorrectly
+                # counted the whole visual trim as dialogue.
+                shot_dialogue_duration = (
+                    0.0 if effectively_muted else source_speech_duration
+                )
+            dialogue_duration += shot_dialogue_duration
+            if shot_dialogue_duration > 0 and (
+                bool(candidate.get("production_context_hint"))
+                or AIDirector._is_production_chatter(candidate)
+            ):
+                production_chatter_duration += shot_dialogue_duration
+            if shot_dialogue_duration > 6.0:
+                long_dialogue_shots += 1
+            if str(candidate.get("camera_motion") or "static").casefold() == "static":
+                static_shots += 1
+            source_files.add(str(candidate.get("file_name") or ""))
+            functions.append(str(raw.get("narrative_function") or "unknown"))
+            music_roles.append(str(raw.get("music_edit_role") or "unknown"))
+            shot_scales.append(str(candidate.get("shot_scale") or "unknown"))
+            shot_audit.append(
+                {
+                    "candidate_id": str(raw.get("candidate_id") or ""),
+                    "trim_in_sec": round(start, 3),
+                    "trim_out_sec": round(end, 3),
+                    "duration_sec": round(duration, 3),
+                    "source_speech_sec": round(source_speech_duration, 3),
+                    "audible_speech_sec": round(shot_dialogue_duration, 3),
+                    "audio_intent": intent or "unspecified",
+                    "narrative_function": functions[-1],
+                    "music_edit_role": music_roles[-1],
+                }
+            )
+
+        def longest_run(values: Sequence[str]) -> int:
+            best = current = 0
+            previous = None
+            for value in values:
+                current = current + 1 if value == previous else 1
+                previous = value
+                best = max(best, current)
+            return best
+
+        clip_count = len([item for item in sequence if isinstance(item, dict)])
+        graphics = payload.get("graphics_plan")
+        graphic_items = graphics.get("items") if isinstance(graphics, dict) else []
+        scale_counts = {
+            scale: shot_scales.count(scale)
+            for scale in sorted(set(shot_scales))
+        }
+        available_nonstatic = sum(
+            1 for item in candidates
+            if isinstance(item, dict)
+            and str(item.get("camera_motion") or "static").casefold() != "static"
+        )
+        available_scales = {
+            str(item.get("shot_scale") or "unknown")
+            for item in candidates
+            if isinstance(item, dict)
+        }
+        return {
+            "clip_count": clip_count,
+            "program_duration_sec": round(total_duration, 3),
+            "average_shot_duration_sec": round(total_duration / clip_count, 3) if clip_count else 0.0,
+            "preserved_dialogue_duration_sec": round(dialogue_duration, 3),
+            "preserved_dialogue_ratio": round(dialogue_duration / total_duration, 3) if total_duration else 0.0,
+            "audible_speech_duration_sec": round(dialogue_duration, 3),
+            "audible_speech_ratio": round(dialogue_duration / total_duration, 3) if total_duration else 0.0,
+            "production_chatter_duration_sec": round(production_chatter_duration, 3),
+            "production_chatter_ratio": round(
+                production_chatter_duration / total_duration, 3
+            ) if total_duration else 0.0,
+            "long_dialogue_shots_over_6_sec": long_dialogue_shots,
+            "static_shot_ratio": round(static_shots / clip_count, 3) if clip_count else 0.0,
+            "selected_nonstatic_shot_count": max(0, clip_count - static_shots),
+            "available_nonstatic_candidate_count": available_nonstatic,
+            "shot_scale_counts": scale_counts,
+            "dominant_shot_scale_ratio": round(
+                max(scale_counts.values()) / clip_count, 3
+            ) if clip_count and scale_counts else 0.0,
+            "available_shot_scale_count": len(available_scales),
+            "unique_source_count": len({value for value in source_files if value}),
+            "graphic_count": len(graphic_items) if isinstance(graphic_items, list) else 0,
+            "longest_same_narrative_function_run": longest_run(functions),
+            "longest_same_music_role_run": longest_run(music_roles),
+            "narrative_functions": functions,
+            "music_edit_roles": music_roles,
+            "shot_audit": shot_audit,
+        }
+
+    def _picture_plan_quality_violations(
+        self,
+        payload: Dict[str, Any],
+        metrics: Dict[str, Any],
+        candidates: Sequence[Dict[str, Any]],
+        treatment: Dict[str, Any],
+        narrative_contract: Optional[Dict[str, Any]] = None,
+        coverage_synopsis: Optional[Dict[str, Any]] = None,
+        blind_review: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        """
+        Return measurable reasons a model-authored cut needs another AI edit pass.
+        返回模型剪辑需要再次交由 AI 重剪的可测量原因。
+
+        Python never chooses replacement shots here. It only rejects obvious
+        contradictions such as a supposedly visual montage that is 85% speech,
+        five nearly identical static wides, or four consecutive beats with the
+        same narrative and music role. The director model remains responsible
+        for the revised creative decisions.
+
+        Python 不在这里替换镜头，只退回明显自相矛盾的方案；如何重剪仍由导演模型决定。
+        """
+        clip_count = int(metrics.get("clip_count", 0) or 0)
+        duration = float(metrics.get("program_duration_sec", 0) or 0)
+        if clip_count <= 0 or duration <= 0:
+            return ["The picture plan is empty or has no positive duration."]
+
+        review = payload.get("review")
+        review = review if isinstance(review, dict) else {}
+        editorial_rules = treatment.get("editorial_rules")
+        editorial_rules = editorial_rules if isinstance(editorial_rules, list) else []
+        style_text = " ".join(
+            str(value or "") for value in (
+                payload.get("editorial_style"),
+                payload.get("project_summary"),
+                payload.get("viewer_takeaway"),
+                treatment.get("edit_style"),
+                treatment.get("central_theme"),
+                treatment.get("logline"),
+                treatment.get("development_beat"),
+                review.get("dialogue_strategy"),
+                " ".join(str(value) for value in editorial_rules),
+            )
+        ).casefold()
+        brief_text = self.creative_brief.casefold()
+        selected_ids = {
+            str(item.get("candidate_id") or "")
+            for item in payload.get("sequence", [])
+            if isinstance(item, dict)
+        }
+        selected_candidates = [
+            item for item in candidates
+            if isinstance(item, dict)
+            and str(item.get("candidate_id") or "") in selected_ids
+        ]
+        interview_count = sum(
+            1 for item in selected_candidates
+            if str(item.get("story_role") or "").casefold() == "interview"
+        )
+        explicit_dialogue_tokens = (
+            "dialogue-led", "dialogue led", "interview", "conversation-led",
+            "talking-head", "访谈", "采访", "口述", "对白为主", "谈话为主",
+        )
+        dialogue_led = (
+            any(token in brief_text for token in explicit_dialogue_tokens)
+            or (
+                any(token in style_text for token in explicit_dialogue_tokens)
+                and interview_count >= max(1, clip_count // 3)
+            )
+        )
+        explicit_visual_tokens = (
+            "kinetic_montage", "kinetic montage", "visual montage",
+            "music video", "music-video", "silent film", "no dialogue",
+            "dialogue-free", "pure montage", "纯视觉", "视觉蒙太奇",
+            "音乐短片", "不要对白", "无对白",
+        )
+        explicitly_visual_led = any(
+            token in brief_text or token in style_text
+            for token in explicit_visual_tokens
+        )
+
+        violations: List[str] = []
+        narrative_contract = (
+            narrative_contract if isinstance(narrative_contract, dict) else {}
+        )
+        coverage_synopsis = (
+            coverage_synopsis if isinstance(coverage_synopsis, dict) else {}
+        )
+        dialogue_ratio = float(
+            metrics.get("audible_speech_ratio", metrics.get("preserved_dialogue_ratio", 0))
+            or 0
+        )
+        if (
+            explicitly_visual_led
+            and not dialogue_led
+            and (duration >= 15.0 or clip_count >= 4)
+            and dialogue_ratio > 0.55
+        ):
+            violations.append(
+                f"Measured preserved-dialogue ratio is {dialogue_ratio:.1%}; "
+                "this is not an evidence-supported dialogue-led film and must be <=55%."
+            )
+        elif (
+            not dialogue_led
+            and (duration >= 15.0 or clip_count >= 4)
+            and dialogue_ratio > 0.72
+        ):
+            violations.append(
+                f"Measured audible-speech ratio is {dialogue_ratio:.1%}; no interview or "
+                "explicit evidence-supported dialogue-led structure justifies that dominance."
+            )
+        chatter_ratio = float(metrics.get("production_chatter_ratio", 0) or 0)
+        narrative_mode = str(
+            narrative_contract.get("narrative_mode") or ""
+        ).casefold()
+        chain = narrative_contract.get("causal_chain")
+        chain = chain if isinstance(chain, list) else []
+        if (
+            not dialogue_led
+            and chatter_ratio > 0.35
+            and narrative_mode != "bts_process"
+        ):
+            violations.append(
+                f"Production-process chatter occupies {chatter_ratio:.1%} of the film, "
+                "but the evidence contract did not choose a BTS process story."
+            )
+        elif chatter_ratio > 0.60 and (
+            narrative_mode != "bts_process" or len(chain) < 3
+        ):
+            violations.append(
+                f"Production-process chatter occupies {chatter_ratio:.1%}; a BTS cut may "
+                "keep that much only when at least three cited state changes prove a "
+                "problem-attempt-result progression."
+            )
+        long_dialogue = int(metrics.get("long_dialogue_shots_over_6_sec", 0) or 0)
+        if explicitly_visual_led and not dialogue_led and long_dialogue > 1:
+            violations.append(
+                f"There are {long_dialogue} dialogue passages longer than six seconds; "
+                "retain at most one unless speech is the actual story."
+            )
+        static_ratio = float(metrics.get("static_shot_ratio", 0) or 0)
+        available_nonstatic = int(
+            metrics.get("available_nonstatic_candidate_count", 0) or 0
+        )
+        if clip_count >= 4 and static_ratio > 0.75 and available_nonstatic >= 3:
+            violations.append(
+                f"Static-shot ratio is {static_ratio:.1%} despite {available_nonstatic} "
+                "available non-static candidates; create visible shot-to-shot variation."
+            )
+        dominant_scale = float(metrics.get("dominant_shot_scale_ratio", 0) or 0)
+        available_scale_count = int(metrics.get("available_shot_scale_count", 0) or 0)
+        if clip_count >= 4 and dominant_scale > 0.80 and available_scale_count >= 3:
+            violations.append(
+                f"One shot scale occupies {dominant_scale:.1%} of the cut although "
+                f"{available_scale_count} scales are available; vary visual distance."
+            )
+        narrative_run = int(
+            metrics.get("longest_same_narrative_function_run", 0) or 0
+        )
+        narrative_limit = 3 if clip_count <= 4 else 4
+        if clip_count >= 4 and narrative_run >= narrative_limit:
+            violations.append(
+                f"{narrative_run} consecutive shots repeat the same narrative function; "
+                "the middle needs escalation, contrast, or payoff rather than more context."
+            )
+        music_run = int(metrics.get("longest_same_music_role_run", 0) or 0)
+        music_limit = 3 if clip_count <= 4 else 4
+        if clip_count >= 4 and music_run >= music_limit:
+            violations.append(
+                f"{music_run} consecutive shots repeat one music-edit role; design an "
+                "audible rhythmic progression instead of labeling every shot as build."
+            )
+        functions = [
+            str(value).casefold() for value in metrics.get("narrative_functions", [])
+        ]
+        if clip_count >= 4 and not any(
+            value in {"escalation", "contrast", "payoff"} for value in functions
+        ):
+            violations.append(
+                "The cut has no authored escalation, contrast, or payoff beat between "
+                "its hook and closure."
+            )
+        contract_ids = [
+            str(item.get("candidate_id") or "")
+            for item in chain if isinstance(item, dict)
+        ]
+        if bool(narrative_contract.get("has_causal_arc")) and len(contract_ids) >= 3:
+            selected_chain_count = len(set(contract_ids) & selected_ids)
+            if selected_chain_count < 3:
+                violations.append(
+                    "The evidence contract proves a causal arc, but the cut includes only "
+                    f"{selected_chain_count} of its cited state-changing events; include at "
+                    "least three or explicitly choose a non-causal form."
+                )
+        if (
+            narrative_mode in {"causal_story", "bts_process"}
+            and len(contract_ids) < 3
+        ):
+            violations.append(
+                f"Narrative mode {narrative_mode!r} lacks three candidate-cited state "
+                "changes and therefore cannot promise a causal story."
+            )
+        event_timeline = coverage_synopsis.get("event_timeline")
+        if (
+            narrative_mode in {"causal_story", "bts_process"}
+            and not (isinstance(event_timeline, list) and len(event_timeline) >= 3)
+        ):
+            violations.append(
+                "The whole-footage audit did not establish three chronological events, so "
+                "the current causal/BTS claim is not grounded."
+            )
+        music_roles = [
+            str(value).casefold() for value in metrics.get("music_edit_roles", [])
+        ]
+        teaser_then_chronological = (
+            str(treatment.get("chronology_policy") or "").casefold()
+            == "teaser_then_chronological"
+            or "teaser" in str(treatment.get("opening_beat") or "").casefold()
+        )
+        if (
+            clip_count >= 4
+            and music_roles
+            and music_roles[0] == "payoff_hit"
+            and music_roles[-1] == "payoff_hit"
+            and not teaser_then_chronological
+        ):
+            violations.append(
+                "Both the opening teaser and ending are labeled payoff_hit; reserve the "
+                "true payoff hit for the earned climax and give the hook a distinct role."
+            )
+        graphics_count = int(metrics.get("graphic_count", 0) or 0)
+        if duration <= 120.0 and graphics_count > 2:
+            violations.append(
+                f"A {duration:.1f}s film contains {graphics_count} graphics; use at most "
+                "two unless the footage proves distinct chapters."
+            )
+        if isinstance(blind_review, dict):
+            coherence = int(blind_review.get("coherence_score", 0) or 0)
+            causal = int(blind_review.get("causal_clarity_score", 0) or 0)
+            payoff = int(blind_review.get("visual_payoff_score", 0) or 0)
+            if not bool(blind_review.get("passes")):
+                violations.append(
+                    "The context-isolated blind viewer could not understand the cut: "
+                    + " ".join(str(blind_review.get("reason") or "failed blind review").split())
+                )
+            elif coherence < 7:
+                violations.append(
+                    f"Blind-viewer coherence is {coherence}/10; at least 7/10 is required."
+                )
+            if narrative_mode in {"mood_montage", "character_vignette"}:
+                if payoff < 7:
+                    violations.append(
+                        f"Blind-viewer visual payoff is {payoff}/10 for a non-causal film; "
+                        "at least 7/10 is required."
+                    )
+            elif causal < 7:
+                violations.append(
+                    f"Blind-viewer causal clarity is {causal}/10; at least 7/10 is required."
+                )
+        return violations
 
     def chunk_raw_data(
         self,
@@ -1947,7 +3247,9 @@ class AIDirector:
         prompt = self.build_prompt(
             prompt_chunk, source_name, active_schema, treatment=treatment
         )
-        return self._request_json(prompt, active_schema, images)
+        return self._request_json(
+            prompt, active_schema, images, progress_activity="visual_review"
+        )
 
     @staticmethod
     def _director_system_prompt() -> str:
@@ -1993,12 +3295,16 @@ class AIDirector:
         schema: Dict[str, Any],
         images: Sequence[str] = (),
         model: Optional[str] = None,
+        progress_activity: str = "director_generation",
     ) -> Dict[str, Any]:
         """
         Send one schema-constrained Ollama request with optional real images.
         发送一次受 Schema 约束、可包含真实图片的 Ollama 请求。
         """
         selected_model = str(model or self.model).strip()
+        activity = re.sub(
+            r"[^a-z0-9_]+", "_", str(progress_activity).casefold()
+        ).strip("_") or "director_generation"
         normalized_model = selected_model.casefold()
         request_num_ctx = self._effective_num_ctx(selected_model)
         # Ollama accepts low/medium/high only for GPT-OSS. Qwen and other
@@ -2094,6 +3400,32 @@ class AIDirector:
             }
             if images:
                 payload["images"] = list(images)
+            request_started = time.monotonic()
+            heartbeat_stop = threading.Event()
+
+            def progress_heartbeat() -> None:
+                """Emit honest elapsed-time heartbeats while Ollama is blocking. / Ollama 阻塞时定时报告真实耗时。"""
+                while not heartbeat_stop.wait(15.0):
+                    self.logger.info(
+                        "AI_PROGRESS state=working activity=%s elapsed=%d attempt=%d/%d",
+                        activity,
+                        int(time.monotonic() - request_started),
+                        attempt_index,
+                        len(attempts),
+                    )
+
+            self.logger.info(
+                "AI_PROGRESS state=start activity=%s elapsed=0 attempt=%d/%d",
+                activity,
+                attempt_index,
+                len(attempts),
+            )
+            heartbeat_thread = threading.Thread(
+                target=progress_heartbeat,
+                name=f"ollama-progress-{activity}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
             try:
                 response = self.session.post(
                     url, json=payload, timeout=(10, self.timeout_sec)
@@ -2113,9 +3445,30 @@ class AIDirector:
                 response.raise_for_status()
                 envelope = response.json()
             except Exception as exc:
+                self.logger.info(
+                    "AI_PROGRESS state=failed activity=%s elapsed=%d attempt=%d/%d",
+                    activity,
+                    int(time.monotonic() - request_started),
+                    attempt_index,
+                    len(attempts),
+                )
                 raise DirectorError(
                     f"Ollama 分块请求失败 / Ollama chunk request failed: {exc}"
                 ) from exc
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=0.25)
+
+            self.logger.info(
+                "AI_PROGRESS state=complete activity=%s elapsed=%d attempt=%d/%d "
+                "prompt_tokens=%s output_tokens=%s",
+                activity,
+                int(time.monotonic() - request_started),
+                attempt_index,
+                len(attempts),
+                envelope.get("prompt_eval_count") if isinstance(envelope, dict) else None,
+                envelope.get("eval_count") if isinstance(envelope, dict) else None,
+            )
 
             if not isinstance(envelope, dict) or not envelope.get("done", False):
                 last_issue = "incomplete response"
@@ -2389,20 +3742,42 @@ class AIDirector:
             )
         brief = self.creative_brief or (
             "Discover the strongest truthful theme in the footage. Make a concise "
-            "director-led short with a clear setup, development, payoff, and ending."
+            "director-led short with a clear setup, development, payoff, and ending. "
+            "Choose the most effective form: story film, kinetic style reel, atmospheric "
+            "piece, dialogue-led scene, or a hybrid. Prefer the footage's strongest visual "
+            "transformation and human behavior. Do not default to a behind-the-scenes film "
+            "merely because production chatter exists; BTS needs real conflict, discovery, "
+            "or character change, not routine logistics."
         )
         prompt = (
             "Create the director treatment before any shot selection. The sources "
-            "are listed in real shooting order. Default to strict chronology; use a "
-            "very short teaser only if it materially improves comprehension. Do not "
-            "make a chronological dump: identify one central theme, reject setup "
-            "chatter that does not serve it, and design a complete emotional arc. "
+            "are listed in real shooting order. Choose an edit_style deliberately; "
+            "strict chronology is not mandatory unless the user asks for it, and a "
+            "short teaser is useful when it gives the viewer an immediate promise. Do not "
+            "make a chronological dump: identify one central theme and design a "
+            "complete emotional arc. "
+            "State one concrete viewer_takeaway that the finished film must communicate. "
+            "Design restrained typography in the user's or dominant transcript language: "
+            "a title, chapter words, or an end card may "
+            "clarify the premise or heighten style, but cannot explain away weak shots. "
+            "Dialogue about microphones, filters, blocking, takes, or camera setup is "
+            "marked only as possible production context. You are the director: decide "
+            "whether it is irrelevant, revealing, funny, authentic, useful as natural "
+            "texture, or central to a behind-the-scenes idea. Do not exclude or mute it "
+            "by category; make an editorial decision from the chosen theme. "
+            "Do not claim an engine start, rollout, departure, arrival, reaction, or other "
+            "future action unless the supplied visual evidence directly observes the state "
+            "change across time. A countdown, readiness pose, headlight, or forward lean proves "
+            "only anticipation. When the footage contains mostly routine setup without real "
+            "conflict, discovery, or character change, do not force a behind-the-scenes story; "
+            "choose a concise visual mood/style form and minimize explanatory dialogue. "
             "Choose 4-8 story_anchors from the supplied exact asset_id and absolute "
             "timestamps. Anchors must cover at least three beats and at least three "
             "different sources when the footage supports it. Use dynamic duration: "
             "1.5-10 seconds for B-roll, up to 20 seconds for context, and up to 45 "
             "seconds for an uninterrupted complete spoken thought; never cross an "
-            "asset duration. Include a complete "
+            "asset duration. Anchors are hypotheses for later full-footage review, not "
+            "clips that must be protected or included. Include a complete "
             "ending action rather than a one-word tail. "
             "Design the music before searching: provide 2-6 specific multilingual "
             "search queries, instrumentation, a useful tempo range, vocal policy, "
@@ -2425,7 +3800,12 @@ class AIDirector:
         self.logger.info(
             "正在生成导演阐述与叙事弧线 / Creating director treatment and story arc"
         )
-        return self._request_json(prompt, TREATMENT_SCHEMA, images=images)
+        return self._request_json(
+            prompt,
+            TREATMENT_SCHEMA,
+            images=images,
+            progress_activity="director_treatment",
+        )
 
     @staticmethod
     def _compact_transcript_excerpt(
@@ -2499,13 +3879,38 @@ class AIDirector:
                     f"导演阐述缺少 {key} / Treatment is missing {key}."
                 )
             treatment[key] = value
+        treatment["viewer_takeaway"] = " ".join(
+            str(payload.get("viewer_takeaway") or treatment["central_theme"]).split()
+        )
+        treatment["typography_intent"] = " ".join(
+            str(
+                payload.get("typography_intent")
+                or "Use a concise opening title and only story-motivated chapter typography."
+            ).split()
+        )
+        treatment["edit_style"] = self._enum_value(
+            payload.get("edit_style"),
+            {
+                "narrative_documentary", "kinetic_montage", "atmospheric_poem",
+                "dialogue_led", "hybrid_cinematic",
+            },
+            "hybrid_cinematic",
+        )
         policy = str(payload.get("chronology_policy") or "").casefold()
         if policy not in {"strict_chronological", "teaser_then_chronological"}:
             policy = "strict_chronological"
-        # The default product promise is a time-flow edit. A non-linear teaser is
-        # accepted only when the user explicitly asks for one in the creative brief.
-        if "teaser" not in self.creative_brief.casefold() and "预告" not in self.creative_brief:
+        # Free direction keeps the director's structure. Explicit user wording wins.
+        # 自由发挥时保留导演结构；用户明确要求时间流或预告开场时则强制遵守。
+        brief_lower = self.creative_brief.casefold()
+        strict_tokens = (
+            "chronological", "time-flow", "time flow", "in order", "按时间",
+            "时间流", "时间顺序", "顺叙",
+        )
+        teaser_tokens = ("teaser", "cold open", "预告", "先抛高潮", "倒叙开场")
+        if any(token in brief_lower for token in strict_tokens):
             policy = "strict_chronological"
+        elif any(token in brief_lower for token in teaser_tokens):
+            policy = "teaser_then_chronological"
         treatment["chronology_policy"] = policy
         treatment["target_duration_sec"] = self._active_target_duration_sec
         look = str(payload.get("creative_look") or "clean_neutral").casefold()
@@ -2755,7 +4160,7 @@ class AIDirector:
         treatment: Dict[str, Any],
         assets: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Convert global treatment anchors into protected edit candidates. / 将全局导演锚点转换为受保护候选。"""
+        """Convert treatment hypotheses into unprotected fallback candidates. / 将导演假设转换为不受保护的回退候选。"""
         by_id = {
             str(asset.get("asset_id")): (source_order, asset)
             for source_order, asset in enumerate(assets)
@@ -2802,7 +4207,8 @@ class AIDirector:
                 "stabilization": "none",
                 "tracking": "none",
                 "smart_reframe": False,
-                "protected_story_anchor": True,
+                "protected_story_anchor": False,
+                "candidate_origin": "treatment_fallback",
                 "treatment_beat": beat,
             })
         return candidates
@@ -2982,6 +4388,14 @@ class AIDirector:
             if timeline_out - timeline_in < 0.25:
                 continue
             track_in = number(raw.get("track_in_sec"), 0, 0, track_duration)
+            if cue_index == 1 and timeline_in > 8.0 and track_in > 0:
+                # A free-direction montage should not accidentally spend tens of
+                # seconds with no score. Extend the selected musical phrase
+                # backwards while preserving every later beat-to-picture mapping.
+                # 防止模型把开场二十多秒误留成无配乐；向前延展同一音乐段且不破坏后续卡点。
+                extension = min(timeline_in, track_in)
+                timeline_in -= extension
+                track_in -= extension
             desired = timeline_out - timeline_in
             track_out = number(
                 raw.get("track_out_sec"), track_in + desired, track_in, track_duration
@@ -3071,7 +4485,7 @@ class AIDirector:
                 "track_in_sec": round(track_in, 4),
                 "track_out_sec": round(track_out, 4),
                 "reason": " ".join(str(raw.get("reason") or "").split()),
-                "target_lufs": round(number(raw.get("target_lufs"), -24, -36, -14), 2),
+                "target_lufs": round(number(raw.get("target_lufs"), -17, -20, -14), 2),
                 "fade_in_sec": round(number(raw.get("fade_in_sec"), 1.5, 0, min(12, usable / 2)), 3),
                 "fade_out_sec": round(number(raw.get("fade_out_sec"), 2.0, 0, min(12, usable / 2)), 3),
                 "crossfade_sec": round(number(raw.get("crossfade_sec"), 1.5, 0, min(8, usable / 2)), 3),
@@ -3085,6 +4499,8 @@ class AIDirector:
                 "strong_beats_sec": cue_strong_beats,
                 "downbeats_sec": cue_downbeats,
                 "sections": cue_sections,
+                "energy_profile": dict(analyzed.get("energy_profile") or {}),
+                "director_match": dict(analyzed.get("director_match") or {}),
                 "license": str(analyzed.get("license") or "user-supplied"),
                 "license_url": str(analyzed.get("license_url") or ""),
                 "license_provenance": str(analyzed.get("license_provenance") or ""),
@@ -3122,6 +4538,65 @@ class AIDirector:
             "credits": credits,
         }
 
+    @staticmethod
+    def music_plan_quality_violations(
+        music_plan: Dict[str, Any], treatment: Dict[str, Any]
+    ) -> List[str]:
+        """Detect cue claims contradicted by measured energy. / 检测与实测能量矛盾的 cue。"""
+        violations: List[str] = []
+        cues = [item for item in music_plan.get("cues", []) if isinstance(item, dict)]
+        desired_arc = " ".join(str(treatment.get("music_energy_arc") or "").split()).casefold()
+        build_terms = {
+            "build", "rise", "rising", "crescendo", "swell", "peak", "climax",
+            "上升", "渐强", "推进", "高潮", "递进",
+        }
+        treatment_requires_build = any(term in desired_arc for term in build_terms)
+        for cue in cues:
+            profile = cue.get("energy_profile")
+            if not isinstance(profile, dict) or not profile:
+                continue
+            trend = str(profile.get("trend") or "unknown").casefold()
+            try:
+                build_score = float(profile.get("build_score", 0) or 0)
+                contrast = float(profile.get("contrast_db", 0) or 0)
+            except (TypeError, ValueError):
+                build_score, contrast = 0.0, 0.0
+            reason = str(cue.get("reason") or "").casefold()
+            claims_build = any(term in reason for term in build_terms)
+            payoff = str(cue.get("story_beat") or "") == "payoff"
+            sections = cue.get("sections")
+            section_labels = {
+                str(item.get("energy") or "").casefold()
+                for item in sections if isinstance(item, dict)
+            } if isinstance(sections, list) else set()
+            flat_low = bool(section_labels) and section_labels <= {"low"}
+            measured_build = trend == "rising" or build_score >= 0.45 or contrast >= 4.0
+            if (claims_build or (payoff and treatment_requires_build)) and not measured_build:
+                violations.append(
+                    f"Cue {cue.get('cue_id', '?')} claims a build/payoff, but measured "
+                    f"energy is trend={trend}, build_score={build_score:.2f}, contrast={contrast:.1f} dB."
+                )
+            if payoff and flat_low:
+                violations.append(
+                    f"Cue {cue.get('cue_id', '?')} assigns an all-low-energy section to payoff."
+                )
+        for previous, current in zip(cues, cues[1:]):
+            same_track = str(previous.get("file_name") or "").casefold() == str(
+                current.get("file_name") or ""
+            ).casefold()
+            try:
+                gap = float(current.get("timeline_in_sec", 0) or 0) - float(
+                    previous.get("timeline_out_sec", 0) or 0
+                )
+            except (TypeError, ValueError):
+                gap = 999.0
+            if same_track and abs(gap) <= 0.25:
+                violations.append(
+                    "The same track was split into adjacent cues without an audible change; "
+                    "use one continuous cue or select a genuinely different musical section."
+                )
+        return violations
+
     def enforce_dialogue_ducking(
         self,
         clips: Sequence[Dict[str, Any]],
@@ -3146,7 +4621,37 @@ class AIDirector:
                 float(clip.get("cut_out_sec", 0) or 0)
                 - float(clip.get("cut_in_sec", 0) or 0),
             )
-            if bool(clip.get("has_dialogue")):
+            source_in = float(clip.get("cut_in_sec", 0) or 0)
+            audio_intent = str(clip.get("audio_intent") or "").casefold()
+            exact_ranges = clip.get("dialogue_ranges_sec")
+            added_exact = False
+            if audio_intent != "mute_for_music" and isinstance(exact_ranges, list):
+                for raw_range in exact_ranges:
+                    if not isinstance(raw_range, dict):
+                        continue
+                    start = max(
+                        source_in,
+                        float(raw_range.get("start_sec", source_in) or source_in),
+                    )
+                    end = min(
+                        source_in + duration,
+                        float(raw_range.get("end_sec", source_in) or source_in),
+                    )
+                    if end - start < 0.05:
+                        continue
+                    dialogue_ranges.append(
+                        (cursor + start - source_in, cursor + end - source_in)
+                    )
+                    added_exact = True
+            if (
+                not added_exact
+                and audio_intent != "mute_for_music"
+                and bool(clip.get("has_dialogue"))
+                and (
+                    exact_ranges is None
+                    or str(clip.get("story_role") or "").casefold() == "interview"
+                )
+            ):
                 dialogue_ranges.append((cursor, cursor + duration))
             cursor += duration
         cues: List[Dict[str, Any]] = []
@@ -3166,6 +4671,10 @@ class AIDirector:
                 )
             cues.append(cue)
         plan["cues"] = cues
+        plan["dialogue_regions"] = [
+            {"timeline_in_sec": round(start, 3), "timeline_out_sec": round(end, 3)}
+            for start, end in dialogue_ranges
+        ]
         return plan
 
     def snap_visual_cuts_to_beats(
@@ -3299,25 +4808,41 @@ class AIDirector:
         if not cues:
             return plan
         boundaries: List[tuple[float, str]] = []
+        picture_boundaries: List[float] = [0.0]
         cursor = 0.0
         for clip in clips[:-1]:
             cursor += max(
                 0.0,
                 float(clip.get("cut_out_sec", 0)) - float(clip.get("cut_in_sec", 0)),
             )
+            picture_boundaries.append(cursor)
             role = str(clip.get("music_edit_role") or "on_beat").casefold()
             if role != "natural_sound":
                 boundaries.append((cursor, role))
+        if clips:
+            cursor += max(
+                0.0,
+                float(clips[-1].get("cut_out_sec", 0))
+                - float(clips[-1].get("cut_in_sec", 0)),
+            )
+            picture_boundaries.append(cursor)
         aligned: List[Dict[str, Any]] = []
         for cue in cues:
             timeline_in = float(cue.get("timeline_in_sec", 0) or 0)
             timeline_out = float(cue.get("timeline_out_sec", 0) or 0)
             track_in = float(cue.get("track_in_sec", 0) or 0)
             track_out = float(cue.get("track_out_sec", 0) or 0)
-            existing = [
-                dict(point) for point in cue.get("sync_points", [])
-                if isinstance(point, dict)
-            ]
+            cue_landmarks = picture_boundaries + [timeline_in, timeline_out]
+            existing = []
+            for point in cue.get("sync_points", []):
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    point_time = float(point.get("timeline_sec", -999))
+                except (TypeError, ValueError):
+                    continue
+                if any(abs(point_time - boundary) <= 0.8 for boundary in cue_landmarks):
+                    existing.append(dict(point))
             events: List[tuple[float, str]] = []
             for field, kind in (("downbeats_sec", "downbeat"), ("strong_beats_sec", "strong_beat")):
                 events.extend(
@@ -3381,6 +4906,23 @@ class AIDirector:
         """
         compact_candidates = []
         for item in candidates:
+            speech_intervals = self._candidate_speech_intervals(item)
+            silent_intervals = self._candidate_silent_intervals(
+                item, speech_intervals
+            )
+            try:
+                candidate_duration = max(
+                    0.0,
+                    float(item.get("cut_out_sec", 0) or 0)
+                    - float(item.get("cut_in_sec", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                candidate_duration = 0.0
+            speech_duration = (
+                sum(end - start for start, end in speech_intervals)
+                if speech_intervals is not None
+                else candidate_duration if bool(item.get("has_dialogue")) else 0.0
+            )
             compact_candidates.append(
                 {
                     "candidate_id": item["candidate_id"],
@@ -3402,13 +4944,42 @@ class AIDirector:
                     "camera_motion": item.get("camera_motion", "static"),
                     "rhythmic_potential": item.get("rhythmic_potential", 0.5),
                     "has_dialogue": bool(item.get("has_dialogue", False)),
+                    # Exact merged timing lets the model trim a visual action
+                    # outside speech instead of guessing from has_dialogue.
+                    # 精确合并时间让导演能保留画面动作而不误留现场谈话。
+                    "speech_ranges": [
+                        [round(start, 3), round(end, 3)]
+                        for start, end in (speech_intervals or [])
+                    ],
+                    "silent_ranges": [
+                        [round(start, 3), round(end, 3)]
+                        for start, end in silent_intervals
+                    ],
+                    "speech_seconds_if_full_range": round(speech_duration, 3),
+                    "speech_occupancy_ratio": round(
+                        speech_duration / candidate_duration, 3
+                    ) if candidate_duration else 0.0,
                     "dialogue_excerpt": self._compact_prompt_text(
                         item.get("dialogue_excerpt", ""), 260
+                    ),
+                    "production_context_hint": bool(
+                        item.get("production_context_hint", False)
                     ),
                     "confidence": item.get("confidence", 0.5),
                     "quality_score": item.get("quality_score", 0.5),
                 }
             )
+            if speech_intervals is None:
+                # Keep legacy/test ledgers as compact as before. Exact audio
+                # fields are valuable only when the extractor actually supplied
+                # timestamps; empty placeholders needlessly consume context.
+                for key in (
+                    "speech_ranges",
+                    "silent_ranges",
+                    "speech_seconds_if_full_range",
+                    "speech_occupancy_ratio",
+                ):
+                    compact_candidates[-1].pop(key, None)
         asset_names = [
             {
                 "source_order": source_order,
@@ -3499,9 +5070,16 @@ class AIDirector:
             "overlapping transport batches. Synthesize the complete source summaries into "
             "one grounded project memory before selecting shots. Track people, locations, "
             "actions, reactions, cause/effect, recurring motifs, and unresolved intentions. "
-            "Do not invent events. You may refine the treatment's central thesis when the "
-            "complete evidence supports a stronger interpretation, but respect an explicit "
-            "user creative brief. Return JSON only.\n"
+            "Do not invent events. Audit the user's requested outcome against what the "
+            "source summaries literally observe. Words such as preparing, ready, before, "
+            "signals, implies, or a countdown do NOT prove that the next action happened. "
+            "For example, a static lineup is not a departure and a rider leaning forward "
+            "is not riding away. Record the last action actually visible in observed_ending, "
+            "list requested but unsupported actions in absent_or_unproven_events, and use "
+            "honest_adaptation to propose the strongest film the available evidence can "
+            "truthfully support. The creative brief is an intention, not permission to "
+            "hallucinate missing footage. You may refine its thesis when evidence requires. "
+            "Return JSON only.\n"
             f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
             f"INITIAL TREATMENT: {json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
             f"SOURCE SUMMARIES: {json.dumps(full_review_summaries, ensure_ascii=False, separators=(',', ':'))}"
@@ -3513,6 +5091,12 @@ class AIDirector:
             coverage_prompt,
             COVERAGE_SYNOPSIS_SCHEMA,
             model=self.text_model,
+        )
+        coverage_synopsis = self._normalize_coverage_synopsis(
+            coverage_synopsis, compact_treatment
+        )
+        narrative_contract = self._request_narrative_contract(
+            compact_candidates, coverage_synopsis, compact_treatment
         )
         def build_sequence_prompt(
             active_candidates: Sequence[Dict[str, Any]],
@@ -3527,9 +5111,42 @@ class AIDirector:
                 "never invent or duplicate an id. Follow the treatment. Preserve the "
                 "real source_order and in-file timestamp chronology; narrative quality "
                 "must come from selection and juxtaposition, not scrambling the shoot. "
+                "The EVIDENCE-FIRST NARRATIVE CONTRACT is the factual and structural source "
+                "of truth. The earlier treatment is only a creative hypothesis; where they "
+                "conflict, obey the contract. First decide exactly what the viewer should "
+                "understand in one sentence, then choose an editorial_style and make every "
+                "shot prove that sentence. "
+                "Treat absent_or_unproven_events as a hard factual boundary. Never describe "
+                "a departure, ride, reaction, ignition, or other event unless a candidate's "
+                "visual_summary or dialogue explicitly observes it. Readiness is not action. "
+                "If the requested ending was not filmed, reframe the film around the strongest "
+                "honest ending (ritual, portrait, anticipation, friendship, or another observed "
+                "idea) instead of pretending the missing event occurred. "
                 "Establish context, develop the story, "
                 "use B-roll to cover or bridge speech, avoid repetitive points, and "
-                "finish deliberately. Preserve complete thoughts. Choose restrained "
+                "finish deliberately. Candidate production_context_hint is advisory "
+                "evidence, not a command. You alone decide whether production dialogue "
+                "serves this film. For every selected shot explicitly choose preserve_dialogue, "
+                "natural_texture, mix_with_music, or mute_for_music and justify that choice "
+                "through narrative_function and reason_for_position. "
+                "For each selected id, trim_in_sec and trim_out_sec must stay inside its "
+                "candidate range and isolate only the exact useful action or complete thought. "
+                "Kinetic montage shots should usually be 0.8-4 seconds; dialogue-led thoughts "
+                "may be longer only when every second is meaningful. Preserve complete thoughts. "
+                "Use normal human cutting grammar: enter just before the useful action or line, "
+                "leave immediately after it, and cut on action, reaction, gaze, or sound. Adjacent "
+                "shots should change at least one major visual property such as subject, shot scale, "
+                "camera movement, action, or emotional pressure. Do not repeat static wide lineups "
+                "when moving, medium, close, reaction, or detail candidates can advance the idea. "
+                "Every selected shot must state narrative_function, viewer_information, a "
+                "literal evidence_claim, connection_to_previous, and reason_for_position. "
+                "evidence_claim must describe only visible or audible facts in that candidate; "
+                "connection_to_previous must explain the editorial progression, not repeat mood words. "
+                "Design at most six executable graphics tied to selected candidate ids. Use a title, "
+                "chapter words, lower thirds, or an end card only when they clarify the premise, "
+                "structure, identity, or payoff; typography may be bold and stylish but cannot name "
+                "an event that the selected picture never shows. "
+                "Choose restrained "
                 "transitions and effects from the schema; default to hard cuts, use "
                 "cross dissolves for genuine time/mood changes, and fade_black only "
                 "for major chapter endings. Keep the sum of selected clip durations at "
@@ -3542,9 +5159,12 @@ class AIDirector:
                 "use action/reaction and high rhythmic_potential shots for musical builds, "
                 "and reserve payoff_hit for the true narrative payoff. Do not pretend a flat "
                 "track has a crescendo. "
-                "Return project_summary and sequence only; the next constrained call "
+                "Return project_summary, viewer_takeaway, editorial_style, graphics_plan, "
+                "and sequence only; the next constrained call "
                 "will score music against this exact edit. Return JSON only.\n"
                 f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"EVIDENCE-FIRST NARRATIVE CONTRACT:\n{json.dumps(narrative_contract, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"PREVIOUS RENDERED ROUGH-CUT REVIEW:\n{json.dumps(self._rough_cut_feedback, ensure_ascii=False, separators=(',', ':'))}\n"
                 f"AVAILABLE SCORE PROFILES:\n{json.dumps(score_profiles, ensure_ascii=False, separators=(',', ':'))}\n"
                 f"ASSETS:\n{json.dumps(asset_names, ensure_ascii=False, separators=(',', ':'))}\n"
                 f"FULL COVERAGE SYNOPSIS:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
@@ -3558,6 +5178,7 @@ class AIDirector:
             "all_candidate_count": len(compact_candidates),
             "final_assembly_candidate_count": len(compact_candidates),
             "all_candidates_considered": True,
+            "narrative_contract": narrative_contract,
             "review_rounds": [],
         }
         # Prefer a single global call when the complete compact ledger fits. If
@@ -3621,11 +5242,407 @@ class AIDirector:
             sequence_prompt,
             SEQUENCE_SELECTION_SCHEMA,
             model=self.text_model,
+            progress_activity="picture_assembly",
         )
 
-        selected_storyboard = self._build_music_storyboard(
-            sequence_payload.get("sequence"), candidates
+        # A separate supervising-editor pass protects narrative logic and factual
+        # grounding. It may revise the draft, whereas Python is not allowed to
+        # silently add, delete, or reorder creative choices afterward.
+        # 独立总剪辑师复审叙事与证据；此后 Python 不得再静默增删或重排镜头。
+        draft_metrics = self._picture_plan_metrics(sequence_payload, candidates)
+        compact_draft_metrics = {
+            key: value for key, value in draft_metrics.items()
+            if key != "shot_audit"
+        }
+        supervising_prompt = (
+            "SUPERVISING EDITOR REVIEW. Audit the draft picture plan as if a viewer has "
+            "never seen the prompt. Return a complete revised plan, not notes. The film "
+            "must communicate one intelligible idea through visible/audible cause, contrast, "
+            "or progression. Reject any claim or title unsupported by candidate evidence. "
+            "A static lineup, countdown, readiness, headlight, or forward lean does not prove "
+            "departure. If the desired action is absent, openly reframe the thesis around what "
+            "was actually filmed. Preserve useful human behavior when it gives character. "
+            "Each shot needs a unique job and a concrete connection to the preceding shot. "
+            "Do not rubber-stamp the draft: problems_found and changes_made must cite concrete "
+            "shot, dialogue, title, or rhythm decisions. For a film under two minutes that is "
+            "not explicitly dialogue_led, preserved dialogue should normally occupy less than "
+            "half the runtime. Keep only lines that change understanding, reveal character, or "
+            "create a genuine turn; one concise exchange is enough for routine logistics. "
+            "Avoid adjacent shots that answer the same question or repeat the same action. "
+            "Most montage shots should be roughly 1.5-5 seconds; longer dialogue is earned only "
+            "by a complete, meaningful thought. Prefer visible behavior, movement, reaction, "
+            "composition, and contrast over people explaining setup. If visual diversity is "
+            "limited, make a shorter film instead of padding with technical chatter. Use zero "
+            "to two graphics by default for a sub-two-minute film; three or more require truly "
+            "distinct chapters. Music-edit roles must progress across natural sound, phrase "
+            "starts, build, payoff, and release rather than repeating one label. "
+            "natural_texture still preserves all production audio, including speech; use "
+            "mute_for_music when a line should not remain audible. "
+            "Apply human cutting grammar: enter a shot immediately before its useful action or "
+            "line and leave immediately after it; cut on action, reaction, gaze, or sound; make "
+            "adjacent shots change subject, scale, movement, information, or emotional pressure. "
+            "Do not use an explanatory title such as THE LOGISTICS to make routine footage feel "
+            "important. If the process has no conflict, discovery, character turn, or real payoff, "
+            "abandon the behind-the-scenes premise and make a shorter visual mood or style film. "
+            "Choose the duration and number of shots yourself; the target is guidance, not a "
+            "reason for software to alter your cut later. Return JSON only.\n"
+            f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
+            f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"EVIDENCE-FIRST NARRATIVE CONTRACT:\n{json.dumps(narrative_contract, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"PREVIOUS RENDERED ROUGH-CUT REVIEW:\n{json.dumps(self._rough_cut_feedback, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"EVIDENCE AUDIT:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"DRAFT EDIT METRICS:\n{json.dumps(compact_draft_metrics, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"AVAILABLE CANDIDATES:\n{json.dumps(review_pool, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"DRAFT PICTURE PLAN:\n{json.dumps(sequence_payload, ensure_ascii=False, separators=(',', ':'))}"
         )
+        if not self._request_has_capacity(
+            supervising_prompt,
+            SUPERVISING_EDITOR_SCHEMA,
+            model=self.text_model,
+            reserve_output_tokens=1536,
+        ):
+            raise DirectorError(
+                "总剪辑复审无法完整放入当前 Context；请提高 Context，禁止跳过叙事复审。"
+                " / Supervising-editor review does not fit the current Context; increase it."
+            )
+        self.logger.info(
+            "正在由总剪辑师复审叙事与证据（镜头第 2/2 步）/ "
+            "Supervising editor reviewing story and evidence (picture step 2/2)"
+        )
+        draft_sequence_payload = sequence_payload
+        sequence_payload = self._request_json(
+            supervising_prompt,
+            SUPERVISING_EDITOR_SCHEMA,
+            model=self.text_model,
+            progress_activity="picture_critique",
+        )
+        quality_audit_rounds: List[Dict[str, Any]] = []
+        max_quality_revisions = 3
+        final_metrics: Dict[str, Any] = {}
+        quality_violations: List[str] = []
+        best_sequence_payload = sequence_payload
+        best_metrics: Dict[str, Any] = {}
+        best_violations: List[str] = []
+        best_blind_review: Dict[str, Any] = {}
+        best_rank: Optional[tuple[Any, ...]] = None
+        previous_rank: Optional[tuple[Any, ...]] = None
+        previous_signature = ""
+        structural_reset_used = False
+        for revision_index in range(max_quality_revisions + 1):
+            final_metrics = self._picture_plan_metrics(sequence_payload, candidates)
+            blind_review = self._request_blind_viewer_review(
+                sequence_payload, candidates, narrative_contract
+            )
+            quality_violations = self._picture_plan_quality_violations(
+                sequence_payload,
+                final_metrics,
+                candidates,
+                treatment,
+                narrative_contract,
+                coverage_synopsis,
+                blind_review,
+            )
+            current_signature = json.dumps(
+                {
+                    "sequence": sequence_payload.get("sequence", []),
+                    "graphics_plan": sequence_payload.get("graphics_plan", {}),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            # Rank complete model-authored alternatives; Python does not invent
+            # or rewrite shots. A lower tuple means fewer unresolved findings,
+            # less repetitive labeling, and more visual variety.
+            current_rank: tuple[Any, ...] = (
+                len(quality_violations),
+                int(final_metrics.get("longest_same_narrative_function_run", 0) or 0),
+                int(final_metrics.get("longest_same_music_role_run", 0) or 0),
+                float(final_metrics.get("static_shot_ratio", 0) or 0),
+                float(final_metrics.get("dominant_shot_scale_ratio", 0) or 0),
+                -int(blind_review.get("coherence_score", 0) or 0),
+                -int(blind_review.get("visual_payoff_score", 0) or 0),
+            )
+            if best_rank is None or current_rank < best_rank:
+                best_rank = current_rank
+                best_sequence_payload = sequence_payload
+                best_metrics = final_metrics
+                best_violations = list(quality_violations)
+                best_blind_review = dict(blind_review)
+            quality_audit_rounds.append(
+                {
+                    "round": revision_index,
+                    "metrics": final_metrics,
+                    "violations": list(quality_violations),
+                    "rank": list(current_rank),
+                    "review": sequence_payload.get("review", {}),
+                    "blind_viewer_review": blind_review,
+                }
+            )
+            self.logger.info(
+                "总剪辑质量门：第 %d 轮，对白 %.1f%%，静态镜头 %.1f%%，字卡 %d，问题 %d / "
+                "Picture quality gate round %d: dialogue %.1f%%, static %.1f%%, graphics %d, violations %d",
+                revision_index,
+                float(final_metrics.get("preserved_dialogue_ratio", 0)) * 100,
+                float(final_metrics.get("static_shot_ratio", 0)) * 100,
+                int(final_metrics.get("graphic_count", 0)),
+                len(quality_violations),
+                revision_index,
+                float(final_metrics.get("preserved_dialogue_ratio", 0)) * 100,
+                float(final_metrics.get("static_shot_ratio", 0)) * 100,
+                int(final_metrics.get("graphic_count", 0)),
+                len(quality_violations),
+            )
+            if not quality_violations:
+                break
+            self.logger.warning(
+                "总剪辑方案被质量门退回：%s / Picture plan rejected by measured quality gate: %s",
+                "；".join(quality_violations),
+                "; ".join(quality_violations),
+            )
+            no_measurable_progress = (
+                revision_index > 0
+                and (
+                    current_signature == previous_signature
+                    or (
+                        previous_rank is not None
+                        and current_rank >= previous_rank
+                    )
+                )
+            )
+            force_structural_reset = (
+                not structural_reset_used
+                and (
+                    no_measurable_progress
+                    or revision_index >= max_quality_revisions - 1
+                )
+            )
+            if revision_index >= max_quality_revisions or (
+                no_measurable_progress and structural_reset_used
+            ):
+                if no_measurable_progress:
+                    self.logger.warning(
+                        "质量重剪没有产生可测量改进，停止重复请求并回退到本轮最佳完整导演方案 / "
+                        "Quality recut made no measurable improvement; stopping duplicate requests "
+                        "and falling back to the best complete director-authored plan"
+                    )
+                break
+            previous_rank = current_rank
+            previous_signature = current_signature
+            compact_recut_metrics = {
+                key: value for key, value in final_metrics.items()
+                if key != "shot_audit"
+            }
+            compact_attempt_history = [
+                {
+                    "round": item.get("round"),
+                    "violations": item.get("violations", []),
+                    "rank": item.get("rank", []),
+                }
+                for item in quality_audit_rounds
+            ] if revision_index > 0 else []
+            has_exact_speech_timing = any(
+                isinstance(item, dict) and "speech_ranges" in item
+                for item in review_pool
+            )
+            recut_shot_audit = (
+                final_metrics.get("shot_audit", [])
+                if has_exact_speech_timing
+                else []
+            )
+            audio_evidence_instruction = (
+                "The candidate speech_ranges are exact merged source timestamps; silent_ranges "
+                "are safe visual-only trim windows. The CURRENT SHOT AUDIT reports source speech "
+                "and actually audible speech after audio_intent/volume. Do not guess. Do not mute "
+                "story-critical speech merely to game a percentage; when dialogue genuinely drives "
+                "the treatment, explain that creative decision in review.dialogue_strategy.\n"
+                if has_exact_speech_timing
+                else ""
+            )
+            normal_recut_prompt = (
+                "PICTURE QUALITY RECUT. The previous supervising-editor plan has been rejected "
+                "by measurements of the actual authored sequence. Do not defend it and do not "
+                "merely rewrite the review. Return a materially revised complete picture plan "
+                "plus an honest review. Every violation below must be fixed by actual candidate "
+                "selection, exact trims, audio intent, narrative functions, graphics, and music "
+                "roles. Python will measure the returned plan again. Enter late and leave early; "
+                "most visual shots should contain one readable action and last about 1.5-5 seconds. "
+                "Use dialogue only when the exact timestamped line changes understanding or reveals "
+                "character. Change shot size and movement when the candidate evidence permits it. "
+                "Remember that natural_texture keeps speech audible; it cannot be used to hide "
+                "dialogue from the measured ratio. Use mute_for_music for unwanted production talk. "
+                "A middle made entirely of context is not a story: create escalation, contrast, or "
+                "a visible payoff. Reserve payoff_hit for the earned climax. If routine production "
+                "logistics do not contain conflict, discovery, or character change, abandon the BTS "
+                "premise and author a concise visual mood/style film from the strongest real actions. "
+                "Never invent motion or an ending. Return JSON only.\n"
+                f"{audio_evidence_instruction}"
+                f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
+                f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"EVIDENCE AUDIT:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"EVIDENCE-FIRST NARRATIVE CONTRACT:\n{json.dumps(narrative_contract, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"BLIND VIEWER FAILURE:\n{json.dumps(blind_review, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"MEASURED VIOLATIONS:\n{json.dumps(quality_violations, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"MEASURED PLAN METRICS:\n{json.dumps(compact_recut_metrics, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"CURRENT SHOT AUDIT:\n{json.dumps(recut_shot_audit, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"EARLIER QUALITY ATTEMPTS:\n{json.dumps(compact_attempt_history, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"AVAILABLE CANDIDATES:\n{json.dumps(review_pool, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"REJECTED PICTURE PLAN:\n{json.dumps(sequence_payload, ensure_ascii=False, separators=(',', ':'))}"
+            )
+            selected_failed_ids = [
+                str(item.get("candidate_id") or "")
+                for item in sequence_payload.get("sequence", [])
+                if isinstance(item, dict) and str(item.get("candidate_id") or "")
+            ]
+            structural_recut_prompt = (
+                "PICTURE QUALITY RECUT - STRUCTURAL RESET. Incremental repairs have failed. "
+                "Discard the rejected premise and build a genuinely different complete film "
+                "from AVAILABLE CANDIDATES. Do not preserve the previous shot list, hook, ending, "
+                "or explanatory rationale. First choose one observable subject cluster and one "
+                "form: (A) a concise character micro-portrait, (B) a pure vehicle style/mood film, "
+                "or (C) a factual process vignette with a visible before/change/after. Never combine "
+                "unrelated banter, an isolated car showcase, and repeated static motorcycle lineups "
+                "merely because all occurred at night. For a mood film, visual progression, changing "
+                "scale, movement, and a deliberate final state must replace plot. Use closeup and "
+                "medium alternatives when their literal evidence supports the chosen subject; do not "
+                "fill runtime with near-identical wides. Each narrative_function may repeat at most "
+                "three times in a row. Prefer a focused 15-35 second film with one legible idea over a "
+                "long incoherent montage. FAILED SELECTED IDS are not individually forbidden, but reuse "
+                "only those essential to the new concept. Return a complete plan plus honest review. "
+                "Never invent an event. Return JSON only.\n"
+                f"{audio_evidence_instruction}"
+                f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
+                f"DIRECTOR TREATMENT (hypothesis, not a command):\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"EVIDENCE AUDIT:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"EVIDENCE-FIRST NARRATIVE CONTRACT:\n{json.dumps(narrative_contract, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"BLIND VIEWER FAILURE:\n{json.dumps(blind_review, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"MEASURED VIOLATIONS:\n{json.dumps(quality_violations, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"FAILED SELECTED IDS:\n{json.dumps(selected_failed_ids, ensure_ascii=False)}\n"
+                f"EARLIER QUALITY ATTEMPTS:\n{json.dumps(compact_attempt_history, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"AVAILABLE CANDIDATES:\n{json.dumps(review_pool, ensure_ascii=False, separators=(',', ':'))}"
+            )
+            recut_prompt = (
+                structural_recut_prompt
+                if force_structural_reset
+                else normal_recut_prompt
+            )
+            if not self._request_has_capacity(
+                recut_prompt,
+                SUPERVISING_EDITOR_SCHEMA,
+                model=self.text_model,
+                reserve_output_tokens=2048,
+            ):
+                raise DirectorError(
+                    "质量门重剪无法完整放入当前 Context；请提高 Context。"
+                    " / Quality-gate recut cannot fit the current Context; increase Context."
+                )
+            self.logger.info(
+                "正在执行质量门退回重剪 %d/%d / Quality-gate recut %d/%d",
+                revision_index + 1,
+                max_quality_revisions,
+                revision_index + 1,
+                max_quality_revisions,
+            )
+            if force_structural_reset:
+                self.logger.warning(
+                    "Incremental recuts stalled; running a structural-reset recut "
+                    "%d/%d from the complete evidence pool",
+                    revision_index + 1,
+                    max_quality_revisions,
+                )
+            structural_reset_used = structural_reset_used or force_structural_reset
+            sequence_payload = self._request_json(
+                recut_prompt,
+                SUPERVISING_EDITOR_SCHEMA,
+                model=self.text_model,
+                progress_activity="picture_recut",
+            )
+
+        sequence_payload = best_sequence_payload
+        final_metrics = best_metrics
+        quality_violations = best_violations
+        blind_review = best_blind_review
+        if quality_violations:
+            # These are measured contract failures, not optional aesthetic advice.
+            # Continuing here used to render a film that the blind viewer could not
+            # understand while the JSON itself said quality_gate_passed=false.
+            # Never spend more time in music/Resolve on an invalid picture lock.
+            # 这些是可测量的故事合同失败，不是可忽略的审美建议；盲审未通过时禁止渲染。
+            details = json.dumps(
+                quality_violations,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            raise DirectorError(
+                "Director quality gate failed after all bounded recuts; Resolve render "
+                f"has been blocked. Measured failures: {details}"
+            )
+
+        draft_picture_signature = json.dumps(
+            {
+                "sequence": draft_sequence_payload.get("sequence", []),
+                "graphics_plan": draft_sequence_payload.get("graphics_plan", {}),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        final_picture_signature = json.dumps(
+            {
+                "sequence": sequence_payload.get("sequence", []),
+                "graphics_plan": sequence_payload.get("graphics_plan", {}),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        supervising_changed_plan = draft_picture_signature != final_picture_signature
+        candidate_directing["supervising_editor_reviewed"] = True
+        candidate_directing["supervising_editor_changed_plan"] = supervising_changed_plan
+        candidate_directing["draft_metrics"] = draft_metrics
+        candidate_directing["final_metrics"] = final_metrics
+        candidate_directing["quality_gate_passed"] = True
+        candidate_directing["quality_gate_degraded_acceptance"] = False
+        candidate_directing["unresolved_quality_advisories"] = []
+        candidate_directing["quality_revision_count"] = max(
+            0, len(quality_audit_rounds) - 1
+        )
+        candidate_directing["quality_audit_rounds"] = quality_audit_rounds
+        candidate_directing["blind_viewer_review"] = blind_review
+        candidate_directing["supervising_review"] = sequence_payload.get("review", {})
+        candidate_directing["draft_picture_plan"] = draft_sequence_payload
+        self.logger.info(
+            "总剪辑复审指标：对白占比 %.1f%% → %.1f%%，字卡 %d → %d，平均镜长 %.1fs → %.1fs / "
+            "Supervising metrics: dialogue %.1f%% -> %.1f%%, graphics %d -> %d, average shot %.1fs -> %.1fs",
+            float(draft_metrics.get("preserved_dialogue_ratio", 0)) * 100,
+            float(final_metrics.get("preserved_dialogue_ratio", 0)) * 100,
+            int(draft_metrics.get("graphic_count", 0)),
+            int(final_metrics.get("graphic_count", 0)),
+            float(draft_metrics.get("average_shot_duration_sec", 0)),
+            float(final_metrics.get("average_shot_duration_sec", 0)),
+            float(draft_metrics.get("preserved_dialogue_ratio", 0)) * 100,
+            float(final_metrics.get("preserved_dialogue_ratio", 0)) * 100,
+            int(draft_metrics.get("graphic_count", 0)),
+            int(final_metrics.get("graphic_count", 0)),
+            float(draft_metrics.get("average_shot_duration_sec", 0)),
+            float(final_metrics.get("average_shot_duration_sec", 0)),
+        )
+        if not supervising_changed_plan:
+            self.logger.warning(
+                "总剪辑师未实际改变镜头或字卡；已在 timeline_cuts.json 中记录，"
+                "请检查 review 是否有充分依据 / Supervising editor returned an unchanged "
+                "picture plan; the audit is recorded for inspection"
+            )
+
+        # Music must be authored against the final, deterministic picture lock.
+        # The older path scored the model's pre-validation list, then runtime
+        # guards removed/changed shots, leaving cue hits attached to nonexistent
+        # boundaries. Validate first and never move picture after this point.
+        # 配乐必须基于最终锁画；禁止再用守门前的旧故事板设计卡点。
+        picture_lock = self.validate_sequence(sequence_payload, candidates, treatment)
+        picture_lock = self._attach_candidate_dialogue(picture_lock, assets)
+        selected_storyboard = self._build_locked_music_storyboard(picture_lock)
+        locked_duration = selected_storyboard[-1]["timeline_out"] if selected_storyboard else 0.0
         if music_choices:
             music_prompt = (
                 "Design the final documentary music cue sheet for the already selected "
@@ -3644,7 +5661,7 @@ class AIDirector:
                 "serve distinct story beats, not add random variety. The CPU conformer "
                 "will render this cue sheet into one music_bed.wav. Return music_plan "
                 "JSON only.\n"
-                f"TARGET PROGRAM: {self._active_target_duration_sec:.1f}s\n"
+                f"LOCKED PROGRAM DURATION: {locked_duration:.3f}s\n"
                 f"DIRECTOR TREATMENT:\n{json.dumps(compact_treatment, ensure_ascii=False, separators=(',', ':'))}\n"
                 f"FULL COVERAGE SYNOPSIS:\n{json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
                 f"SELECTED PICTURE STORYBOARD:\n{json.dumps(selected_storyboard, ensure_ascii=False, separators=(',', ':'))}\n"
@@ -3654,12 +5671,39 @@ class AIDirector:
                 "正在设计最终配乐（第 2/2 步：音乐）/ "
                 "Designing final music (step 2/2: cue sheet)"
             )
-            music_payload = self._request_json(
-                music_prompt,
-                MUSIC_PLAN_SCHEMA,
-                model=self.text_model,
-            )
-            music_plan = music_payload.get("music_plan")
+            music_request = music_prompt
+            music_plan = None
+            for music_revision in range(2):
+                music_payload = self._request_json(
+                    music_request,
+                    MUSIC_PLAN_SCHEMA,
+                    model=self.text_model,
+                    progress_activity="music_spotting",
+                )
+                music_plan = music_payload.get("music_plan")
+                normalized_music = self.validate_music_plan(music_plan, locked_duration)
+                music_violations = self.music_plan_quality_violations(
+                    normalized_music, compact_treatment
+                )
+                if not music_violations:
+                    break
+                if music_revision >= 1:
+                    raise DirectorError(
+                        "Music director quality gate failed after reselection: "
+                        + "; ".join(music_violations)
+                    )
+                self.logger.warning(
+                    "Music cue sheet contradicted measured audio energy; returning it "
+                    "to the director for one grounded reselection: %s",
+                    "; ".join(music_violations),
+                )
+                music_request = (
+                    music_prompt + "\nREJECTED MUSIC PLAN:\n"
+                    + json.dumps(music_plan, ensure_ascii=False, separators=(",", ":"))
+                    + "\nMEASURED MUSIC FAILURES:\n"
+                    + json.dumps(music_violations, ensure_ascii=False)
+                    + "\nReturn a materially different, measurement-grounded music_plan."
+                )
         else:
             music_plan = {
                 "strategy": "No analyzed music candidates were supplied.",
@@ -3668,10 +5712,25 @@ class AIDirector:
             }
         return {
             "project_summary": sequence_payload.get("project_summary", ""),
+            "viewer_takeaway": sequence_payload.get(
+                "viewer_takeaway", treatment.get("viewer_takeaway", "")
+            ),
+            "editorial_style": sequence_payload.get(
+                "editorial_style", treatment.get("edit_style", "hybrid_cinematic")
+            ),
+            "graphics_plan": sequence_payload.get("graphics_plan", {}),
             "coverage_synopsis": coverage_synopsis,
+            "narrative_contract": narrative_contract,
             "candidate_directing": candidate_directing,
             "sequence": sequence_payload.get("sequence", []),
             "music_plan": music_plan,
+            "picture_lock_audit": {
+                "locked_before_music": True,
+                "duration_sec": round(float(locked_duration), 4),
+                "candidate_ids": [
+                    str(item.get("candidate_id") or "") for item in picture_lock
+                ],
+            },
         }
 
     def _review_candidate_round(
@@ -3963,6 +6022,162 @@ class AIDirector:
             cursor += duration
         return result
 
+    @classmethod
+    def _build_locked_music_storyboard(
+        cls, clips: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Describe the validated picture lock with exact final timeline offsets.
+        使用最终校验后的精确时间线位置构建配乐故事板。
+
+        Parameters / 参数:
+            clips: Final ordered and duration-fitted picture clips. / 已排序并完成时长守门的镜头。
+        """
+        result: List[Dict[str, Any]] = []
+        cursor = 0.0
+        for clip in clips:
+            duration = max(
+                0.0,
+                float(clip.get("cut_out_sec", 0))
+                - float(clip.get("cut_in_sec", 0)),
+            )
+            result.append(
+                {
+                    "candidate_id": str(clip.get("candidate_id") or ""),
+                    "timeline_in": round(cursor, 3),
+                    "timeline_out": round(cursor + duration, 3),
+                    "source_in": round(float(clip.get("cut_in_sec", 0)), 3),
+                    "source_out": round(float(clip.get("cut_out_sec", 0)), 3),
+                    "narrative_function": str(
+                        clip.get("narrative_function") or "context"
+                    ),
+                    "viewer_information": cls._compact_prompt_text(
+                        clip.get("viewer_information", ""), 180
+                    ),
+                    "story_role": clip.get("story_role", "context"),
+                    "music_edit_role": clip.get("music_edit_role", "natural_sound"),
+                    "audio_intent": clip.get("audio_intent", "mix_with_music"),
+                    "has_dialogue": bool(clip.get("has_dialogue")),
+                    "dialogue_ranges_sec": list(clip.get("dialogue_ranges_sec") or [])[:12],
+                    "action_phase": clip.get("action_phase", "action"),
+                    "emotion": cls._compact_prompt_text(clip.get("emotion", ""), 80),
+                    "rhythmic_potential": clip.get("rhythmic_potential", 0.5),
+                    "visual": cls._compact_prompt_text(
+                        clip.get("visual_summary", ""), 180
+                    ),
+                    "position_reason": cls._compact_prompt_text(
+                        clip.get("reason_for_position", ""), 160
+                    ),
+                }
+            )
+            cursor += duration
+        return result
+
+    def validate_graphics_plan(
+        self,
+        payload: Any,
+        clips: Sequence[Dict[str, Any]],
+        treatment: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Resolve candidate-anchored typography to exact final timeline seconds.
+        将候选镜头锚定的字体设计解析为最终时间线秒数。
+
+        Invalid or removed anchors are discarded. A restrained opening title is
+        added when the model returns no executable graphics, so a finished short
+        always has an optional, editable statement of intent.
+        无效或被删镜头的字卡会被丢弃；模型未返回可执行方案时补一个克制的开场标题。
+        """
+        value = payload if isinstance(payload, dict) else {}
+        active_treatment = treatment or self._active_treatment
+        positions: Dict[str, tuple[float, float]] = {}
+        cursor = 0.0
+        for clip in clips:
+            duration = max(
+                0.0,
+                float(clip.get("cut_out_sec", 0))
+                - float(clip.get("cut_in_sec", 0)),
+            )
+            candidate_id = str(clip.get("candidate_id") or "")
+            if candidate_id:
+                positions[candidate_id] = (cursor, cursor + duration)
+            cursor += duration
+        styles = {"minimal", "bold_cinematic", "kinetic", "editorial"}
+        kinds = {"title_card", "chapter", "lower_third", "end_card"}
+        placements = {"clip_start", "clip_middle", "clip_end"}
+        items: List[Dict[str, Any]] = []
+        for index, raw in enumerate(
+            value.get("items", []) if isinstance(value.get("items"), list) else []
+        ):
+            if not isinstance(raw, dict):
+                continue
+            anchor_id = str(raw.get("anchor_candidate_id") or "").strip()
+            bounds = positions.get(anchor_id)
+            text = " ".join(str(raw.get("text") or "").split())[:80]
+            if bounds is None or not text:
+                continue
+            clip_start, clip_end = bounds
+            clip_duration = max(0.0, clip_end - clip_start)
+            duration = min(
+                6.0,
+                clip_duration,
+                max(0.8, float(raw.get("duration_sec", 2.5) or 2.5)),
+            )
+            placement = str(raw.get("placement") or "clip_start").casefold()
+            placement = placement if placement in placements else "clip_start"
+            if placement == "clip_end":
+                start = max(clip_start, clip_end - duration)
+            elif placement == "clip_middle":
+                start = max(clip_start, (clip_start + clip_end - duration) / 2.0)
+            else:
+                start = clip_start
+            kind = str(raw.get("kind") or "chapter").casefold()
+            style = str(raw.get("style") or "minimal").casefold()
+            items.append(
+                {
+                    "graphic_id": str(raw.get("graphic_id") or f"G{index + 1}"),
+                    "kind": kind if kind in kinds else "chapter",
+                    "anchor_candidate_id": anchor_id,
+                    "timeline_in_sec": round(start, 3),
+                    "timeline_out_sec": round(min(cursor, start + duration), 3),
+                    "text": text,
+                    "subtitle": " ".join(str(raw.get("subtitle") or "").split())[:140],
+                    "style": style if style in styles else "minimal",
+                    "purpose": " ".join(str(raw.get("purpose") or "Story clarity").split())[:240],
+                }
+            )
+        if not items and clips and cursor >= 0.8:
+            first_id = str(clips[0].get("candidate_id") or "")
+            title = " ".join(str(active_treatment.get("title") or "UNTITLED").split())[:80]
+            takeaway = " ".join(
+                str(active_treatment.get("viewer_takeaway") or "").split()
+            )[:140]
+            items.append(
+                {
+                    "graphic_id": "G_TITLE",
+                    "kind": "title_card",
+                    "anchor_candidate_id": first_id,
+                    "timeline_in_sec": 0.0,
+                    "timeline_out_sec": round(min(cursor, 3.5), 3),
+                    "text": title,
+                    "subtitle": takeaway,
+                    "style": "bold_cinematic"
+                    if str(active_treatment.get("edit_style")) in {
+                        "kinetic_montage", "hybrid_cinematic"
+                    }
+                    else "minimal",
+                    "purpose": "State the film's premise before the visual progression.",
+                }
+            )
+        items.sort(key=lambda item: (float(item["timeline_in_sec"]), item["graphic_id"]))
+        return {
+            "strategy": " ".join(
+                str(value.get("strategy") or active_treatment.get("typography_intent") or "").split()
+            ),
+            "renderer": "ffmpeg_preview_and_resolve_text_plus",
+            "items": items[:6],
+        }
+
     def validate_sequence(
         self,
         payload: Dict[str, Any],
@@ -3996,8 +6211,63 @@ class AIDirector:
                 )
             seen.add(candidate_id)
             clip = dict(by_id[candidate_id])
+            candidate_in = float(clip.get("cut_in_sec", 0) or 0)
+            candidate_out = float(clip.get("cut_out_sec", candidate_in) or candidate_in)
+            trim_in = self._finite_float(
+                sequence_item.get("trim_in_sec", candidate_in),
+                f"sequence[{index}].trim_in_sec",
+            )
+            trim_out = self._finite_float(
+                sequence_item.get("trim_out_sec", candidate_out),
+                f"sequence[{index}].trim_out_sec",
+            )
+            trim_in = min(candidate_out, max(candidate_in, trim_in))
+            trim_out = min(candidate_out, max(trim_in, trim_out))
+            if trim_out - trim_in >= 0.4:
+                clip["cut_in_sec"] = round(trim_in, 3)
+                clip["cut_out_sec"] = round(trim_out, 3)
+            clip["narrative_function"] = self._enum_value(
+                sequence_item.get("narrative_function"),
+                {"hook", "context", "escalation", "contrast", "payoff", "closure"},
+                "context",
+            )
+            clip["viewer_information"] = " ".join(
+                str(
+                    sequence_item.get("viewer_information")
+                    or clip.get("visual_summary")
+                    or clip.get("subject_action")
+                    or "Advances the selected story beat."
+                ).split()
+            )
             clip["reason_for_position"] = " ".join(
-                str(sequence_item.get("reason_for_position") or "").split()
+                str(
+                    sequence_item.get("reason_for_position")
+                    or clip.get("reason_for_cut")
+                    or "Supports the preceding and following story beats."
+                ).split()
+            )
+            clip["evidence_claim"] = " ".join(
+                str(
+                    sequence_item.get("evidence_claim")
+                    or clip.get("visual_summary")
+                    or clip.get("subject_action")
+                    or "Observed source action."
+                ).split()
+            )
+            clip["connection_to_previous"] = " ".join(
+                str(
+                    sequence_item.get("connection_to_previous")
+                    or ("Opens the film." if not final else "Continues the director's selected progression.")
+                ).split()
+            )
+            clip["audio_intent"] = self._enum_value(
+                sequence_item.get("audio_intent"),
+                {
+                    "preserve_dialogue", "natural_texture",
+                    "mute_for_music", "mix_with_music",
+                },
+                "preserve_dialogue" if clip.get("story_role") == "interview"
+                else "mix_with_music",
             )
             clip["music_edit_role"] = self._enum_value(
                 sequence_item.get("music_edit_role"),
@@ -4067,7 +6337,9 @@ class AIDirector:
                 sequence_item.get("volume_db", clip.get("volume_db", 0.0)),
                 f"sequence[{index}].volume_db",
             )
-            clip["volume_db"] = round(min(12.0, max(-24.0, volume_db)), 2)
+            clip["volume_db"] = round(min(12.0, max(-60.0, volume_db)), 2)
+            if clip["audio_intent"] == "mute_for_music":
+                clip["volume_db"] = -60.0
             smart_reframe = sequence_item.get(
                 "smart_reframe", clip.get("smart_reframe", False)
             )
@@ -4075,9 +6347,10 @@ class AIDirector:
                 smart_reframe if isinstance(smart_reframe, bool) else False
             )
             final.append(clip)
-        # Preserve the director's sequence for explicitly non-linear treatments;
-        # otherwise enforce real shooting chronology as promised by the treatment.
-        # 非线性方案保留导演排序；严格时间流方案才按拍摄顺序排序。
+        # Preserve the director's exact picture lock. Older code reordered,
+        # deduplicated, padded missing beats, and then score-trimmed the model's
+        # cut. That produced un-authored shots and destroyed narrative structure.
+        # 完整保留导演锁画；禁止 Python 再重排、去重、补镜头或按分数删镜头。
         active_treatment = treatment or self._active_treatment
         global_look = {
             "clean_neutral": "neutral",
@@ -4085,13 +6358,19 @@ class AIDirector:
             "cool_steel": "cool",
             "high_contrast": "contrast",
         }.get(str(active_treatment.get("creative_look") or ""), "neutral")
-        final = self._order_story_clips(final, active_treatment)
-        final = self._remove_semantic_redundancy(final)
-        final = self._complete_story_coverage(final, candidates, active_treatment)
-        final = self._remove_overlaps(final)
         for clip in final:
             clip["color_look"] = global_look
-        final = self._fit_target_duration(final, active_treatment)
+        final_duration = sum(
+            float(clip["cut_out_sec"]) - float(clip["cut_in_sec"])
+            for clip in final
+        )
+        target = float(active_treatment.get("target_duration_sec") or 0.0)
+        if target > 0 and final_duration > target * 1.10:
+            self.logger.warning(
+                "导演锁画 %.1fs 超过建议目标 %.1fs；已尊重导演决定，不再由 Python 删镜头 / "
+                "Director picture lock %.1fs exceeds suggested %.1fs; preserving it without Python cuts",
+                final_duration, target, final_duration, target,
+            )
         return self._apply_creative_grade_plan(final, active_treatment)
 
     def _apply_creative_grade_plan(
@@ -4227,8 +6506,32 @@ class AIDirector:
         """Return normalized semantic text for repetition checks. / 返回用于查重的规范化语义文本。"""
         return " ".join(
             " ".join(str(item.get(key) or "").casefold().split())
-            for key in ("visual_summary", "reason_for_cut", "transcript_excerpt")
+            for key in (
+                "visual_summary", "subject_action", "reason_for_cut",
+                "transcript_excerpt", "dialogue_excerpt",
+            )
         ).strip()
+
+    @classmethod
+    def _is_production_chatter(cls, item: Dict[str, Any]) -> bool:
+        """
+        Flag possible recording-process dialogue as advisory evidence only.
+        标记可能涉及录制流程的对白；此结果仅供导演参考，不触发自动剪辑。
+        """
+        text = cls._story_text(item)
+        phrases = (
+            "microphone", "record sound", "recording sound", "no sound",
+            "camera setting", "camera settings", "beauty filter", "skin smoothing",
+            "retake", "another take", "blocking", "move the camera", "shoot setup",
+            "pretend we are chatting", "pretend to chat", "test shot", "camera operator",
+            "smoke machine", "smoke device", "wait five minutes", "on the count",
+            "three two one", "3 2 1", "director wants", "photographer wants",
+            "麦克风", "录声音", "不需要录", "相机设置", "滤镜", "美颜", "磨皮",
+            "重拍", "重来一遍", "走位", "机位", "拍摄设置", "摄影师", "导演要求",
+            "假装我们", "假装闲聊", "等五分钟", "煙霧", "烟雾", "试验一下",
+            "試驗一下", "拍一条", "拍一條", "倒计时", "倒計時", "321上",
+        )
+        return any(phrase in text for phrase in phrases)
 
     @classmethod
     def _is_semantically_redundant(
@@ -4619,7 +6922,7 @@ class AIDirector:
                         min(
                             12.0,
                             max(
-                                -24.0,
+                                -60.0,
                                 self._finite_float(
                                     decision.get("volume_db", 0.0),
                                     f"decisions[{index}].volume_db",
@@ -4982,7 +7285,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-minutes", type=float, default=12.0)
     parser.add_argument("--project-fps", type=float, default=25.0)
     parser.add_argument("--num-ctx", type=int, default=8192)
-    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=7200,
+        help=(
+            "单次 Ollama 请求读取超时秒数 / per-request Ollama read timeout seconds "
+            "(default: 7200 for slow 27B/70B mixed-memory inference)"
+        ),
+    )
     parser.add_argument("--merge-gap", type=float, default=0.4)
     parser.add_argument(
         "--creative-brief",
@@ -5005,6 +7316,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--treatment-file",
         help="第一次导演初审 JSON；提供后最终导演不会重复初审 / first-pass treatment JSON",
+    )
+    parser.add_argument(
+        "--rough-cut-feedback",
+        help=(
+            "上一版低清成片的隔离盲审 JSON；用于证据化重剪 / "
+            "blind review JSON from the previous rendered rough cut"
+        ),
     )
     parser.add_argument(
         "--treatment-only",
@@ -5051,6 +7369,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             music_folder=args.music_folder,
             music_analysis=args.music_analysis,
             treatment_file=args.treatment_file,
+            rough_cut_feedback=args.rough_cut_feedback,
             logger=logger,
         )
         if args.treatment_only:
