@@ -90,7 +90,7 @@ button { color: inherit; }
 .remote-copy > div { display: grid; gap: 4px; min-width: 0; }
 .remote-copy small { color: var(--blue); font-size: 10px; font-weight: 850; letter-spacing: .12em; }
 .remote-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
-.local-connection { grid-template-columns: minmax(280px, 1fr) auto auto auto; }
+.local-connection { grid-template-columns: minmax(280px, 1fr) auto auto auto auto; }
 .local-connection code { color: var(--muted); font-size: 12px; }
 .local-connection.is-connected { border-color: rgba(30, 190, 135, .38); }
 .local-connection.is-connected .pulse { background: #1ebe87; box-shadow: 0 0 0 5px rgba(30, 190, 135, .12); }

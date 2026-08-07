@@ -33,7 +33,7 @@ const copy = {
     noWorkers: "尚无本机 Worker；请先在 Windows 电脑运行 worker.py", chooseWorker: "请选择一台在线执行电脑",
     pickerRemote: "选择框会在所选 Windows 电脑上打开；RAW 素材不会上传云端。",
     localApp: "真实本机应用", localConnecting: "正在连接这台电脑上的 CyberEditor companion…", localConnected: "已连接本机源码与 AI 工作流",
-    localDisconnected: "尚未连接。请运行本机启动器，并允许浏览器授予 tonytan.me 本地网络访问权限后重新连接。", retryLocal: "重新连接", getSource: "获取源码与启动器 ↗"
+    localDisconnected: "尚未连接。请运行本机启动器；也可以在本机直接打开同一套源码界面。", retryLocal: "重新连接", openLocal: "在本机打开 ↗", getSource: "获取源码与启动器 ↗"
   },
   en: {
     tagline: "Local · Private · Strict-serial AI editing", localFirst: "LOCAL FIRST", theme: "Theme", language: "Language",
@@ -57,7 +57,7 @@ const copy = {
     noWorkers: "No local worker yet; run worker.py on the Windows PC first", chooseWorker: "Choose an online execution PC",
     pickerRemote: "The picker opens on the selected Windows PC; RAW media is never uploaded.",
     localApp: "REAL LOCAL APP", localConnecting: "Connecting to the CyberEditor companion on this computer…", localConnected: "Connected to the local source and AI workflow",
-    localDisconnected: "Not connected. Run the local launcher, allow tonytan.me local-network access in the browser, then reconnect.", retryLocal: "Reconnect", getSource: "Get source and launcher ↗"
+    localDisconnected: "Not connected. Run the local launcher, or open the same source UI directly on this computer.", retryLocal: "Reconnect", openLocal: "Open locally ↗", getSource: "Get source and launcher ↗"
   }
 };
 

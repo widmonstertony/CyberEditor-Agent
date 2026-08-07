@@ -25,7 +25,7 @@ Ollama/Resolve 环境状态、实时日志、阶段进度、安全停止以及�
 Web 服务本身只使用 Python 标准库，也不会导入 Torch、Whisper、OpenCV 或 Resolve，因此常驻
 浏览器控制台不占用模型显存。
 
-也可以让 [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/) 使用同一套真实本机服务。Windows 双击 `launch_companion.bat`（等价于 `web.py --no-browser`），再回到网页点击“重新连接”。托管页面会直接请求 `http://127.0.0.1:8765`；本机服务只接受 `tonytan.me` 与回环开发 Origin，并实现 CORS/Private Network Access 预检。素材选择、环境检测、Ollama 模型列表、工作流启动/停止、日志和输出都来自本仓库的真实 `WorkflowManager`，没有浏览器假数据，EC2 也不会接收 RAW、模型请求或执行指令。
+也可以让 [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/) 使用同一套真实本机服务。Windows 双击 `launch_companion.bat` 会启动服务并直接打开 `http://127.0.0.1:8765/`；托管页面也保留直连和“在本机打开”入口。直接打开的页面与托管页面共用 `web/` 源码，但同源访问不依赖浏览器的本地网络权限。素材选择、环境检测、Ollama 模型列表、工作流启动/停止、日志和输出都来自本仓库的真实 `WorkflowManager`，没有浏览器假数据，EC2 也不会接收 RAW、模型请求或执行指令。
 
 浏览器出于安全原因不能直接读取任意本机绝对路径。本项目在本机 Windows 模式下通过服务端
 打开原生多文件/文件夹选择器，不上传或复制数百 GB 的 4K 素材。若只需要在同一台电脑上使用，
