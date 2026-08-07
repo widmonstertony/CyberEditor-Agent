@@ -94,6 +94,12 @@ button { color: inherit; }
 .local-connection code { color: var(--muted); font-size: 12px; }
 .local-connection.is-connected { border-color: rgba(30, 190, 135, .38); }
 .local-connection.is-connected .pulse { background: #1ebe87; box-shadow: 0 0 0 5px rgba(30, 190, 135, .12); }
+.backend-setup { grid-column: 1 / -1; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 12px 24px; padding: 16px 18px; border-radius: 16px; background: var(--panel-2); border: 1px solid var(--line); }
+.backend-setup > strong { color: var(--accent-strong); white-space: nowrap; }
+.backend-setup ol { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 28px; margin: 0; padding-left: 22px; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.local-connection.is-connected .backend-setup { display: none; }
+.requires-local-backend:not(.backend-ready) .health-grid,
+.requires-local-backend:not(.backend-ready) .workspace-grid { display: none; }
 .worker-select { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; }
 .worker-select > span { color: var(--muted); font-size: 12px; font-weight: 700; white-space: nowrap; }
 .worker-select select { padding-top: 10px; padding-bottom: 10px; }
@@ -204,5 +210,7 @@ dialog::backdrop { background: rgba(0, 8, 20, .55); backdrop-filter: blur(7px); 
   .picker-actions { display: grid; grid-template-columns: 1fr 1fr; }
   .mission-heading { flex-direction: column; }
   .remote-connection { grid-template-columns: 1fr; }
+  .backend-setup { grid-template-columns: 1fr; }
+  .backend-setup ol { grid-template-columns: 1fr; }
   .worker-select { grid-template-columns: 1fr; }
 }

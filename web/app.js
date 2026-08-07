@@ -32,8 +32,9 @@ const copy = {
     refreshWorkers: "刷新电脑", workerOnline: "{name} 在线 · 素材与 AI 留在此电脑", workerOffline: "{name} 离线",
     noWorkers: "尚无本机 Worker；请先在 Windows 电脑运行 worker.py", chooseWorker: "请选择一台在线执行电脑",
     pickerRemote: "选择框会在所选 Windows 电脑上打开；RAW 素材不会上传云端。",
-    localApp: "真实本机应用", localConnecting: "正在连接这台电脑上的 CyberEditor companion…", localConnected: "已连接本机源码与 AI 工作流",
-    localDisconnected: "尚未连接。请运行本机启动器；也可以在本机直接打开同一套源码界面。", retryLocal: "重新连接", openLocal: "在本机打开 ↗", getSource: "获取源码与启动器 ↗"
+    localApp: "浏览器应用 · 本机后端", localConnecting: "正在检测 Python 后端和 Ollama…", localConnected: "已连接；所有操作都在这个浏览器界面中完成",
+    localDisconnected: "尚未连接。请先启动 Ollama 和 Python 后端，再点击连接。", retryLocal: "连接并进入工作区", openLocal: "打开备用界面 ↗", getSource: "获取源码与启动器 ↗",
+    setupTitle: "一次连接三步", setup1: "启动 Ollama（应用或 ollama serve）", setup2: "在仓库启动 Python 后端：python3 web.py --no-browser", setup3: "Chrome 询问时允许 tonytan.me 访问本地网络，然后回到这里连接。"
   },
   en: {
     tagline: "Local · Private · Strict-serial AI editing", localFirst: "LOCAL FIRST", theme: "Theme", language: "Language",
@@ -56,8 +57,9 @@ const copy = {
     refreshWorkers: "Refresh PCs", workerOnline: "{name} online · media and AI stay on this PC", workerOffline: "{name} offline",
     noWorkers: "No local worker yet; run worker.py on the Windows PC first", chooseWorker: "Choose an online execution PC",
     pickerRemote: "The picker opens on the selected Windows PC; RAW media is never uploaded.",
-    localApp: "REAL LOCAL APP", localConnecting: "Connecting to the CyberEditor companion on this computer…", localConnected: "Connected to the local source and AI workflow",
-    localDisconnected: "Not connected. Run the local launcher, or open the same source UI directly on this computer.", retryLocal: "Reconnect", openLocal: "Open locally ↗", getSource: "Get source and launcher ↗"
+    localApp: "BROWSER APP · LOCAL BACKEND", localConnecting: "Checking the Python backend and Ollama…", localConnected: "Connected; every operation stays in this browser UI",
+    localDisconnected: "Not connected. Start Ollama and the Python backend, then connect.", retryLocal: "Connect and enter workspace", openLocal: "Open fallback UI ↗", getSource: "Get source and launcher ↗",
+    setupTitle: "Connect in three steps", setup1: "Start Ollama (the app or ollama serve)", setup2: "Start the Python backend in the repository: python3 web.py --no-browser", setup3: "Allow tonytan.me local-network access when Chrome asks, then connect here."
   }
 };
 
@@ -343,6 +345,7 @@ function bind() {
   $("#saveToken").addEventListener("click", () => { sessionStorage.setItem("cybereditor-token", $("#tokenInput").value.trim()); setTimeout(initialize, 0); });
   $("#localConnection").hidden = !localCompanionMode;
   if (localCompanionMode) {
+    document.body.classList.add("requires-local-backend");
     $("#localConnectionStatus").textContent = t("localConnecting");
     $("#retryLocal").addEventListener("click", initialize);
   }
@@ -350,9 +353,14 @@ function bind() {
 
 let initialized = false;
 async function initialize() {
+  if (localCompanionMode) {
+    $("#localConnectionStatus").textContent = t("localConnecting");
+    $("#retryLocal").disabled = true;
+  }
   try {
     const capabilities = await api("/api/capabilities"); state.mode = capabilities.mode || "local";
     if (localCompanionMode) {
+      document.body.classList.add("backend-ready");
       $("#localConnection").classList.add("is-connected");
       $("#localConnectionStatus").textContent = t("localConnected");
     }
@@ -364,11 +372,19 @@ async function initialize() {
     if (state.mode === "remote" && !state.workerPolling) state.workerPolling = setInterval(() => refreshWorkers().catch(() => {}), 5000);
   } catch (error) {
     if (localCompanionMode) {
+      document.body.classList.remove("backend-ready");
       $("#localConnection").classList.remove("is-connected");
       $("#localConnectionStatus").textContent = t("localDisconnected");
     }
     if (!$("#tokenDialog").open) toast(error.message, true);
+  } finally {
+    if (localCompanionMode) $("#retryLocal").disabled = false;
   }
 }
 
-document.addEventListener("DOMContentLoaded", () => { bind(); translate(); initialize(); initialized = true; });
+document.addEventListener("DOMContentLoaded", () => {
+  bind();
+  translate();
+  if (!localCompanionMode) initialize();
+  initialized = true;
+});

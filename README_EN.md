@@ -39,7 +39,7 @@ and in-browser playback of review and final renders. The resident server uses
 only the Python standard library and never imports Torch, Whisper, OpenCV, or
 Resolve, so it retains no model VRAM.
 
-The same real local service can power [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/). On Windows, double-click `launch_companion.bat` to start the service and open `http://127.0.0.1:8765/`; the hosted page also keeps direct-connect and “Open locally” paths. Both pages share the `web/` source, while the direct local page uses same-origin APIs and does not depend on browser local-network permission. Native media selection, environment detection, Ollama models, workflow start/stop, logs, and outputs all come from this repository's real `WorkflowManager`; EC2 receives neither RAW media, model traffic, nor execution commands.
+[tonytan.me/cybereditor/](https://tonytan.me/cybereditor/) is the primary browser UI. The user starts Ollama and `python3 web.py --no-browser` (or double-clicks `launch_companion.bat` on Windows), returns to the website, and connects. Native media selection, environment detection, Ollama models, workflow start/stop, logs, and outputs remain browser-operated and come from this repository's real `WorkflowManager`. `http://127.0.0.1:8765/` is only the same-origin fallback for browser local-network permission issues. EC2 receives neither RAW media, model traffic, nor execution commands.
 
 Browsers cannot read arbitrary local absolute paths. On a local Windows host,
 CyberEditor opens a native server-side multi-file/folder picker, avoiding a
