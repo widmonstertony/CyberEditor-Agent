@@ -99,6 +99,29 @@ class ControlPlaneStoreTests(unittest.TestCase):
                 self.assertEqual(mime, "video/mp4")
                 path.relative_to((root / "storage").resolve())
 
+    def test_preview_storage_prunes_oldest_files_before_capacity_is_exceeded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with ControlPlaneStore(
+                root / "state.sqlite3",
+                root / "storage",
+                max_storage_bytes=10,
+                artifact_retention_seconds=3600,
+            ) as store:
+                store.register_worker("edit-pc", "Editing PC", {})
+                job = store.create_job("edit-pc", "picker", {"kind": "videos"})
+                first = store.save_artifact(
+                    "edit-pc", job["job_id"], "first.mp4", "video/mp4",
+                    io.BytesIO(b"123456"), 6,
+                )
+                second = store.save_artifact(
+                    "edit-pc", job["job_id"], "second.mp4", "video/mp4",
+                    io.BytesIO(b"abcdef"), 6,
+                )
+                with self.assertRaises(KeyError):
+                    store.artifact(first["artifact_id"])
+                self.assertEqual(store.artifact(second["artifact_id"])[0].read_bytes(), b"abcdef")
+
 
 if __name__ == "__main__":
     unittest.main()

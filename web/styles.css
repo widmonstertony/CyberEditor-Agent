@@ -81,6 +81,7 @@ button { color: inherit; }
 .brand p { margin: 4px 0 0; color: var(--muted); }
 .top-actions { display: flex; align-items: center; gap: 10px; }
 .privacy-pill, .serial-badge { border: 1px solid var(--line); background: var(--panel); backdrop-filter: blur(20px); border-radius: 999px; padding: 11px 16px; color: var(--muted); font-weight: 700; font-size: 12px; letter-spacing: .04em; }
+.demo-pill { border-color: rgba(75, 123, 236, .35); color: var(--blue); }
 .pulse { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 5px rgba(22, 189, 165, .12); }
 .compact-select select { min-width: 126px; }
 .shell { width: min(1800px, calc(100% - 48px)); margin: 0 auto 48px; }

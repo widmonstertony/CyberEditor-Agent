@@ -5,6 +5,8 @@ const state = {
   config: {}, environment: null, videos: [], lastLogId: 0, polling: null,
   workerPolling: null, mode: "local", workers: [], workerId: "", jobId: ""
 };
+const demoMode = new URLSearchParams(window.location.search).get("demo") === "1";
+const demoState = { startedAt: 0, stopped: false };
 
 const copy = {
   zh: {
@@ -27,7 +29,7 @@ const copy = {
     remoteControl: "远程控制 · 本机执行", waitingWorker: "正在等待本机 Worker 连接…", executionComputer: "执行电脑",
     refreshWorkers: "刷新电脑", workerOnline: "{name} 在线 · 素材与 AI 留在此电脑", workerOffline: "{name} 离线",
     noWorkers: "尚无本机 Worker；请先在 Windows 电脑运行 worker.py", chooseWorker: "请选择一台在线执行电脑",
-    pickerRemote: "选择框会在所选 Windows 电脑上打开；RAW 素材不会上传云端。"
+    pickerRemote: "选择框会在所选 Windows 电脑上打开；RAW 素材不会上传云端。", demoMode: "源码演示"
   },
   en: {
     tagline: "Local · Private · Strict-serial AI editing", localFirst: "LOCAL FIRST", theme: "Theme", language: "Language",
@@ -49,7 +51,7 @@ const copy = {
     remoteControl: "REMOTE CONTROL · LOCAL EXECUTION", waitingWorker: "Waiting for a local worker…", executionComputer: "Execution PC",
     refreshWorkers: "Refresh PCs", workerOnline: "{name} online · media and AI stay on this PC", workerOffline: "{name} offline",
     noWorkers: "No local worker yet; run worker.py on the Windows PC first", chooseWorker: "Choose an online execution PC",
-    pickerRemote: "The picker opens on the selected Windows PC; RAW media is never uploaded."
+    pickerRemote: "The picker opens on the selected Windows PC; RAW media is never uploaded.", demoMode: "SOURCE DEMO"
   }
 };
 
@@ -65,11 +67,43 @@ function translate() {
 }
 
 function token() { return sessionStorage.getItem("cybereditor-token") || ""; }
+function demoResponse(path, options) {
+  const route = path.split("?", 1)[0];
+  if (route === "/api/capabilities") return { ok: true, mode: "remote", picker: "worker", preview_relay: true };
+  if (route === "/api/config") return { ok: true, config: { flow: "full", camera_profile: "auto", videos: [], data_dir: "data/ui-run", fps_mode: "auto", project_fps: 29.97, whisper_model: "large-v3", num_ctx: 16384, chunk_minutes: 12, music_provider: "off", render_preview: true, render_final: true, strict_fps: true, skip_resolve: false, ollama_model: "qwen3.6:27b-mtp-q8_0", director_model: "qwen3.6:27b-mtp-q8_0" } };
+  if (route === "/api/workers") return { ok: true, workers: [{ worker_id: "tony-edit-workstation", name: "Tony's Windows editing PC", online: true, status: demoState.startedAt ? "busy" : "online" }] };
+  if (route === "/api/environment") return { ok: true, environment: { python: { version: "3.11.9" }, ffmpeg: { ok: true }, hardware: { torch_cuda: true, torch_available: true, torch_version: "2.9", gpu: "NVIDIA RTX · local worker", vram_gb: 16, ram_gb: 64, cpu_threads: 24 }, ollama: { ok: true, models: [{ name: "qwen3.6:27b-mtp-q8_0" }] }, resolve: { installed: true, version: "Studio", user_registered: true }, recommendation: { whisper_model: "large-v3", num_ctx: 16384, chunk_minutes: 12, ollama_model: "qwen3.6:27b-mtp-q8_0", director_model: "qwen3.6:27b-mtp-q8_0" } } };
+  if (route === "/api/picker") {
+    const request = JSON.parse(options.body || "{}");
+    return { ok: true, paths: request.kind === "folder" ? ["D:\\CyberEditor\\NightRide"] : ["D:\\CyberEditor\\NightRide\\A001.MP4", "D:\\CyberEditor\\NightRide\\A002.MP4", "D:\\CyberEditor\\NightRide\\A003.MP4"] };
+  }
+  if (route === "/api/workflow/start") { demoState.startedAt = Date.now(); demoState.stopped = false; return { ok: true, job_id: "source-demo", state: "running", stage: "proxy-and-evidence", progress: 2, running: true, logs: [{ id: 1, level: "info", message: "Demo: local worker accepted three source clips; RAW media remains on the PC." }], last_log_id: 1 }; }
+  if (route === "/api/workflow/stop") { demoState.stopped = true; return { ok: true, job_id: "source-demo", state: "stopped", stage: "stopped", progress: 0, running: false, logs: [{ id: 99, level: "warning", message: "Demo workflow stopped safely; the worker released local resources." }], last_log_id: 99 }; }
+  if (route === "/api/status") {
+    const since = Number(new URL(path, "http://demo.local").searchParams.get("since") || 0);
+    if (!demoState.startedAt) return { ok: true, state: "idle", stage: "ready", progress: 0, running: false, logs: [], last_log_id: 0 };
+    if (demoState.stopped) return { ok: true, job_id: "source-demo", state: "stopped", stage: "stopped", progress: 0, running: false, logs: [], last_log_id: 99 };
+    const elapsed = Math.min(18, (Date.now() - demoState.startedAt) / 1000);
+    const progress = Math.min(100, Math.round(elapsed / 18 * 100));
+    const stages = ["proxy-and-evidence", "whisper-transcription", "visual-director", "music-analysis", "picture-lock", "resolve-render"];
+    const index = Math.min(stages.length - 1, Math.floor(progress / 18));
+    const finished = progress >= 100;
+    const logId = index + 2;
+    return { ok: true, job_id: "source-demo", state: finished ? "succeeded" : "running", stage: finished ? "complete" : stages[index], progress, running: !finished, elapsed_sec: elapsed, logs: since < logId ? [{ id: logId, level: "info", message: `Demo stage ${index + 1}/${stages.length}: ${stages[index]} (executes on the selected local worker).` }] : [], last_log_id: logId };
+  }
+  if (route === "/api/outputs") return { ok: true, outputs: [] };
+  throw new Error(`Unsupported demo endpoint: ${route}`);
+}
 async function api(path, options = {}) {
+  if (demoMode) {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    return demoResponse(path, options);
+  }
   const headers = { "Accept": "application/json", ...(options.headers || {}) };
   if (token()) headers["X-CyberEditor-Token"] = token();
   if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
-  const response = await fetch(path, { ...options, headers });
+  const url = new URL(path.replace(/^\/+/, ""), document.baseURI);
+  const response = await fetch(url, { ...options, headers });
   let payload;
   try { payload = await response.json(); } catch { payload = { ok: false, error: `HTTP ${response.status}` }; }
   if (!response.ok || payload.ok === false) {
@@ -269,7 +303,18 @@ async function refreshOutputs() {
       const copyNode = document.createElement("div"), name = document.createElement("strong"), meta = document.createElement("small"), button = document.createElement("button");
       name.textContent = output.name; meta.textContent = `${humanSize(output.size)} · ${new Date(output.modified * 1000).toLocaleString()}`; copyNode.append(name, meta);
       button.className = "button secondary small"; button.textContent = t("play");
-      button.addEventListener("click", () => { const join = output.url.includes("?") ? "&" : "?"; window.open(output.url + (token() ? `${join}token=${encodeURIComponent(token())}` : ""), "_blank", "noopener"); });
+      button.addEventListener("click", async () => {
+        try {
+          const url = new URL(String(output.url || "").replace(/^\/+/, ""), document.baseURI);
+          const response = await fetch(url, { headers: { "X-CyberEditor-Token": token() }, cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const objectUrl = URL.createObjectURL(await response.blob());
+          const link = document.createElement("a");
+          link.href = objectUrl; link.target = "_blank"; link.rel = "noopener";
+          link.click();
+          setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+        } catch (error) { toast(error.message, true); }
+      });
       row.append(copyNode, button); target.append(row);
     });
   } catch (error) { toast(error.message, true); }
@@ -292,6 +337,8 @@ function bind() {
   });
   $("#tokenButton").addEventListener("click", () => { $("#tokenInput").value = token(); $("#tokenDialog").showModal(); });
   $("#saveToken").addEventListener("click", () => { sessionStorage.setItem("cybereditor-token", $("#tokenInput").value.trim()); setTimeout(initialize, 0); });
+  $("#demoPill").hidden = !demoMode;
+  if (demoMode) $("#tokenButton").hidden = true;
 }
 
 let initialized = false;
