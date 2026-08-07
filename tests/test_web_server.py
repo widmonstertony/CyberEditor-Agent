@@ -35,11 +35,22 @@ class WebServerTests(unittest.TestCase):
         self.assertFalse(_is_loopback("192.168.1.5"))
 
     def test_hosted_ui_declares_the_companion_as_loopback(self) -> None:
-        app_source = (Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(
-            encoding="utf-8"
-        )
+        project_root = Path(__file__).resolve().parents[1]
+        app_source = (project_root / "web" / "app.js").read_text(encoding="utf-8")
         self.assertIn('targetAddressSpace: "loopback"', app_source)
         self.assertNotIn('targetAddressSpace: "local"', app_source)
+        self.assertIn(
+            'href="http://127.0.0.1:8765/"',
+            (project_root / "web" / "index.html").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn(
+            "--no-browser",
+            (project_root / "launch_companion.command").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn(
+            "--no-browser",
+            (project_root / "launch_companion.bat").read_text(encoding="utf-8"),
+        )
 
     def test_unknown_submission_fields_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
