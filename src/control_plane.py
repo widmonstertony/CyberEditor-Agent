@@ -82,10 +82,21 @@ class ControlPlaneStore:
     使用 SQLite 持久化 Worker、任务、事件和可选预览，支持单进程多线程部署。
     """
 
-    def __init__(self, database: Path, storage_root: Path) -> None:
+    def __init__(
+        self,
+        database: Path,
+        storage_root: Path,
+        *,
+        max_storage_bytes: Optional[int] = None,
+        artifact_retention_seconds: Optional[float] = None,
+    ) -> None:
         """Open the database and create the schema. / 打开数据库并创建表结构。"""
         self.database = database.resolve()
         self.storage_root = storage_root.resolve()
+        self.max_storage_bytes = max_storage_bytes or int(os.environ.get("CYBEREDITOR_MAX_STORAGE_MB", "512")) * 1024 * 1024
+        self.artifact_retention_seconds = artifact_retention_seconds or float(os.environ.get("CYBEREDITOR_ARTIFACT_RETENTION_DAYS", "7")) * 86400
+        if self.max_storage_bytes < 1 or self.artifact_retention_seconds < 1:
+            raise ValueError("Artifact storage and retention limits must be positive.")
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.storage_root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -97,6 +108,7 @@ class ControlPlaneStore:
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._create_schema()
+        self.prune_artifacts()
 
     def __enter__(self) -> "ControlPlaneStore":
         """Return this open store for context-manager use. / 返回已打开的上下文数据库。"""
@@ -446,6 +458,9 @@ class ControlPlaneStore:
             ).fetchone()
             if row is None or row["worker_id"] != worker_id:
                 raise KeyError("Artifact job does not belong to this worker.")
+        if length > self.max_storage_bytes:
+            raise ValueError("Preview exceeds the total managed storage limit.")
+        self.prune_artifacts(reserve_bytes=length)
         artifact_id = uuid.uuid4().hex
         safe = _safe_name(name)
         folder = self.storage_root / "artifacts" / job_id
@@ -472,8 +487,45 @@ class ControlPlaneStore:
             )
         return {"artifact_id": artifact_id, "name": safe, "size": length}
 
+    def prune_artifacts(self, reserve_bytes: int = 0) -> int:
+        """Delete expired/oldest previews until the configured disk bound is met.
+
+        删除过期或最旧预览，确保控制面磁盘使用保持在配置上限内。
+        """
+        cutoff = time.time() - self.artifact_retention_seconds
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT artifact_id,path,size,created_at FROM artifacts ORDER BY created_at DESC"
+            ).fetchall()
+            retained = max(0, reserve_bytes)
+            delete_rows = []
+            for row in rows:
+                size = max(0, int(row["size"]))
+                if float(row["created_at"]) < cutoff or retained + size > self.max_storage_bytes:
+                    delete_rows.append(row)
+                else:
+                    retained += size
+            for row in delete_rows:
+                self._connection.execute(
+                    "DELETE FROM artifacts WHERE artifact_id=?", (row["artifact_id"],)
+                )
+        for row in delete_rows:
+            path = Path(row["path"]).resolve()
+            try:
+                path.relative_to(self.storage_root)
+            except ValueError:
+                LOGGER.error("Refusing to prune artifact outside managed storage: %s", path)
+                continue
+            path.unlink(missing_ok=True)
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+        return len(delete_rows)
+
     def list_artifacts(self) -> List[Dict[str, object]]:
         """List recent remote previews. / 列出最近的远程预览。"""
+        self.prune_artifacts()
         with self._lock:
             rows = self._connection.execute(
                 "SELECT a.*,j.worker_id FROM artifacts a JOIN jobs j ON j.job_id=a.job_id ORDER BY a.created_at DESC LIMIT 30"
@@ -558,9 +610,6 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
     def _admin_ok(self) -> bool:
         supplied = self.headers.get("X-CyberEditor-Token", "")
-        if not supplied:
-            query = urllib_parse.parse_qs(urllib_parse.urlparse(self.path).query)
-            supplied = str((query.get("token") or [""])[0])
         return secrets.compare_digest(supplied, self.server.admin_token)
 
     def _worker_ok(self) -> bool:

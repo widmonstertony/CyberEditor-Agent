@@ -56,6 +56,10 @@ Resolve、Ollama、FFmpeg 和素材都位于运行 `web.py` 的 Windows 主机�
 - 这是需要 SQLite 与持久磁盘的轻量控制服务，适合 Docker VPS、Render/Railway 持久服务等，
   不是纯静态站或短生命周期 Serverless Function。
 
+公开的源码体验位于 [tonytan.me/cybereditor/?demo=1](https://tonytan.me/cybereditor/?demo=1)：它直接复用本仓库 Web Studio，通过确定性的浏览器适配器演示选择素材、硬件检测、任务进度和安全停止，不读取令牌，也不会假装处理真实视频。相同地址去掉 `?demo=1` 后是受管理令牌保护的真实控制面；Windows Worker 仍只主动发起出站 HTTPS 连接。
+
+该实例由 `Personal-Website/ops` 中的 Caddy、systemd、受限 sudo 和原子发布脚本管理。合并受保护的 `main` 后，独立 GitHub Runner 只部署审查过的控制面文件。服务器最多保留 512 MiB 预览，自动删除七天前或超额的文件；RAW、字幕、关键帧、Ollama 和 Resolve 永远不上传。
+
 先在部署主机设置两个**不同**的随机密钥并启动控制面：
 
 ```bash
