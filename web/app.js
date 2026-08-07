@@ -1,7 +1,10 @@
 "use strict";
 
 const $ = (selector) => document.querySelector(selector);
-const state = { config: {}, environment: null, videos: [], lastLogId: 0, polling: null };
+const state = {
+  config: {}, environment: null, videos: [], lastLogId: 0, polling: null,
+  workerPolling: null, mode: "local", workers: [], workerId: "", jobId: ""
+};
 
 const copy = {
   zh: {
@@ -10,17 +13,21 @@ const copy = {
     workflowMode: "工作流模式", cameraProfile: "相机色彩", creativeBrief: "成片主题 / AI 导演要求（可选）",
     briefPlaceholder: "例如：剪成一支有明确起承转合的夜骑短片，强调人物准备、机械细节和最终集结。留空则 AI 自由发现主题。",
     briefHelp: "这是导演最高优先级的创作意图；留空不等于随机拼接。", sourceMedia: "源视频素材", noMedia: "尚未选择素材",
-    pickerLocal: "本机模式会打开 Windows 原生选择器；远程部署可填写服务器路径。", chooseVideos: "选择多个视频", chooseFolder: "选择文件夹",
-    serverPaths: "服务器路径 / 高级输入", videoPaths: "视频绝对路径（每行一个）", folderPath: "素材文件夹路径", dataDir: "运行数据目录",
+    pickerLocal: "本机模式会打开 Windows 原生选择器；素材不会被复制或上传。", chooseVideos: "选择多个视频", chooseFolder: "选择文件夹",
+    serverPaths: "本机 Worker 路径 / 高级输入", videoPaths: "视频绝对路径（每行一个）", folderPath: "素材文件夹路径", dataDir: "运行数据目录",
     fps: "项目 FPS", aiHardware: "AI 与硬件", visionModel: "视觉 / Ollama 模型", directorModel: "文本导演模型", context: "上下文",
     chunk: "分块分钟", detectingHardware: "正在检测硬件并计算质量优先配置…", musicOutput: "配乐与输出", musicSource: "音乐来源",
     musicFolder: "本地音乐目录", rightsWarning: "我确认拥有下载、改编、同步和发布所选音乐的权利，并自行遵守来源平台条款。",
     sendResolve: "发送至 DaVinci Resolve", renderPreview: "生成审片预览", renderFinal: "Resolve 最终渲染", strictFps: "严格匹配 FPS",
     missionControl: "任务控制", taskCenter: "任务中心", ready: "准备就绪", readyHelp: "选择素材后启动；任意时刻只运行一个重型模块。",
     liveLog: "实时日志", clear: "清空", start: "开始串行工作流", stop: "停止", outputPreview: "成片与预览", refresh: "刷新",
-    noOutput: "完成工作流后可在这里直接播放成片。", tokenHelp: "仅当服务部署到局域网或远程 Windows 主机时需要。令牌只保存在当前浏览器。",
+    noOutput: "完成工作流后可在这里直接播放成片。", tokenHelp: "部署版需要管理令牌；它只保存在当前浏览器会话，不会发送给本机 Worker。",
     cancel: "取消", save: "保存", selectedVideos: "已选择 {count} 个视频", selectedFolder: "已选择素材文件夹", running: "工作流运行中",
-    succeeded: "工作流已完成", failed: "工作流失败", stopped: "工作流已停止", play: "播放", refreshEnvironment: "环境检测完成"
+    succeeded: "工作流已完成", failed: "工作流失败", stopped: "工作流已停止", play: "播放", refreshEnvironment: "环境检测完成",
+    remoteControl: "远程控制 · 本机执行", waitingWorker: "正在等待本机 Worker 连接…", executionComputer: "执行电脑",
+    refreshWorkers: "刷新电脑", workerOnline: "{name} 在线 · 素材与 AI 留在此电脑", workerOffline: "{name} 离线",
+    noWorkers: "尚无本机 Worker；请先在 Windows 电脑运行 worker.py", chooseWorker: "请选择一台在线执行电脑",
+    pickerRemote: "选择框会在所选 Windows 电脑上打开；RAW 素材不会上传云端。"
   },
   en: {
     tagline: "Local · Private · Strict-serial AI editing", localFirst: "LOCAL FIRST", theme: "Theme", language: "Language",
@@ -28,17 +35,21 @@ const copy = {
     workflowMode: "Workflow mode", cameraProfile: "Camera color", creativeBrief: "Film theme / AI director brief (optional)",
     briefPlaceholder: "Example: Create a coherent night-riding short with preparation, mechanical details, escalation, and a final gathering. Leave blank for free direction.",
     briefHelp: "This is the director's highest-priority intent; blank never means random assembly.", sourceMedia: "Source media", noMedia: "No media selected",
-    pickerLocal: "Local mode opens the native Windows picker; deployments can use server paths.", chooseVideos: "Choose videos", chooseFolder: "Choose folder",
-    serverPaths: "Server paths / advanced input", videoPaths: "Absolute video paths (one per line)", folderPath: "Media folder path", dataDir: "Run data directory",
+    pickerLocal: "Local mode opens the native Windows picker; media is neither copied nor uploaded.", chooseVideos: "Choose videos", chooseFolder: "Choose folder",
+    serverPaths: "Local worker paths / advanced input", videoPaths: "Absolute video paths (one per line)", folderPath: "Media folder path", dataDir: "Run data directory",
     fps: "Project FPS", aiHardware: "AI & hardware", visionModel: "Vision / Ollama model", directorModel: "Text director model", context: "Context",
     chunk: "Chunk minutes", detectingHardware: "Detecting hardware and computing quality-first settings…", musicOutput: "Music & output", musicSource: "Music source",
     musicFolder: "Local music folder", rightsWarning: "I confirm I have download, adaptation, synchronization, and publishing rights and will follow the source platform's terms.",
     sendResolve: "Send to DaVinci Resolve", renderPreview: "Create review preview", renderFinal: "Final Resolve render", strictFps: "Strict FPS match",
     missionControl: "MISSION CONTROL", taskCenter: "Task center", ready: "Ready", readyHelp: "Select media and start; only one heavy module runs at a time.",
     liveLog: "Live log", clear: "Clear", start: "Start serial workflow", stop: "Stop", outputPreview: "Films & previews", refresh: "Refresh",
-    noOutput: "Completed previews and films will be playable here.", tokenHelp: "Only needed for LAN or remote Windows deployments. The token stays in this browser.",
+    noOutput: "Completed previews and films will be playable here.", tokenHelp: "Deployed mode requires the admin token. It stays in this browser session and is never sent to the local worker.",
     cancel: "Cancel", save: "Save", selectedVideos: "{count} videos selected", selectedFolder: "Media folder selected", running: "Workflow running",
-    succeeded: "Workflow complete", failed: "Workflow failed", stopped: "Workflow stopped", play: "Play", refreshEnvironment: "Environment check complete"
+    succeeded: "Workflow complete", failed: "Workflow failed", stopped: "Workflow stopped", play: "Play", refreshEnvironment: "Environment check complete",
+    remoteControl: "REMOTE CONTROL · LOCAL EXECUTION", waitingWorker: "Waiting for a local worker…", executionComputer: "Execution PC",
+    refreshWorkers: "Refresh PCs", workerOnline: "{name} online · media and AI stay on this PC", workerOffline: "{name} offline",
+    noWorkers: "No local worker yet; run worker.py on the Windows PC first", chooseWorker: "Choose an online execution PC",
+    pickerRemote: "The picker opens on the selected Windows PC; RAW media is never uploaded."
   }
 };
 
@@ -50,6 +61,7 @@ function translate() {
   document.querySelectorAll("[data-i18n-placeholder]").forEach((node) => { node.placeholder = t(node.dataset.i18nPlaceholder); });
   $("#languageSelect").value = language();
   updateMediaSummary();
+  renderWorkerStatus();
 }
 
 function token() { return sessionStorage.getItem("cybereditor-token") || ""; }
@@ -89,13 +101,52 @@ function hydrate(config) {
   updateMediaSummary();
 }
 
+function selectedWorker() { return state.workers.find((item) => item.worker_id === state.workerId) || null; }
+function renderWorkerStatus() {
+  if (state.mode !== "remote") return;
+  const worker = selectedWorker();
+  if (!worker) { $("#workerStatus").textContent = t("noWorkers"); return; }
+  $("#workerStatus").textContent = worker.online
+    ? t("workerOnline", { name: worker.name || worker.worker_id })
+    : t("workerOffline", { name: worker.name || worker.worker_id });
+}
+
+async function refreshWorkers() {
+  if (state.mode !== "remote") return;
+  const payload = await api("/api/workers");
+  state.workers = Array.isArray(payload.workers) ? payload.workers : [];
+  const previous = state.workerId || localStorage.getItem("cybereditor-worker") || "";
+  const preferred = state.workers.find((item) => item.worker_id === previous && item.online)
+    || state.workers.find((item) => item.online) || state.workers[0] || null;
+  state.workerId = preferred ? preferred.worker_id : "";
+  const select = $("#workerSelect"); select.textContent = "";
+  if (!state.workers.length) {
+    const option = document.createElement("option"); option.value = ""; option.textContent = t("noWorkers"); select.append(option);
+  } else {
+    state.workers.forEach((worker) => {
+      const option = document.createElement("option"); option.value = worker.worker_id;
+      option.textContent = `${worker.online ? "●" : "○"} ${worker.name || worker.worker_id}`; select.append(option);
+    });
+    select.value = state.workerId;
+  }
+  localStorage.setItem("cybereditor-worker", state.workerId);
+  renderWorkerStatus();
+}
+
+function requireWorker() {
+  if (state.mode !== "remote") return "";
+  const worker = selectedWorker();
+  if (!worker || !worker.online) throw new Error(t("chooseWorker"));
+  return worker.worker_id;
+}
+
 function updateMediaSummary() {
   const paths = $("#videoPaths").value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
   const folder = $("#inputFolder").value.trim();
   state.videos = paths;
   if (paths.length) { $("#mediaSummary").textContent = t("selectedVideos", { count: paths.length }); $("#mediaDetail").textContent = paths.slice(0, 3).map((p) => p.split(/[\\/]/).pop()).join(" · ") + (paths.length > 3 ? " …" : ""); }
   else if (folder) { $("#mediaSummary").textContent = t("selectedFolder"); $("#mediaDetail").textContent = folder; }
-  else { $("#mediaSummary").textContent = t("noMedia"); $("#mediaDetail").textContent = t("pickerLocal"); }
+  else { $("#mediaSummary").textContent = t("noMedia"); $("#mediaDetail").textContent = t(state.mode === "remote" ? "pickerRemote" : "pickerLocal"); }
 }
 
 function populateModels(models, selected, directorSelected) {
@@ -111,7 +162,8 @@ function populateModels(models, selected, directorSelected) {
 function health(name, text, mode) { const card = document.querySelector(`[data-health="${name}"]`); card.className = `health-card ${mode}`; card.querySelector("strong").textContent = text; }
 async function refreshEnvironment() {
   try {
-    const payload = await api("/api/environment"); state.environment = payload.environment;
+    const query = state.mode === "remote" ? `?worker_id=${encodeURIComponent(requireWorker())}` : "";
+    const payload = await api(`/api/environment${query}`); state.environment = payload.environment;
     const env = state.environment, hw = env.hardware || {}, models = env.ollama.models || [];
     health("python", env.python.version, "ok"); health("ffmpeg", env.ffmpeg.ok ? "OK" : "Not found", env.ffmpeg.ok ? "ok" : "bad");
     health("cuda", hw.torch_cuda ? `${hw.torch_version} · CUDA` : (hw.torch_available ? `${hw.torch_version} · CPU` : "Not installed"), hw.torch_cuda ? "ok" : "warn");
@@ -156,7 +208,9 @@ function collect() {
 
 async function pick(kind) {
   try {
-    const payload = await api("/api/picker", { method: "POST", body: JSON.stringify({ kind }) });
+    const workerId = requireWorker();
+    const request = { kind }; if (state.mode === "remote") request.worker_id = workerId;
+    const payload = await api("/api/picker", { method: "POST", body: JSON.stringify(request) });
     if (!payload.paths.length) return;
     if (kind === "videos") { $("#videoPaths").value = payload.paths.join("\n"); $("#inputFolder").value = ""; }
     else { $("#inputFolder").value = payload.paths[0]; $("#videoPaths").value = ""; }
@@ -171,6 +225,7 @@ function appendLogs(logs) {
 }
 function formatTime(seconds) { const value = Math.max(0, Math.floor(seconds || 0)); return [Math.floor(value / 3600), Math.floor(value / 60) % 60, value % 60].map((item) => String(item).padStart(2, "0")).join(":"); }
 function renderStatus(value) {
+  if (value.job_id) state.jobId = value.job_id;
   const running = value.running; $("#startButton").disabled = running; $("#stopButton").disabled = !running;
   $("#progressBar").style.width = `${Math.max(1, value.progress || 0)}%`; $("#progressBar").classList.toggle("running", running);
   $("#elapsed").textContent = formatTime(value.elapsed_sec);
@@ -182,10 +237,28 @@ function renderStatus(value) {
 }
 
 async function poll() {
-  try { renderStatus(await api(`/api/status?since=${state.lastLogId}`)); } catch (error) { if (!$("#tokenDialog").open) toast(error.message, true); }
+  try {
+    const query = new URLSearchParams({ since: String(state.lastLogId) });
+    if (state.mode === "remote") {
+      if (!state.workerId) return;
+      query.set("worker_id", state.workerId); if (state.jobId) query.set("job_id", state.jobId);
+    }
+    renderStatus(await api(`/api/status?${query}`));
+  } catch (error) { if (!$("#tokenDialog").open) toast(error.message, true); }
 }
-async function startWorkflow() { try { renderStatus(await api("/api/workflow/start", { method: "POST", body: JSON.stringify(collect()) })); } catch (error) { toast(error.message, true); } }
-async function stopWorkflow() { try { renderStatus(await api("/api/workflow/stop", { method: "POST", body: "{}" })); } catch (error) { toast(error.message, true); } }
+async function startWorkflow() {
+  try {
+    const request = collect(); if (state.mode === "remote") request.worker_id = requireWorker();
+    state.lastLogId = 0; $("#liveLog").textContent = "";
+    renderStatus(await api("/api/workflow/start", { method: "POST", body: JSON.stringify(request) }));
+  } catch (error) { toast(error.message, true); }
+}
+async function stopWorkflow() {
+  try {
+    const request = state.mode === "remote" ? { job_id: state.jobId } : {};
+    renderStatus(await api("/api/workflow/stop", { method: "POST", body: JSON.stringify(request) }));
+  } catch (error) { toast(error.message, true); }
+}
 function humanSize(size) { const units = ["B", "KB", "MB", "GB"]; let value = Number(size || 0), unit = 0; while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; } return `${value.toFixed(unit > 1 ? 1 : 0)} ${units[unit]}`; }
 async function refreshOutputs() {
   try {
@@ -211,6 +284,12 @@ function bind() {
   $("#pickVideos").addEventListener("click", () => pick("videos")); $("#pickFolder").addEventListener("click", () => pick("folder"));
   $("#applyAutoButton").addEventListener("click", applyAuto); $("#startButton").addEventListener("click", startWorkflow); $("#stopButton").addEventListener("click", stopWorkflow);
   $("#clearLog").addEventListener("click", () => { $("#liveLog").textContent = ""; }); $("#refreshOutputs").addEventListener("click", refreshOutputs);
+  $("#refreshWorkers").addEventListener("click", async () => { try { await refreshWorkers(); await refreshEnvironment(); } catch (error) { toast(error.message, true); } });
+  $("#workerSelect").addEventListener("change", async (event) => {
+    state.workerId = event.target.value; state.jobId = ""; state.lastLogId = 0; state.environment = null;
+    localStorage.setItem("cybereditor-worker", state.workerId); renderWorkerStatus();
+    try { await refreshEnvironment(); await poll(); } catch (error) { toast(error.message, true); }
+  });
   $("#tokenButton").addEventListener("click", () => { $("#tokenInput").value = token(); $("#tokenDialog").showModal(); });
   $("#saveToken").addEventListener("click", () => { sessionStorage.setItem("cybereditor-token", $("#tokenInput").value.trim()); setTimeout(initialize, 0); });
 }
@@ -218,9 +297,13 @@ function bind() {
 let initialized = false;
 async function initialize() {
   try {
+    const capabilities = await api("/api/capabilities"); state.mode = capabilities.mode || "local";
+    $("#remoteConnection").hidden = state.mode !== "remote";
     const payload = await api("/api/config"); hydrate(payload.config); translate();
+    if (state.mode === "remote") await refreshWorkers();
     await Promise.all([refreshEnvironment(), poll(), refreshOutputs()]);
     if (!state.polling) state.polling = setInterval(poll, 1000);
+    if (state.mode === "remote" && !state.workerPolling) state.workerPolling = setInterval(() => refreshWorkers().catch(() => {}), 5000);
   } catch (error) { if (!$("#tokenDialog").open) toast(error.message, true); }
 }
 

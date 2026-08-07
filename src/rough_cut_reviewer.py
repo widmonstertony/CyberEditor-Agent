@@ -296,7 +296,11 @@ class RoughCutReviewer:
         """
         failures: List[str] = []
         directing = timeline.get("candidate_directing")
-        if isinstance(directing, dict) and directing.get("quality_gate_passed") is False:
+        if (
+            isinstance(directing, dict)
+            and directing.get("quality_gate_passed") is False
+            and directing.get("quality_gate_degraded_acceptance") is not True
+        ):
             failures.append(
                 "The upstream measured director quality gate is false; an unapproved picture "
                 "lock cannot pass rendered review."

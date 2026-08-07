@@ -161,6 +161,39 @@ class RoughCutReviewerTests(unittest.TestCase):
         self.assertTrue(result["deterministic_failures"])
         self.assertTrue(result["blind_review"]["model_passes"])
 
+    def test_explicit_degraded_director_acceptance_is_reviewed_on_rendered_evidence(self):
+        reviewer = RoughCutReviewer.__new__(RoughCutReviewer)
+        reviewer.model = "vision-model"
+        reviewer.text_model = "text-model"
+        reviewer.logger = logging.getLogger("test.rough.degraded")
+        reviewer.director = FakeDirector()
+
+        def fake_extract(this, preview, destination, duration):
+            this._sample_fps = 1.0
+            frames = []
+            for index in range(3):
+                frame = destination / f"frame_{index:05d}.jpg"
+                frame.write_bytes(b"jpeg")
+                frames.append(frame)
+            return frames
+
+        reviewer._extract_frames = types.MethodType(fake_extract, reviewer)
+        timeline_payload = self.timeline()
+        timeline_payload["candidate_directing"] = {
+            "quality_gate_passed": False,
+            "quality_gate_degraded_acceptance": True,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            preview = root / "preview.mp4"
+            preview.write_bytes(b"video")
+            timeline = root / "timeline.json"
+            timeline.write_text(json.dumps(timeline_payload), encoding="utf-8")
+            result = reviewer.review(preview, timeline, root / "review.json")
+
+        self.assertTrue(result["passes"])
+        self.assertEqual(result["deterministic_failures"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

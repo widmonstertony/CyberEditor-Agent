@@ -26,9 +26,8 @@ Web 服务本身只使用 Python 标准库，也不会导入 Torch、Whisper、O
 浏览器控制台不占用模型显存。
 
 浏览器出于安全原因不能直接读取任意本机绝对路径。本项目在本机 Windows 模式下通过服务端
-打开原生多文件/文件夹选择器，不上传或复制数百 GB 的 4K 素材；远程部署时可填写 Windows
-主机或挂载存储上的绝对路径。Resolve、Ollama、FFmpeg 和素材必须位于运行 Web 服务的那台
-Windows 主机上，普通云端静态网页无法直接控制你家中电脑上的 Resolve。
+打开原生多文件/文件夹选择器，不上传或复制数百 GB 的 4K 素材。若只需要在同一台电脑上使用，
+Resolve、Ollama、FFmpeg 和素材都位于运行 `web.py` 的 Windows 主机。
 
 默认只监听回环地址。若要部署到局域网、工作站或反向代理后方，必须设置至少 16 个字符的令牌：
 
@@ -38,6 +37,45 @@ Windows 主机上，普通云端静态网页无法直接控制你家中电脑上
 
 首次从另一台设备访问时，在右上角“访问令牌”中输入相同令牌。请优先放在可信局域网、VPN 或
 带 HTTPS 的认证反向代理后方；不要把 Resolve 控制端口和本服务直接暴露到公网。
+
+## 云端网页 + 本机执行 / Remote Control Plane
+
+部署版采用“云端控制面 + Windows 本机 Worker”，不是在部署主机上安装 Ollama 或 Resolve：
+
+```text
+任意浏览器 ─HTTPS─> 云端 Control Plane <─出站 HTTPS 轮询─ Windows Worker
+                                                        ├─ 本机 RAW / 代理素材
+                                                        ├─ 本机 Ollama / CUDA / FFmpeg
+                                                        └─ 本机 DaVinci Resolve Studio
+```
+
+- 云端只保存任务、进度、有限日志和可选的 720p 低码率预览；RAW、关键帧、字幕与模型留在本机。
+- Worker 主动向云端建立出站 HTTPS 连接，不需要家庭公网 IP、端口转发，也不暴露 Resolve API。
+- 网页“选择多个视频/文件夹”会让原生选择框弹在选中的 Windows Worker 上；路径由本机使用。
+- 网页顶部展示的 CUDA、Ollama 和 Resolve 状态均由本机 Worker 检测，不是部署服务器的状态。
+- 这是需要 SQLite 与持久磁盘的轻量控制服务，适合 Docker VPS、Render/Railway 持久服务等，
+  不是纯静态站或短生命周期 Serverless Function。
+
+先在部署主机设置两个**不同**的随机密钥并启动控制面：
+
+```bash
+export CYBEREDITOR_ADMIN_TOKEN="replace-with-random-admin-token"
+export CYBEREDITOR_WORKER_TOKEN="replace-with-a-different-long-worker-token"
+docker compose -f docker-compose.control-plane.yml up -d --build
+```
+
+容器本身监听 HTTP，应由部署平台或 Caddy/Nginx 提供公开 HTTPS。然后在保存素材、安装了
+Ollama/CUDA/Resolve 的 Windows 电脑运行：
+
+```powershell
+$env:CYBEREDITOR_WORKER_TOKEN = "replace-with-a-different-long-worker-token"
+.\.venv\Scripts\python.exe worker.py --server "https://edit.example.com"
+```
+
+也可以设置环境变量后双击 `launch_worker.bat https://edit.example.com`。打开部署网页，在右上角
+输入 `CYBEREDITOR_ADMIN_TOKEN`，选择在线电脑后即可远程发起本机工作流。管理密钥不会下发给
+Worker，Worker 密钥也不进入浏览器。若不希望云端保留任何成片副本，启动 Worker 时添加
+`--no-preview-upload`；此时日志与控制仍可用，但只能回到本机查看输出。
 
 桌面界面可一次多选任意数量的视频，或递归读取一个素材文件夹；还提供 Whisper/Ollama
 参数、断点续跑模式、Resolve 开关、可观看预览、实时日志、阶段进度、停止任务和打开
@@ -321,6 +359,11 @@ CyberEditor-Agent/
 ├─ launch_ui.bat                 # 双击启动 UI
 ├─ launch_web.bat                # 双击启动本地 Web Studio
 ├─ web.py                        # 浏览器控制台入口
+├─ control_plane.py              # 可部署的轻量云端控制面
+├─ worker.py                     # 主动出站连接的 Windows 本机 Worker
+├─ launch_worker.bat             # 双击启动 Worker
+├─ Dockerfile
+├─ docker-compose.control-plane.yml
 ├─ web/                          # 零依赖 HTML/CSS/JavaScript 前端
 ├─ main.py                       # 严格串行工作流调度器
 ├─ scripts/
@@ -338,6 +381,8 @@ CyberEditor-Agent/
 │  ├─ __init__.py
 │  ├─ gui.py                     # 无额外 UI 依赖的后备控制器与公共检测逻辑
 │  ├─ modern_gui.py              # Windows 11 / 4K / 中英文现代界面
+│  ├─ control_plane.py           # SQLite 任务队列、认证与预览中继
+│  ├─ remote_worker.py           # 本机环境检测、命令执行与状态上报
 │  ├─ runtime_services.py        # 跨盘软件发现与 Ollama/Resolve 自动启动
 │  ├─ media_manifest.py          # 多视频/文件夹发现、去重与代理映射
 │  ├─ ui_i18n.py                 # 不依赖 GUI 包的中英文文案
