@@ -1,6 +1,8 @@
 from pathlib import Path
 import unittest
 
+from src.control_plane import PUBLIC_STATIC_FILES
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,6 +23,9 @@ class ShareMetadataTests(unittest.TestCase):
         share_card = (REPOSITORY_ROOT / "web/share-card.png").read_bytes()
         self.assertEqual(int.from_bytes(share_card[16:20], byteorder="big"), 1200)
         self.assertEqual(int.from_bytes(share_card[20:24], byteorder="big"), 630)
+
+    def test_share_card_is_in_the_explicit_public_static_allowlist(self) -> None:
+        self.assertEqual(PUBLIC_STATIC_FILES["/share-card.png"], "share-card.png")
 
 
 if __name__ == "__main__":
