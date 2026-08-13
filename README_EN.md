@@ -82,6 +82,11 @@ Any browser ─HTTPS─> Cloud Control Plane <─outbound HTTPS polling─ Windo
 
 The default public entry, [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/), is the real Local App mode and connects directly to the loopback companion on this computer. Use `?remote=1` for the token-protected cloud control plane when controlling an outbound Windows worker from another device. The old browser fake-data demo has been removed.
 
+The control plane in this repository owns page navigation below
+`/cybereditor/`. Unknown browser documents receive CyberEditor's bilingual HTML
+404, while unknown API, worker, and static-asset requests retain the native JSON
+404 contract. Caddy does not duplicate or guess the application route table.
+
 That instance is managed by the Caddy, systemd, restricted-sudo, and atomic-release definitions in `Personal-Website/ops`. A merge to protected `main` lets its isolated GitHub runner deploy only the reviewed control-plane package. The host caps previews at 512 MiB and prunes artifacts after seven days; RAW media, transcripts, evidence frames, Ollama, and Resolve stay on the workstation.
 
 Set two different random secrets on the deployment host and launch the control

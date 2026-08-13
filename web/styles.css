@@ -60,6 +60,22 @@ body {
   font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
   transition: background .25s ease, color .25s ease;
 }
+
+.not-found-body { display: grid; }
+.not-found-shell { width: min(100% - 32px, 880px); margin: auto; padding: 40px 0; }
+.not-found-card { padding: clamp(30px, 7vw, 72px); border: 1px solid var(--line); border-radius: 32px; background: var(--panel); box-shadow: var(--shadow); backdrop-filter: blur(24px); }
+.not-found-brand { margin-bottom: clamp(48px, 9vw, 88px); }
+.not-found-brand > div:last-child { display: grid; gap: 5px; }
+.not-found-brand strong { font-size: 20px; letter-spacing: -.025em; }
+.not-found-brand small { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .13em; }
+.not-found-card h1 { max-width: 700px; margin: 12px 0 22px; font-size: clamp(44px, 8vw, 82px); line-height: .98; letter-spacing: -.055em; }
+.not-found-card > p:not(.eyebrow) { max-width: 700px; margin: 8px 0; color: var(--muted); font-size: 16px; line-height: 1.7; }
+.not-found-card .button { margin-top: 28px; }
+
+@media (max-width: 600px) {
+  .not-found-shell { width: min(100% - 20px, 880px); padding: 10px 0; }
+  .not-found-card { border-radius: 22px; }
+}
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }
 .ambient { position: fixed; z-index: -1; border-radius: 50%; filter: blur(100px); opacity: .18; pointer-events: none; }
