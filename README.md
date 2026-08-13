@@ -60,6 +60,10 @@ Resolve、Ollama、FFmpeg 和素材都位于运行 `web.py` 的 Windows 主机�
 
 公开默认入口 [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/) 是真实本机应用模式，直连这台电脑上只监听回环地址的源码 companion。需要从外部设备远程控制 Windows Worker 时，使用 `?remote=1` 进入受管理令牌保护的云端控制面；Worker 仍只主动发起出站 HTTPS 连接。旧的浏览器假数据 Demo 已删除。
 
+公开入口和项目自有 404 都发布同一组 Open Graph/Twitter 元数据，便于 iPhone
+和消息应用生成项目预览。界面变化时应同步更新 1200×630 的
+`web/share-card.png`，且预览图不得包含访问令牌、素材路径或客户媒体。
+
 `/cybereditor/` 下的页面导航由本仓库控制平面负责。未知浏览器页面返回
 CyberEditor 自己的双语 HTML 404；未知 API、Worker 和静态资源请求继续返回
 原生 JSON 404，不由 Caddy 维护或猜测应用路由。
