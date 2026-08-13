@@ -34,6 +34,13 @@ MAX_JSON_BYTES = 2 * 1024 * 1024
 ONLINE_WINDOW_SEC = 30.0
 TERMINAL_STATES = {"succeeded", "failed", "stopped"}
 WORKER_ID_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,80}")
+PUBLIC_STATIC_FILES: Mapping[str, str] = {
+    "/": "index.html",
+    "/index.html": "index.html",
+    "/app.js": "app.js",
+    "/styles.css": "styles.css",
+    "/share-card.png": "share-card.png",
+}
 
 DEFAULT_REMOTE_CONFIG: Dict[str, object] = {
     "video": "", "videos": [], "input_folder": "", "proxy": "",
@@ -764,8 +771,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.NOT_FOUND, "Unknown worker endpoint.")
 
     def _serve_static(self, request_path: str) -> None:
-        mapping = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/styles.css": "styles.css"}
-        name = mapping.get(request_path)
+        name = PUBLIC_STATIC_FILES.get(request_path)
         if not name:
             raise FileNotFoundError(request_path)
         path = self.server.static_root / name
