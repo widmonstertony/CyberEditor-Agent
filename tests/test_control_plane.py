@@ -5,9 +5,17 @@ from __future__ import annotations
 import io
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
-from src.control_plane import ControlPlaneStore
+from src.control_plane import (
+    ControlPlaneHandler,
+    ControlPlaneServer,
+    ControlPlaneStore,
+    _accepts_html,
+)
 
 
 class ControlPlaneStoreTests(unittest.TestCase):
@@ -121,6 +129,51 @@ class ControlPlaneStoreTests(unittest.TestCase):
                 with self.assertRaises(KeyError):
                     store.artifact(first["artifact_id"])
                 self.assertEqual(store.artifact(second["artifact_id"])[0].read_bytes(), b"abcdef")
+
+
+class ControlPlaneRoutingTests(unittest.TestCase):
+    """Keep browser navigation separate from the JSON control-plane contract."""
+
+    def test_browser_documents_receive_project_owned_not_found_page(self) -> None:
+        self.assertTrue(_accepts_html("text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"))
+
+    def test_api_and_asset_requests_do_not_receive_html(self) -> None:
+        self.assertFalse(_accepts_html("application/json"))
+        self.assertFalse(_accepts_html("text/css,*/*;q=0.1"))
+        self.assertFalse(_accepts_html("*/*"))
+
+    def test_unknown_browser_route_serves_project_page_with_404_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            static = root / "web"
+            static.mkdir()
+            (static / "index.html").write_text("home", encoding="utf-8")
+            (static / "not-found.html").write_text("CyberEditor route not found", encoding="utf-8")
+            with ControlPlaneStore(root / "state.sqlite3", root / "storage") as store:
+                server = ControlPlaneServer(
+                    ("127.0.0.1", 0), ControlPlaneHandler, store, static,
+                    "admin-token-123456789", "worker-token-123456789", 1024,
+                )
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                request = urllib_request.Request(
+                    f"http://127.0.0.1:{server.server_port}/missing",
+                    headers={"Accept": "text/html"},
+                )
+                try:
+                    with self.assertRaises(urllib_error.HTTPError) as raised:
+                        urllib_request.urlopen(request, timeout=3)
+                    response = raised.exception
+                    try:
+                        self.assertEqual(response.code, 404)
+                        self.assertEqual(response.headers.get_content_type(), "text/html")
+                        self.assertIn(b"CyberEditor route not found", response.read())
+                    finally:
+                        response.close()
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=3)
 
 
 if __name__ == "__main__":

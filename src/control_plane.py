@@ -60,6 +60,14 @@ def _json_bytes(payload: object) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def _accepts_html(value: str) -> bool:
+    """Return whether the client explicitly accepts a browser document."""
+    return any(
+        item.split(";", 1)[0].strip().casefold() in {"text/html", "application/xhtml+xml"}
+        for item in value.split(",")
+    )
+
+
 def _safe_name(value: str, fallback: str = "preview.mp4") -> str:
     """Return a filesystem-safe artifact name. / 返回安全的预览文件名。"""
     name = Path(urllib_parse.unquote(value)).name
@@ -670,7 +678,12 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 self._send_file(path, mime)
             else:
                 self._serve_static(parsed.path)
-        except (KeyError, FileNotFoundError):
+        except FileNotFoundError:
+            if not parsed.path.startswith("/api/") and _accepts_html(self.headers.get("Accept", "")):
+                self._serve_not_found()
+            else:
+                self._error(HTTPStatus.NOT_FOUND, "Not found.")
+        except KeyError:
             self._error(HTTPStatus.NOT_FOUND, "Not found.")
         except (ValueError, PermissionError) as exc:
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
@@ -757,6 +770,10 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             raise FileNotFoundError(request_path)
         path = self.server.static_root / name
         self._send(path.read_bytes(), mimetypes.guess_type(name)[0] or "application/octet-stream")
+
+    def _serve_not_found(self) -> None:
+        path = self.server.static_root / "not-found.html"
+        self._send(path.read_bytes(), "text/html; charset=utf-8", HTTPStatus.NOT_FOUND)
 
     def _send_file(self, path: Path, mime_type: str) -> None:
         size = path.stat().st_size

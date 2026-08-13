@@ -60,6 +60,10 @@ Resolve、Ollama、FFmpeg 和素材都位于运行 `web.py` 的 Windows 主机�
 
 公开默认入口 [tonytan.me/cybereditor/](https://tonytan.me/cybereditor/) 是真实本机应用模式，直连这台电脑上只监听回环地址的源码 companion。需要从外部设备远程控制 Windows Worker 时，使用 `?remote=1` 进入受管理令牌保护的云端控制面；Worker 仍只主动发起出站 HTTPS 连接。旧的浏览器假数据 Demo 已删除。
 
+`/cybereditor/` 下的页面导航由本仓库控制平面负责。未知浏览器页面返回
+CyberEditor 自己的双语 HTML 404；未知 API、Worker 和静态资源请求继续返回
+原生 JSON 404，不由 Caddy 维护或猜测应用路由。
+
 该实例由 `Personal-Website/ops` 中的 Caddy、systemd、受限 sudo 和原子发布脚本管理。合并受保护的 `main` 后，独立 GitHub Runner 只部署审查过的控制面文件。服务器最多保留 512 MiB 预览，自动删除七天前或超额的文件；RAW、字幕、关键帧、Ollama 和 Resolve 永远不上传。
 
 先在部署主机设置两个**不同**的随机密钥并启动控制面：
