@@ -81,6 +81,10 @@ docker compose -f docker-compose.control-plane.yml up -d --build
 容器本身监听 HTTP，应由部署平台或 Caddy/Nginx 提供公开 HTTPS。然后在保存素材、安装了
 Ollama/CUDA/Resolve 的 Windows 电脑运行：
 
+控制面容器使用固定摘要的 Python 3.14 slim 镜像；Windows 编辑工作站继续使用经过
+PyTorch、Whisper、OpenCV 与 Librosa 真实安装验证的 Python 3.11 环境。两套运行时由
+独立 CI 检查，避免云端容器升级影响本机 CUDA 工作流。
+
 ```powershell
 $env:CYBEREDITOR_WORKER_TOKEN = "replace-with-a-different-long-worker-token"
 .\.venv\Scripts\python.exe worker.py --server "https://edit.example.com"
