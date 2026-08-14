@@ -50,6 +50,7 @@ jobs:
         run: |
           docker run --detach --name cybereditor-control-ci \
             --env CYBEREDITOR_ADMIN_TOKEN=ci-only-control-plane-token \
+            --env CYBEREDITOR_WORKER_TOKEN=ci-only-worker-token-1234567890 \
             --publish 127.0.0.1:18765:8765 cybereditor-control:ci
           trap 'docker rm --force cybereditor-control-ci >/dev/null 2>&1 || true' EXIT
           for attempt in $(seq 1 30); do
