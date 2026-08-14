@@ -1,0 +1,83 @@
+name: Runtime compatibility
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - requirements.txt
+      - scripts/install_windows.ps1
+      - scripts/verify_dependencies.py
+      - .github/workflows/runtime-compatibility.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - requirements.txt
+      - scripts/install_windows.ps1
+      - scripts/verify_dependencies.py
+      - .github/workflows/runtime-compatibility.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-314-control-plane:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Compile sources
+        run: python -m compileall -q main.py src tests
+      - name: Run standard-library test suite
+        run: python -m unittest discover -s tests -v
+
+  control-plane-container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Build pinned Python 3.14 image
+        run: docker build --tag cybereditor-control:ci .
+      - name: Smoke-test the HTTP control plane
+        run: |
+          docker run --detach --name cybereditor-control-ci \
+            --env CYBEREDITOR_ADMIN_TOKEN=ci-only-control-plane-token \
+            --env CYBEREDITOR_WORKER_TOKEN=ci-only-worker-token-1234567890 \
+            --publish 127.0.0.1:18765:8765 cybereditor-control:ci
+          trap 'docker rm --force cybereditor-control-ci >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:18765/ >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs cybereditor-control-ci
+          exit 1
+
+  windows-workstation-dependencies:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up supported workstation Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install current workstation dependencies
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          python -m pip_audit --requirement requirements.txt
+          python -m pip install -r requirements.txt
+      - name: Exercise media and ML dependency APIs
+        run: python scripts/verify_dependencies.py

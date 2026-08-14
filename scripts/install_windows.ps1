@@ -22,13 +22,13 @@ if ($env:OS -ne "Windows_NT") {
 if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Step "创建 Python 虚拟环境" "Creating Python virtual environment"
     if ($PythonCommand -eq "py") {
-        & py -3.11 -m venv $venvRoot
+        & py -3.12 -m venv $venvRoot
     }
     else {
         & $PythonCommand -m venv $venvRoot
     }
     if ($LASTEXITCODE -ne 0) {
-        throw "无法创建 .venv；请安装 Python 3.11。 / Could not create .venv; install Python 3.11."
+        throw "无法创建 .venv；请安装 Python 3.12。 / Could not create .venv; install Python 3.12."
     }
 }
 

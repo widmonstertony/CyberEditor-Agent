@@ -102,6 +102,11 @@ The container listens on HTTP internally; terminate public HTTPS through the
 hosting platform, Caddy, or Nginx. On the Windows PC containing the media and
 local applications, run:
 
+The control-plane container uses a digest-pinned Python 3.14 slim image. The
+Windows editing workstation stays on Python 3.12, where CI performs a real
+install and API smoke test for PyTorch, Whisper, OpenCV, and Librosa. Separate
+checks keep cloud runtime upgrades from silently breaking the CUDA workflow.
+
 ```powershell
 $env:CYBEREDITOR_WORKER_TOKEN = "replace-with-a-different-long-worker-token"
 .\.venv\Scripts\python.exe worker.py --server "https://edit.example.com"
@@ -528,7 +533,7 @@ CyberEditor-Agent/
 ### Minimum recommendations
 
 - Windows 10/11 64-bit
-- Python 3.10 or 3.11 64-bit
+- Python 3.12 64-bit
 - 16 GB system RAM; 32–64 GB is recommended for mixed 32B/70B inference
 - At least 20 GB of free disk space, plus space for proxies and model weights
 - FFmpeg
