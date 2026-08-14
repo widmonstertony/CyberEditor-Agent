@@ -82,7 +82,7 @@ docker compose -f docker-compose.control-plane.yml up -d --build
 Ollama/CUDA/Resolve 的 Windows 电脑运行：
 
 控制面容器使用固定摘要的 Python 3.14 slim 镜像；Windows 编辑工作站继续使用经过
-PyTorch、Whisper、OpenCV 与 Librosa 真实安装验证的 Python 3.11 环境。两套运行时由
+PyTorch、Whisper、OpenCV 与 Librosa 真实安装验证的 Python 3.12 环境。两套运行时由
 独立 CI 检查，避免云端容器升级影响本机 CUDA 工作流。
 
 ```powershell
@@ -436,7 +436,7 @@ CyberEditor-Agent/
 ### 最低建议
 
 - Windows 10/11 64 位
-- Python 3.10 或 3.11 64 位
+- Python 3.12 64 位
 - 16GB 系统内存；运行 32B/70B 混合推理时建议 32–64GB
 - 至少 20GB 可用磁盘空间，另加代理素材和模型空间
 - FFmpeg
