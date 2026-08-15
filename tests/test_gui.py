@@ -12,7 +12,9 @@ from src.gui import (
     console_python_executable,
     detect_torch_runtime,
     detect_system_theme,
+    director_context_contract,
     enable_windows_high_dpi,
+    format_director_context_status,
     get_primary_work_area,
     parse_frame_rate,
     recommend_automatic_settings,
@@ -107,6 +109,71 @@ class WorkflowOptionsTests(unittest.TestCase):
             self.assertIn("--proxy", command)
             self.assertIn("--skip-resolve", command)
             self.assertNotIn("--skip-extraction", command)
+            self.assertEqual(
+                command[command.index("--sample-interval") + 1], "0.5"
+            )
+            self.assertEqual(
+                command[command.index("--max-keyframes") + 1], "14400"
+            )
+
+    def test_72b_requested_context_is_passed_unchanged_to_main(self) -> None:
+        """The UI reports the cap; it must not replace the user's CLI request."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "source.mp4"
+            video.touch()
+            options = WorkflowOptions(
+                video=str(video),
+                data_dir="data/run-72b",
+                ollama_model="qwen3.6:27b",
+                director_model="qwen2.5:72b-instruct-q5_K_M",
+                num_ctx=32768,
+                skip_resolve=True,
+            )
+
+            command = options.build_command("python.exe", root)
+
+            self.assertEqual(
+                command[command.index("--num-ctx") + 1], "32768"
+            )
+
+    def test_director_context_contract_covers_70b_72b_and_27b_boundaries(self) -> None:
+        self.assertEqual(
+            director_context_contract(32768, "qwen2.5:72b-instruct-q5_K_M"),
+            (32768, 8192, True),
+        )
+        self.assertEqual(
+            director_context_contract(4096, "llama:70B-q5"),
+            (4096, 4096, True),
+        )
+        self.assertEqual(
+            director_context_contract(32768, "qwen3.6:27b-mtp-q8_0"),
+            (32768, 32768, False),
+        )
+        self.assertEqual(
+            director_context_contract(32768, "experimental:172b"),
+            (32768, 32768, False),
+        )
+
+    def test_director_context_status_is_bilingual_and_27b_has_no_warning(self) -> None:
+        chinese = format_director_context_status(
+            32768, "qwen2.5:72b", "zh"
+        )
+        english = format_director_context_status(
+            32768, "qwen2.5:70b", "en"
+        )
+        self.assertIn("请求=32768", chinese)
+        self.assertIn("实际=8192", chinese)
+        self.assertIn("提高界面值不会绕过", chinese)
+        self.assertIn("requested=32768", english)
+        self.assertIn("effective=8192", english)
+        self.assertIn("raising the UI value does not bypass", english)
+        self.assertEqual(
+            format_director_context_status(
+                32768, "qwen3.6:27b-mtp-q8_0", "zh"
+            ),
+            "Context=32768",
+        )
 
     def test_multi_video_and_folder_inputs_build_batch_flags(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -303,7 +370,7 @@ class WorkflowOptionsTests(unittest.TestCase):
         )
         self.assertEqual(recommendation["chunk_minutes"], 10.0)
 
-    def test_auto_profile_prefers_qwen36_dense_q8_for_both_roles(self) -> None:
+    def test_auto_profile_uses_only_installed_model_when_one_role_tag_exists(self) -> None:
         recommendation = recommend_automatic_settings(
             {"ram_gb": 64, "vram_gb": 16, "cpu_threads": 16, "torch_cuda": True},
             [
@@ -320,6 +387,42 @@ class WorkflowOptionsTests(unittest.TestCase):
             recommendation["director_model"],
             "qwen3.6:27b-mtp-q8_0",
         )
+
+    def test_auto_profile_splits_q4_vision_from_q8_text_director(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {"ram_gb": 64, "vram_gb": 16, "cpu_threads": 16, "torch_cuda": True},
+            [
+                {"name": "qwen3.6:27b-q4_K_M", "size": 17 * 1024**3},
+                {"name": "qwen3.6:27b-mtp-q8_0", "size": 30 * 1024**3},
+            ],
+        )
+
+        self.assertEqual(
+            recommendation["ollama_model"], "qwen3.6:27b-q4_K_M"
+        )
+        self.assertEqual(
+            recommendation["director_model"], "qwen3.6:27b-mtp-q8_0"
+        )
+        self.assertEqual(recommendation["requested_num_ctx"], 32768)
+        self.assertEqual(recommendation["effective_num_ctx"], 32768)
+        self.assertFalse(recommendation["context_is_70b_class"])
+
+    def test_auto_profile_reports_72b_effective_context_without_rewriting_request(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {"ram_gb": 64, "vram_gb": 16, "cpu_threads": 16, "torch_cuda": True},
+            [
+                {
+                    "name": "qwen2.5:72b-instruct-q5_K_M",
+                    "size": 54 * 1024**3,
+                }
+            ],
+        )
+
+        self.assertEqual(recommendation["director_model"], "qwen2.5:72b-instruct-q5_K_M")
+        self.assertEqual(recommendation["num_ctx"], 32768)
+        self.assertEqual(recommendation["requested_num_ctx"], 32768)
+        self.assertEqual(recommendation["effective_num_ctx"], 8192)
+        self.assertTrue(recommendation["context_is_70b_class"])
 
     def test_auto_profile_does_not_assume_pytorch_cuda(self) -> None:
         recommendation = recommend_automatic_settings(
@@ -347,6 +450,14 @@ class WorkflowOptionsTests(unittest.TestCase):
     def test_interface_translations_cover_chinese_and_english(self) -> None:
         self.assertEqual(translate("zh", "start"), "开始串行工作流")
         self.assertEqual(translate("en", "start"), "Start serial workflow")
+        self.assertEqual(
+            translate("zh", "ollama_model"),
+            "全片视觉审片（2fps + 短动作最高4fps）",
+        )
+        self.assertEqual(
+            translate("en", "ollama_model"),
+            "Whole-footage vision review (2 fps + short actions up to 4 fps)",
+        )
 
     def test_explicit_interface_language_does_not_depend_on_system(self) -> None:
         self.assertEqual(resolve_language("zh"), "zh")

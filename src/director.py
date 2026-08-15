@@ -24,7 +24,10 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
@@ -32,7 +35,156 @@ from typing import Any, Dict, List, Optional, Sequence
 
 LOGGER_NAME = "cybereditor.director"
 DIRECTOR_CHECKPOINT_VERSION = 1
-DIRECTOR_PROMPT_VERSION = "2026-08-05.7-evidence-contract-blind-viewer"
+DIRECTOR_PROMPT_VERSION = "2026-08-15.1-neutral-ledger-concept-tournament"
+VISUAL_REVIEW_VERSION = 3
+VISUAL_EVIDENCE_PROMPT_VERSION = "2026-08-15.1-neutral-action-atoms"
+TEMPORAL_REFINEMENT_VERSION = "2026-08-15.1-dense-4fps"
+# A 1280x720 Qwen-style visual sample is roughly 1.2K merged visual tokens.
+# Keep a safety margin for model/version differences and for images whose
+# encoded dimensions are not present in legacy extractor JSON.
+# 1280x720 的 Qwen 类视觉样本通常约占 1.2K 合并视觉 token；这里额外保留
+# 模型版本与旧版提取 JSON 缺少尺寸信息的安全余量。
+VISION_IMAGE_TOKEN_ESTIMATE = 1536
+
+
+def build_evidence_fingerprint(
+    raw_data_path: os.PathLike,
+    vision_model: str,
+) -> str:
+    """
+    Fingerprint the complete visual evidence contract for safe cache reuse.
+    为完整视觉证据契约生成指纹，确保缓存只在完全匹配时复用。
+
+    Parameters / 参数:
+        raw_data_path: Combined extractor JSON, including sampling metadata.
+            合并后的提取 JSON，其中已包含视觉采样元数据。
+        vision_model: Exact local vision-model tag. / 本地视觉模型完整标签。
+
+    The raw JSON bytes deliberately participate in the digest. Every referenced
+    source, proxy, and JPEG also contributes its resolved path, byte size, and
+    nanosecond mtime. Replacing media in place therefore invalidates a cached
+    ledger, while a missing evidence file fails closed instead of being silently
+    treated as the footage previously reviewed.
+
+    原始 JSON 字节直接参与哈希。每个源素材、代理和 JPEG 的解析路径、
+    字节大小与纳秒 mtime 也会纳入指纹；同路径替换文件会使缓存失效，
+    缺失证据文件则安全失败，绝不冒充成曾经完整审看的素材。
+    """
+    path = Path(raw_data_path).expanduser().resolve()
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError as exc:
+        raise DirectorError(
+            f"无法读取视觉证据源 / Cannot read visual evidence source: {exc}"
+        ) from exc
+    try:
+        raw_payload = json.loads(raw_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DirectorError(
+            f"无法解析视觉证据源 / Cannot parse visual evidence source: {exc}"
+        ) from exc
+
+    manifest: List[Dict[str, Any]] = []
+
+    def append_file(role: str, raw_value: object) -> None:
+        """Append one fail-closed file identity record. / 追加一条安全失败的文件身份记录。"""
+        value = str(raw_value or "").strip()
+        if not value:
+            raise DirectorError(
+                f"视觉证据清单缺少 {role} 路径 / Evidence manifest lacks {role}."
+            )
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = path.parent / candidate
+        resolved = candidate.resolve()
+        try:
+            stat = resolved.stat()
+        except OSError as exc:
+            raise DirectorError(
+                f"视觉证据文件缺失或不可读 / Missing or unreadable evidence file "
+                f"({role}): {resolved}: {exc}"
+            ) from exc
+        if not resolved.is_file():
+            raise DirectorError(
+                f"视觉证据路径不是文件 / Evidence path is not a file "
+                f"({role}): {resolved}"
+            )
+        manifest.append(
+            {
+                "role": role,
+                "path": os.path.normcase(str(resolved)),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+
+    assets = raw_payload.get("assets") if isinstance(raw_payload, dict) else None
+    if isinstance(assets, list):
+        if not assets:
+            raise DirectorError(
+                "视觉证据清单不能是空 assets / Evidence manifest has no assets."
+            )
+        for asset_index, asset in enumerate(assets):
+            if not isinstance(asset, dict):
+                raise DirectorError(
+                    f"assets[{asset_index}] 不是对象 / is not an object."
+                )
+            append_file(
+                f"asset[{asset_index}].source",
+                asset.get("source_video"),
+            )
+            proxy_value = str(asset.get("proxy_file_name") or "").strip()
+            if proxy_value:
+                append_file(f"asset[{asset_index}].proxy", proxy_value)
+            raw_keyframes = asset.get("keyframes")
+            if not isinstance(raw_keyframes, list):
+                raise DirectorError(
+                    f"assets[{asset_index}].keyframes 必须是数组 / must be an array."
+                )
+            for frame_index, frame in enumerate(raw_keyframes):
+                if not isinstance(frame, dict):
+                    raise DirectorError(
+                        f"assets[{asset_index}].keyframes[{frame_index}] 不是对象 / "
+                        "is not an object."
+                    )
+                image_path = str(frame.get("image_path") or "").strip()
+                if not image_path:
+                    raw_asset_path = str(asset.get("raw_data_path") or "").strip()
+                    frame_name = str(frame.get("file_name") or "").strip()
+                    if raw_asset_path and frame_name:
+                        raw_asset_candidate = Path(raw_asset_path).expanduser()
+                        if not raw_asset_candidate.is_absolute():
+                            raw_asset_candidate = path.parent / raw_asset_candidate
+                        image_path = str(
+                            raw_asset_candidate.resolve().parent
+                            / "keyframes"
+                            / frame_name
+                        )
+                append_file(
+                    f"asset[{asset_index}].keyframe[{frame_index}]",
+                    image_path,
+                )
+
+    digest = hashlib.sha256()
+    digest.update(raw_bytes)
+    digest.update(b"\0")
+    digest.update(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    digest.update(b"\0")
+    digest.update(str(vision_model or "").strip().casefold().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(VISUAL_REVIEW_VERSION).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(VISUAL_EVIDENCE_PROMPT_VERSION.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(TEMPORAL_REFINEMENT_VERSION.encode("utf-8"))
+    return digest.hexdigest()
 
 COLOR_BIBLE_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -178,6 +330,109 @@ TREATMENT_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
+STORY_CONCEPTS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "concepts": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "concept_id": {"type": "string", "minLength": 1},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "form": {
+                        "type": "string",
+                        "enum": [
+                            "causal_story", "character_vignette", "kinetic_style_film",
+                            "atmospheric_poem", "dialogue_scene", "bts_process",
+                        ],
+                    },
+                    "premise": {"type": "string", "minLength": 1, "maxLength": 600},
+                    "viewer_takeaway": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "opening": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "development": {"type": "string", "minLength": 1, "maxLength": 600},
+                    "payoff": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "ending": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "proof_candidate_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "maxItems": 16,
+                    },
+                    "ending_candidate_id": {"type": "string", "minLength": 1},
+                    "music_direction": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "color_direction": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "feasibility_score": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "biggest_risk": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "recommended_duration_sec": {"type": "number", "minimum": 10, "maximum": 600},
+                },
+                "required": [
+                    "concept_id", "title", "form", "premise", "viewer_takeaway",
+                    "opening", "development", "payoff", "ending",
+                    "proof_candidate_ids", "ending_candidate_id", "music_direction",
+                    "color_direction", "feasibility_score", "biggest_risk",
+                    "recommended_duration_sec",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "selected_concept_id": {"type": "string", "minLength": 1},
+        "selection_reason": {"type": "string", "minLength": 1, "maxLength": 800},
+    },
+    "required": ["concepts", "selected_concept_id", "selection_reason"],
+    "additionalProperties": False,
+}
+
+STORY_SEED_PAGE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "page_summary": {"type": "string", "minLength": 1, "maxLength": 1200},
+        "story_seeds": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "form": {
+                        "type": "string",
+                        "enum": [
+                            "causal_story", "character_vignette", "kinetic_style_film",
+                            "atmospheric_poem", "dialogue_scene", "bts_process",
+                        ],
+                    },
+                    "premise": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "proof_candidate_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 10,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "possible_ending_candidate_id": {
+                        "type": "string",
+                        "minLength": 1,
+                    },
+                    "observable_progression": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
+                    },
+                    "limitations": {"type": "string", "minLength": 1, "maxLength": 400},
+                },
+                "required": [
+                    "form", "premise", "proof_candidate_ids",
+                    "possible_ending_candidate_id", "observable_progression", "limitations",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["page_summary", "story_seeds"],
+    "additionalProperties": False,
+}
+
 GRAPHICS_PLAN_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -292,6 +547,18 @@ CANDIDATE_SCHEMA: Dict[str, Any] = {
                     "visual_summary": {"type": "string", "minLength": 1},
                     "subject_action": {"type": "string", "minLength": 1},
                     "emotion": {"type": "string", "minLength": 1},
+                    "entry_state": {"type": "string", "minLength": 1},
+                    "action_apex": {"type": "string", "minLength": 1},
+                    "exit_state": {"type": "string", "minLength": 1},
+                    "screen_direction": {
+                        "type": "string",
+                        "enum": ["left", "right", "toward_camera", "away_from_camera", "mixed", "none"],
+                    },
+                    "identity_tags": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 8,
+                    },
                     "action_phase": {
                         "type": "string",
                         "enum": ["setup", "build", "action", "reaction", "payoff", "aftermath"],
@@ -389,6 +656,113 @@ CANDIDATE_SCHEMA: Dict[str, Any] = {
         }
     },
     "required": ["continuity_summary", "decisions"],
+    "additionalProperties": False,
+}
+
+# The visual pass is an evidence collector, not a miniature editor.  Keeping a
+# separate schema is intentional: requiring story roles, effects, transitions,
+# or a ``reason_for_cut`` before the treatment existed caused the model to throw
+# away ordinary setup/reaction evidence and then confirm its own premature idea.
+# 视觉阶段只负责取证，不是缩小版导演。独立 Schema 可避免在阐述生成前就强迫模型
+# 决定叙事角色、特效、转场或“为何保留”，从结构上消除先入为主。
+EVIDENCE_ATOM_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "continuity_summary": {
+            "type": "string", "minLength": 1, "maxLength": 1600,
+        },
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "cut_in_sec": {"type": "number", "minimum": 0},
+                    "cut_out_sec": {"type": "number", "minimum": 0},
+                    "visual_summary": {"type": "string", "minLength": 1},
+                    "subject_action": {"type": "string", "minLength": 1},
+                    "observable_emotion": {"type": "string", "minLength": 1},
+                    "entry_state": {"type": "string", "minLength": 1},
+                    "action_apex": {"type": "string", "minLength": 1},
+                    "exit_state": {"type": "string", "minLength": 1},
+                    "screen_direction": {
+                        "type": "string",
+                        "enum": [
+                            "left", "right", "toward_camera",
+                            "away_from_camera", "mixed", "none",
+                        ],
+                    },
+                    "identity_tags": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 8,
+                    },
+                    "temporal_phase": {
+                        "type": "string",
+                        "enum": [
+                            "state", "onset", "development", "apex",
+                            "reaction", "aftermath",
+                        ],
+                    },
+                    "shot_scale": {
+                        "type": "string",
+                        "enum": [
+                            "extreme_wide", "wide", "medium", "closeup", "detail",
+                        ],
+                    },
+                    "camera_motion": {
+                        "type": "string",
+                        "enum": ["static", "pan", "tilt", "handheld", "tracking"],
+                    },
+                    "continuity_tags": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 8,
+                    },
+                    "technical_readability": {
+                        "type": "string",
+                        "enum": ["clear", "limited", "unreadable"],
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "required": [
+                    "cut_in_sec", "cut_out_sec", "visual_summary",
+                    "subject_action", "observable_emotion", "entry_state",
+                    "action_apex", "exit_state", "screen_direction",
+                    "identity_tags", "temporal_phase", "shot_scale",
+                    "camera_motion", "continuity_tags",
+                    "technical_readability", "confidence",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["continuity_summary", "decisions"],
+    "additionalProperties": False,
+}
+
+
+ATOM_REFINEMENT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "keep": {"type": "boolean"},
+        "trim_in_sec": {"type": "number", "minimum": 0},
+        "action_apex_sec": {"type": "number", "minimum": 0},
+        "trim_out_sec": {"type": "number", "minimum": 0},
+        "entry_state": {"type": "string", "minLength": 1, "maxLength": 300},
+        "action_apex": {"type": "string", "minLength": 1, "maxLength": 300},
+        "exit_state": {"type": "string", "minLength": 1, "maxLength": 300},
+        "screen_direction": {
+            "type": "string",
+            "enum": ["left", "right", "toward_camera", "away_from_camera", "mixed", "none"],
+        },
+        "continuity_risk": {"type": "string", "maxLength": 300},
+        "decision_reason": {"type": "string", "minLength": 1, "maxLength": 400},
+    },
+    "required": [
+        "keep", "trim_in_sec", "action_apex_sec", "trim_out_sec",
+        "entry_state", "action_apex", "exit_state", "screen_direction",
+        "continuity_risk", "decision_reason",
+    ],
     "additionalProperties": False,
 }
 
@@ -638,6 +1012,124 @@ SUPERVISING_EDITOR_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
 }
 
+# Long-form picture locks cannot safely return dozens of verbose shot objects
+# in one Ollama generation. The staged protocol first selects a compact global
+# order, then authors core cuts and annotations in bounded pages.
+# 长片锁画不能让 Ollama 一次生成数十个富文本镜头对象；分阶段协议先返回紧凑
+# 全局顺序，再分页生成核心剪点与详细标注。
+PICTURE_MAX_SHOTS = 96
+PICTURE_SKELETON_PAGE_SIZE = 12
+PICTURE_ENRICHMENT_PAGE_SIZE = 6
+
+PICTURE_ORDER_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "project_summary": {"type": "string", "minLength": 1, "maxLength": 800},
+        "viewer_takeaway": {"type": "string", "minLength": 1, "maxLength": 500},
+        "editorial_style": SEQUENCE_SCHEMA["properties"]["editorial_style"],
+        "ordered_candidate_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": PICTURE_MAX_SHOTS,
+            "items": {"type": "string", "minLength": 1, "maxLength": 96},
+        },
+    },
+    "required": [
+        "project_summary", "viewer_takeaway", "editorial_style",
+        "ordered_candidate_ids",
+    ],
+    "additionalProperties": False,
+}
+
+PICTURE_ORDER_REVIEW_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        **PICTURE_ORDER_SCHEMA["properties"],
+        "review": SUPERVISING_EDITOR_SCHEMA["properties"]["review"],
+    },
+    "required": [*PICTURE_ORDER_SCHEMA["required"], "review"],
+    "additionalProperties": False,
+}
+
+PICTURE_SKELETON_PAGE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "page_index": {"type": "integer", "minimum": 1},
+        "shots": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": PICTURE_SKELETON_PAGE_SIZE,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string", "minLength": 1, "maxLength": 96},
+                    "trim_in_sec": {"type": "number", "minimum": 0},
+                    "trim_out_sec": {"type": "number", "minimum": 0},
+                    "narrative_function": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["narrative_function"],
+                    "audio_intent": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["audio_intent"],
+                    "music_edit_role": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["music_edit_role"],
+                },
+                "required": [
+                    "candidate_id", "trim_in_sec", "trim_out_sec",
+                    "narrative_function", "audio_intent", "music_edit_role",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["page_index", "shots"],
+    "additionalProperties": False,
+}
+
+PICTURE_ENRICHMENT_PAGE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "page_index": {"type": "integer", "minimum": 1},
+        "shots": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": PICTURE_ENRICHMENT_PAGE_SIZE,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string", "minLength": 1, "maxLength": 96},
+                    "viewer_information": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "reason_for_position": {"type": "string", "minLength": 1, "maxLength": 180},
+                    "evidence_claim": {"type": "string", "minLength": 1, "maxLength": 160},
+                    "connection_to_previous": {"type": "string", "minLength": 1, "maxLength": 180},
+                    "transition_to_next": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["transition_to_next"],
+                    "transition_duration_sec": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["transition_duration_sec"],
+                    "audio_cleanup": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["audio_cleanup"],
+                    "color_look": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["color_look"],
+                    "motion": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["motion"],
+                    "volume_db": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["volume_db"],
+                    "drx_preset": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["drx_preset"],
+                    "stabilization": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["stabilization"],
+                    "tracking": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["tracking"],
+                    "smart_reframe": SEQUENCE_SCHEMA["properties"]["sequence"]["items"]["properties"]["smart_reframe"],
+                },
+                "required": [
+                    "candidate_id", "viewer_information", "reason_for_position",
+                    "evidence_claim", "connection_to_previous",
+                    "transition_to_next", "transition_duration_sec",
+                    "audio_cleanup", "color_look", "motion", "volume_db",
+                    "drx_preset", "stabilization", "tracking", "smart_reframe",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["page_index", "shots"],
+    "additionalProperties": False,
+}
+
+PICTURE_GRAPHICS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {"graphics_plan": GRAPHICS_PLAN_SCHEMA},
+    "required": ["graphics_plan"],
+    "additionalProperties": False,
+}
+
 MUSIC_PLAN_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -659,6 +1151,7 @@ COVERAGE_SYNOPSIS_SCHEMA: Dict[str, Any] = {
         },
         "event_timeline": {
             "type": "array",
+            "minItems": 1,
             "items": {
                 "type": "object",
                 "properties": {
@@ -675,6 +1168,7 @@ COVERAGE_SYNOPSIS_SCHEMA: Dict[str, Any] = {
         "visual_motifs": {
             "type": "array",
             "items": {"type": "string", "minLength": 1, "maxLength": 300},
+            "minItems": 1,
             "maxItems": 10,
         },
         "continuity_risks": {
@@ -807,6 +1301,27 @@ BLIND_VIEWER_SCHEMA: Dict[str, Any] = {
 
 class DirectorError(RuntimeError):
     """Expected AI director failure. / 可预期的 AI 导演错误。"""
+
+
+class EditorialQualityError(DirectorError):
+    """Raised when every bounded recut still fails the editorial gate. / 重剪仍未过质量门。"""
+
+    def __init__(
+        self,
+        violations: Sequence[str],
+        metrics: Optional[Dict[str, Any]] = None,
+        blind_review: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Preserve machine-readable failure evidence for concept fallback. / 保存可供换构想使用的失败证据。"""
+        self.violations = [str(value) for value in violations]
+        self.metrics = dict(metrics or {})
+        self.blind_review = dict(blind_review or {})
+        super().__init__(
+            "导演的三轮重剪仍未达到可理解的成片标准，拒绝输出已知不合格版本："
+            + "；".join(self.violations)
+            + " / Bounded recuts still failed the editorial gate; refusing to render a known-bad cut: "
+            + "; ".join(self.violations)
+        )
 
 
 class AIDirector:
@@ -952,8 +1467,22 @@ class AIDirector:
         self._active_target_duration_sec = 0.0
         self._music_files: List[Path] = []
         self._asset_continuity_summaries: Dict[str, str] = {}
+        self._active_evidence_candidates: List[Dict[str, Any]] = []
+        self._active_concept_tournament: Dict[str, Any] = {}
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         self._session = session
+        effective_text_ctx = self._effective_num_ctx(self.text_model)
+        if effective_text_ctx < self.num_ctx:
+            self.logger.warning(
+                "导演模型 Context：界面配置=%d，70B/72B 混合内存安全有效值=%d；"
+                "提高界面 Context 不会越过此硬上限，长片将使用分页输出 / "
+                "Director context: configured=%d, effective mixed-memory 70B/72B cap=%d; "
+                "raising the UI value does not bypass this hard cap, so long-form output is paged",
+                self.num_ctx,
+                effective_text_ctx,
+                self.num_ctx,
+                effective_text_ctx,
+            )
 
     @property
     def session(self) -> Any:
@@ -1095,14 +1624,48 @@ class AIDirector:
             raise DirectorError(
                 "双导演音乐流程需要批量素材 schema / Two-pass music directing requires multi-asset raw data."
             )
+        treatment_destination = Path(treatment_output_path).expanduser().resolve()
+        ledger_path = self._footage_ledger_path(treatment_destination)
         try:
-            self.check_ollama(require_vision=True)
-            payload = self.request_treatment(assets)
+            ledger = self._review_footage_neutrally(
+                assets, raw_path, ledger_path
+            )
+            candidates = [
+                dict(item) for item in ledger.get("candidate_audit", [])
+                if isinstance(item, dict)
+            ]
+            self._active_evidence_candidates = candidates
+            if self.text_model.casefold() != self.model.casefold():
+                self.logger.info(
+                    "中立视觉审片完成，卸载 %s 后加载文字导演 %s / "
+                    "Neutral review complete; switching vision to text director",
+                    self.model, self.text_model,
+                )
+                self.unload_model(self.model)
+                self.check_ollama(model=self.text_model)
+            else:
+                self.check_ollama(model=self.text_model)
+            concepts = self.request_story_concepts(
+                assets,
+                candidates,
+                ledger.get("asset_coverage", []),
+            )
+            self._active_concept_tournament = concepts
+            payload = self.request_treatment(
+                assets,
+                evidence_candidates=candidates,
+                concept_tournament=concepts,
+                asset_coverage=ledger.get("asset_coverage", []),
+            )
             treatment = self.validate_treatment(payload, assets)
+            treatment["concept_tournament"] = concepts
+            treatment["selected_concept_id"] = concepts["selected_concept_id"]
+            treatment["footage_ledger"] = str(ledger_path)
+            treatment["evidence_fingerprint"] = ledger["evidence_fingerprint"]
             music_brief = self.build_music_brief(treatment, assets)
             self._atomic_write_json(
                 treatment,
-                Path(treatment_output_path).expanduser().resolve(),
+                treatment_destination,
             )
             self._atomic_write_json(
                 music_brief,
@@ -1116,11 +1679,26 @@ class AIDirector:
             return {"director_treatment": treatment, "music_brief": music_brief}
         finally:
             self.unload_model(self.model)
+            if self.text_model.casefold() != self.model.casefold():
+                self.unload_model(self.text_model)
 
     def load_treatment(self, assets: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         """Load and validate the first-pass treatment. / 读取并校验第一次导演初审。"""
         if self.treatment_path is None:
-            payload = self.request_treatment(assets)
+            if not self._active_evidence_candidates:
+                raise DirectorError(
+                    "必须先完成中立视觉证据账本，才能生成导演阐述。"
+                    " / A neutral visual evidence ledger is required before treatment."
+                )
+            if not self._active_concept_tournament:
+                raise DirectorError(
+                    "必须先完成三方案构想评审 / Story concept tournament is required before treatment."
+                )
+            payload = self.request_treatment(
+                assets,
+                evidence_candidates=self._active_evidence_candidates,
+                concept_tournament=self._active_concept_tournament,
+            )
         else:
             try:
                 payload = json.loads(
@@ -1138,7 +1716,66 @@ class AIDirector:
                 payload.get("target_duration_sec", self.target_duration_sec or 90.0),
                 "target_duration_sec",
             )
+        tournament = payload.get("concept_tournament") if isinstance(payload, dict) else None
+        if isinstance(tournament, dict):
+            self._active_concept_tournament = dict(tournament)
         return self.validate_treatment(payload, assets)
+
+    @staticmethod
+    def _require_treatment_evidence_fingerprint(
+        treatment: Dict[str, Any], expected_fingerprint: str
+    ) -> None:
+        """
+        Require a treatment to belong to the exact current evidence ledger.
+        要求导演阐述严格属于当前完整证据账本。
+
+        Parameters / 参数:
+            treatment: Validated treatment loaded from disk or a plan. /
+                从磁盘或计划读取的已校验导演阐述。
+            expected_fingerprint: Fingerprint rebuilt from current media evidence. /
+                由当前媒体证据重建的指纹。
+
+        Legacy treatments without a fingerprint fail closed: accepting an empty
+        value would let a new source/proxy/JPEG set reuse an unrelated story.
+        旧阐述若没有指纹将安全失效，避免新素材误用旧故事。
+        """
+        actual = str(treatment.get("evidence_fingerprint") or "").strip()
+        if not actual or actual != str(expected_fingerprint or "").strip():
+            raise DirectorError(
+                "导演阐述缺少有效证据指纹，或与当前素材不匹配；"
+                "必须重跑音乐导演初审。 / Treatment lacks the exact current "
+                "evidence fingerprint; rerun the first director pass."
+            )
+
+    @staticmethod
+    def _assign_missing_candidate_ids(
+        candidates: Sequence[Dict[str, Any]], prefix: str = "R"
+    ) -> None:
+        """
+        Assign IDs only to derived candidates while preserving audit identities.
+        仅为派生候选分配 ID，保留审片账本的原始身份。
+
+        Parameters / 参数:
+            candidates: Mutable assembly-only candidate dictionaries. /
+                仅用于组装的可变候选字典。
+            prefix: Namespace for newly derived IDs. / 新派生 ID 的命名空间。
+        """
+        used = {
+            str(item.get("candidate_id") or "").strip()
+            for item in candidates
+            if str(item.get("candidate_id") or "").strip()
+        }
+        next_index = 1
+        for candidate in candidates:
+            if str(candidate.get("candidate_id") or "").strip():
+                continue
+            candidate_id = f"{prefix}{next_index:04d}"
+            while candidate_id in used:
+                next_index += 1
+                candidate_id = f"{prefix}{next_index:04d}"
+            candidate["candidate_id"] = candidate_id
+            used.add(candidate_id)
+            next_index += 1
 
     def build_music_brief(
         self,
@@ -1213,6 +1850,28 @@ class AIDirector:
                 "已有计划没有 candidate_audit，必须重新运行 AI 导演。"
                 " / Existing plan has no candidate audit; rerun the director."
             )
+        visual_review = payload.get("visual_review")
+        expected_fingerprint = build_evidence_fingerprint(raw_path, self.model)
+        try:
+            review_version = int(
+                visual_review.get("candidate_audit_version", 0)
+                if isinstance(visual_review, dict)
+                else 0
+            )
+        except (TypeError, ValueError):
+            review_version = 0
+        if not (
+            isinstance(visual_review, dict)
+            and visual_review.get("mode") == "neutral_complete_temporal_coverage"
+            and visual_review.get("candidate_audit_complete") is True
+            and review_version >= VISUAL_REVIEW_VERSION
+            and str(visual_review.get("evidence_fingerprint") or "")
+            == expected_fingerprint
+        ):
+            raise DirectorError(
+                "已有计划的审片账本与当前素材证据不匹配，不能重新校验。"
+                " / Existing audit does not match current evidence; revalidation is unsafe."
+            )
         self._active_target_duration_sec = self._finite_float(
             payload.get("target_duration_sec", self.target_duration_sec or 90),
             "target_duration_sec",
@@ -1222,6 +1881,9 @@ class AIDirector:
             treatment_payload if isinstance(treatment_payload, dict) else {},
             assets,
         )
+        self._require_treatment_evidence_fingerprint(
+            treatment, expected_fingerprint
+        )
         candidates = [
             dict(item) for item in audit
             if isinstance(item, dict) and not item.get("protected_story_anchor")
@@ -1229,8 +1891,7 @@ class AIDirector:
         if not candidates:
             candidates = self.candidates_from_treatment(treatment, assets)
         candidates = self.merge_decisions(candidates)
-        for index, candidate in enumerate(candidates, start=1):
-            candidate["candidate_id"] = f"C{index:04d}"
+        self._assign_missing_candidate_ids(candidates, prefix="R")
         final_clips = self._complete_story_coverage([], candidates, treatment)
         final_clips = self._remove_overlaps(final_clips)
         global_look = {
@@ -1254,8 +1915,9 @@ class AIDirector:
                 "color_pipeline": self.build_color_pipeline(
                     treatment, assets, raw_data.get("color_match_plan")
                 ),
-                "candidate_count": len(candidates),
-                "candidate_audit": candidates,
+                "candidate_count": len(audit),
+                "assembly_candidate_count": len(candidates),
+                "assembly_candidate_pool": candidates,
                 "clips": final_clips,
                 "revalidated_at_utc": datetime.now(timezone.utc).isoformat(),
             }
@@ -1306,6 +1968,28 @@ class AIDirector:
                 " / Existing plan has no candidate audit; vision review cannot be skipped."
             )
         visual_review = existing.get("visual_review")
+        expected_fingerprint = build_evidence_fingerprint(raw_path, self.model)
+        try:
+            review_version = int(
+                visual_review.get("candidate_audit_version", 0)
+                if isinstance(visual_review, dict)
+                else 0
+            )
+        except (TypeError, ValueError):
+            review_version = 0
+        if not (
+            isinstance(visual_review, dict)
+            and visual_review.get("mode") == "neutral_complete_temporal_coverage"
+            and visual_review.get("candidate_audit_complete") is True
+            and review_version >= VISUAL_REVIEW_VERSION
+            and str(visual_review.get("evidence_fingerprint") or "")
+            == expected_fingerprint
+        ):
+            raise DirectorError(
+                "已有视觉审片缓存与当前素材、视觉模型或审片协议不匹配；"
+                "不能跳过完整审片。 / Existing visual audit does not match the current "
+                "sources, vision model, or review protocol; full review cannot be skipped."
+            )
         summaries = (
             visual_review.get("continuity_summaries")
             if isinstance(visual_review, dict)
@@ -1323,6 +2007,9 @@ class AIDirector:
             if isinstance(item, dict) and str(item.get("file_name") or "").strip()
         ] or self.discover_music_files()
         treatment = self.load_treatment(assets)
+        self._require_treatment_evidence_fingerprint(
+            treatment, expected_fingerprint
+        )
         self._active_treatment = treatment
         candidates = self._sanitize_candidate_bounds(
             [
@@ -1368,8 +2055,7 @@ class AIDirector:
                 float(item.get("cut_out_sec", 0) or 0),
             ),
         )
-        for index, candidate in enumerate(candidates, start=1):
-            candidate["candidate_id"] = f"C{index:04d}"
+        self._assign_missing_candidate_ids(candidates, prefix="R")
         try:
             self.check_ollama(model=self.text_model)
             sequence_payload = self.request_sequence(candidates, assets, treatment)
@@ -1390,6 +2076,28 @@ class AIDirector:
         music_plan = self.validate_music_plan(
             sequence_payload.get("music_plan"), program_duration
         )
+        # Music is selected against the draft lock, then visual-only trims may
+        # move by a few frames to the nearest analyzed downbeat/strong beat.
+        # This is the final picture operation; dialogue is never changed.
+        # 配乐基于草案锁画选择，随后仅允许无对白镜头轻微吸附到实测强拍；这是最终
+        # 一次画面调整，对白镜头绝不改动。
+        final_clips = self.snap_visual_cuts_to_beats(
+            final_clips, music_plan, assets
+        )
+        # Beat snapping may expose or remove a short transcript overlap at the
+        # new out-point. Refresh literal dialogue evidence before calculating
+        # ducking; stale pre-snap ranges can otherwise leave speech uncovered.
+        # 卡点微调可能在新出点处增减少量对白，计算 ducking 前必须重新挂接实证区间。
+        final_clips = self._attach_candidate_dialogue(final_clips, assets)
+        program_duration = sum(
+            max(
+                0.0,
+                float(item.get("cut_out_sec", 0))
+                - float(item.get("cut_in_sec", 0)),
+            )
+            for item in final_clips
+        )
+        music_plan["program_duration_sec"] = round(program_duration, 4)
         music_plan = self.enforce_dialogue_ducking(final_clips, music_plan)
         music_plan = self.enrich_music_sync_points(final_clips, music_plan)
         graphics_plan = self.validate_graphics_plan(
@@ -1428,8 +2136,9 @@ class AIDirector:
                 "project_fps": self.project_fps,
                 "source_raw_data": str(raw_path),
                 "director_model": self.text_model,
-                "candidate_count": len(candidates),
-                "candidate_audit": candidates,
+                "candidate_count": len(audit),
+                "assembly_candidate_count": len(candidates),
+                "assembly_candidate_pool": candidates,
                 "project_summary": str(
                     sequence_payload.get("project_summary") or ""
                 ).strip(),
@@ -1471,6 +2180,745 @@ class AIDirector:
         )
         return output
 
+    @staticmethod
+    def _footage_ledger_path(anchor: Path) -> Path:
+        """Return the stable neutral-evidence ledger beside a stage artifact. / 返回阶段产物旁的中立证据账本路径。"""
+        return anchor.with_name("footage_ledger.json")
+
+    def _build_visual_review_chunks(
+        self, assets: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Build overlapping transport windows without dropping saved samples.
+        构建不丢弃任何已保存采样帧的重叠传输窗口。
+
+        Ten-second cores plus one-second overlap hold at most 24 images at the
+        high-quality 2 fps default, leaving headroom below Ollama's 32-image
+        request guard. These are transport envelopes, not semantic chunks.
+        默认 2 fps 下，10 秒核心加 1 秒重叠最多约 24 张图；这只是传输容器，
+        并不把素材语义截断。
+        """
+        chunks: List[Dict[str, Any]] = []
+        image_budget = self._vision_image_budget(EVIDENCE_ATOM_SCHEMA)
+        for asset_order, asset in enumerate(assets):
+            source_name = str(
+                asset.get("proxy_file_name") or asset.get("source_video") or ""
+            ).strip()
+            if not source_name:
+                raise DirectorError(
+                    f"素材 {asset.get('asset_id')} 缺少媒体路径 / asset has no media path."
+                )
+            window_sec = 10.0
+            prepared: List[Dict[str, Any]] = []
+            for _attempt in range(8):
+                overlap_sec = min(1.0, window_sec * 0.2)
+                trial_chunks = self.chunk_raw_data(
+                    asset,
+                    window_sec=window_sec,
+                    overlap_sec=overlap_sec,
+                )
+                prepared = []
+                oversized = False
+                for raw_chunk in trial_chunks:
+                    chunk = dict(raw_chunk)
+                    chunk["asset_id"] = str(asset.get("asset_id") or "")
+                    chunk["source_name"] = source_name
+                    chunk["source_video"] = str(asset.get("source_video") or "")
+                    chunk["asset_label"] = Path(
+                        str(asset.get("source_video") or source_name)
+                    ).name
+                    chunk["source_order"] = asset_order
+                    # Use the maximum rolling continuity payload for preflight.
+                    # CJK text is a conservative worst case for the zero-
+                    # dependency token estimator.
+                    probe = dict(chunk)
+                    probe["continuity_context"] = "证" * 1200
+                    prompt = self.build_prompt(
+                        probe,
+                        source_name,
+                        EVIDENCE_ATOM_SCHEMA,
+                        treatment=None,
+                    )
+                    frame_count = len(chunk.get("keyframes", []))
+                    if (
+                        frame_count > image_budget
+                        or frame_count > 32
+                        or not self._request_has_multimodal_capacity(
+                            prompt,
+                            EVIDENCE_ATOM_SCHEMA,
+                            frame_count,
+                            reserve_output_tokens=1024,
+                        )
+                    ):
+                        oversized = True
+                        break
+                    prepared.append(chunk)
+                if not oversized:
+                    break
+                if window_sec <= 0.5:
+                    raise DirectorError(
+                        "单个最小视觉窗口仍超过模型 Context；请提高 Context、降低抽帧尺寸，"
+                        "或缩短异常长字幕段。 / One minimum visual window still exceeds the "
+                        "model context; increase Context, reduce frame size, or split an unusually long transcript."
+                    )
+                window_sec = max(0.5, window_sec / 2.0)
+            else:
+                raise DirectorError(
+                    "无法构建 Context 安全的视觉审片窗口 / "
+                    "Could not build context-safe visual review windows."
+                )
+            if window_sec < 10.0:
+                self.logger.info(
+                    "视觉 Context 自适应：%s 使用 %.3fs 核心窗口，单次最多 %d 张图 / "
+                    "Adaptive visual context: %s uses %.3fs cores with at most %d images",
+                    Path(str(asset.get("source_video") or source_name)).name,
+                    window_sec,
+                    image_budget,
+                    Path(str(asset.get("source_video") or source_name)).name,
+                    window_sec,
+                    image_budget,
+                )
+            chunks.extend(prepared)
+        return chunks
+
+    @classmethod
+    def _deduplicate_event_atoms(
+        cls, candidates: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Remove only duplicate observations created by overlap transport.
+        仅删除由重叠传输窗口产生的重复观察，绝不合并相邻动作。
+
+        Older code merged touching candidates into broad ranges and retained
+        mostly the first event's metadata. This method keeps action boundaries
+        intact and replaces a duplicate only when ranges substantially overlap
+        and their literal action descriptions agree.
+        旧逻辑会把相邻候选合成长段并丢失后续动作元数据；本方法保留动作边界，
+        仅在时间高度重合且字面动作一致时去重。
+        """
+        ordered = sorted(
+            (dict(item) for item in candidates if isinstance(item, dict)),
+            key=lambda item: (
+                int(item.get("source_order", 0) or 0),
+                str(item.get("asset_id") or item.get("file_name") or ""),
+                float(item.get("cut_in_sec", 0) or 0),
+                float(item.get("cut_out_sec", 0) or 0),
+            ),
+        )
+        result: List[Dict[str, Any]] = []
+        for current in ordered:
+            duplicate_index: Optional[int] = None
+            current_start = float(current.get("cut_in_sec", 0) or 0)
+            current_end = float(current.get("cut_out_sec", 0) or 0)
+            current_duration = max(0.001, current_end - current_start)
+            current_text = " ".join(str(
+                current.get("subject_action") or current.get("visual_summary") or ""
+            ).casefold().split())
+            for index in range(len(result) - 1, max(-1, len(result) - 8), -1):
+                previous = result[index]
+                if str(previous.get("asset_id") or previous.get("file_name") or "") != str(
+                    current.get("asset_id") or current.get("file_name") or ""
+                ):
+                    continue
+                if str(previous.get("evidence_type") or "visual_atom") != str(
+                    current.get("evidence_type") or "visual_atom"
+                ):
+                    continue
+                previous_start = float(previous.get("cut_in_sec", 0) or 0)
+                previous_end = float(previous.get("cut_out_sec", 0) or 0)
+                overlap = min(previous_end, current_end) - max(previous_start, current_start)
+                if overlap <= 0:
+                    continue
+                overlap_ratio = overlap / max(
+                    0.001, min(previous_end - previous_start, current_duration)
+                )
+                previous_text = " ".join(str(
+                    previous.get("subject_action") or previous.get("visual_summary") or ""
+                ).casefold().split())
+                similarity = SequenceMatcher(None, previous_text, current_text).ratio()
+                if overlap_ratio >= 0.65 and similarity >= 0.58:
+                    duplicate_index = index
+                    break
+            if duplicate_index is None:
+                result.append(current)
+                continue
+            previous = result[duplicate_index]
+            previous_score = float(previous.get("quality_score", 0.5) or 0.5) + float(
+                previous.get("confidence", 0.5) or 0.5
+            )
+            current_score = float(current.get("quality_score", 0.5) or 0.5) + float(
+                current.get("confidence", 0.5) or 0.5
+            )
+            if current_score > previous_score:
+                result[duplicate_index] = current
+        return sorted(
+            result,
+            key=lambda item: (
+                int(item.get("source_order", 0) or 0),
+                float(item.get("cut_in_sec", 0) or 0),
+                float(item.get("cut_out_sec", 0) or 0),
+            ),
+        )
+
+    def _load_footage_ledger(
+        self,
+        ledger_path: Path,
+        raw_path: Path,
+    ) -> Optional[Dict[str, Any]]:
+        """Load a ledger only when source, model, sampling, and prompt match. / 仅在素材、模型、采样和提示完全一致时读取账本。"""
+        try:
+            payload = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            version = int(payload.get("visual_review_version", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        expected = build_evidence_fingerprint(raw_path, self.model)
+        candidates = payload.get("candidate_audit")
+        coverage = payload.get("asset_coverage")
+        if (
+            version < VISUAL_REVIEW_VERSION
+            or str(payload.get("evidence_fingerprint") or "") != expected
+            or not isinstance(candidates, list)
+            or not candidates
+            or not isinstance(coverage, list)
+        ):
+            return None
+        return payload
+
+    def _dense_refinement_prompt(
+        self,
+        item: Dict[str, Any],
+        review_start: float,
+        review_end: float,
+        frame_times: Sequence[float],
+    ) -> str:
+        """Build the literal dense-review prompt for capacity planning and execution. / 构建可同时用于容量规划与执行的密集复审提示。"""
+        return (
+            "DENSE TEMPORAL ATOM REVIEW. These are consecutive frames from one previously "
+            "observed event, not thumbnails. Locate the earliest readable action entry, the "
+            "visible action apex/reaction, and the clean exit before the action becomes static "
+            "or repeats. Keep the candidate unless it is technically unusable or the alleged "
+            "action is not visible. Use absolute source seconds only, stay within REVIEW RANGE, "
+            "preserve a complete gesture, and do not trim spoken words from a dialogue atom. "
+            "Infer no event between frames. Return JSON only.\n"
+            f"REVIEW RANGE: {review_start:.4f}-{review_end:.4f}\n"
+            f"ORIGINAL ATOM: {json.dumps(self._compact_story_evidence([item])[0], ensure_ascii=False, separators=(',', ':'))}\n"
+            f"FRAME TIMES IN IMAGE ORDER: {json.dumps(list(frame_times))}"
+        )
+
+    def _dense_refinement_sampling_plan(
+        self,
+        item: Dict[str, Any],
+        review_start: float,
+        review_end: float,
+    ) -> tuple[float, int]:
+        """
+        Choose the highest continuous sample rate that really fits vision Context.
+        选择在视觉 Context 中真实可请求的最高连续采样率。
+
+        The old fixed 28-frame request consumed about 43K visual tokens and was
+        rejected even at 32K. This planner budgets the exact dense prompt plus
+        image tokens, keeping at least two chronological samples or failing
+        explicitly instead of silently claiming a 4-fps review.
+        旧固定 28 帧约占 43K 视觉 token，32K 也必然失败；本方法用真实提示与图像
+        token 共同预算，至少保留两张连续帧，否则明确失败，绝不伪称完成 4fps 复审。
+        """
+        duration = max(0.001, float(review_end) - float(review_start))
+        desired_frames = min(28, max(2, int(math.floor(duration * 4.0)) + 1))
+        for frame_count in range(desired_frames, 1, -1):
+            sample_fps = min(4.0, (frame_count - 1) / duration)
+            if sample_fps <= 0:
+                continue
+            frame_times = [
+                round(min(review_end, review_start + index / sample_fps), 4)
+                for index in range(frame_count)
+            ]
+            prompt = self._dense_refinement_prompt(
+                item, review_start, review_end, frame_times
+            )
+            if self._request_has_multimodal_capacity(
+                prompt,
+                ATOM_REFINEMENT_SCHEMA,
+                frame_count,
+                reserve_output_tokens=1024,
+            ):
+                return sample_fps, frame_count
+        raise DirectorError(
+            "密集动作复审连两张连续帧也无法放入视觉 Context；拒绝静默降级。 / "
+            "Dense temporal review cannot fit even two consecutive frames; refusing "
+            "a silent degraded claim. " + self._context_capacity_guidance(self.model)
+        )
+
+    def _refine_event_atoms_temporally(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        assets: Sequence[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Rewatch concise visual atoms at up to 4 fps for human-scale trim points.
+        以最高 4 fps 重新审看短视觉动作，获得接近人工剪辑粒度的入点与出点。
+
+        Parameters / 参数:
+            candidates: Neutral 2-fps event atoms. / 中立 2fps 事件原子。
+            assets: Source/proxy paths and authoritative durations. / 源/代理路径及权威时长。
+
+        Returns / 返回:
+            Refined atoms and explicit rejected-atom audit records.
+            精修后的动作原子与明确记录的淘汰项。
+
+        Spoken thoughts longer than eight seconds retain Whisper timing instead
+        of pretending that a sparse visual pass can improve word boundaries.
+        超过八秒的完整台词保留 Whisper 时间码，不伪称稀疏画面能改善字词边界。
+        """
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.logger.warning(
+                "未找到 FFmpeg，跳过动作密集复审 / FFmpeg missing; skipping dense temporal refinement"
+            )
+            preserved: List[Dict[str, Any]] = []
+            for raw in candidates:
+                item = dict(raw)
+                item["temporal_refinement"] = {
+                    "version": TEMPORAL_REFINEMENT_VERSION,
+                    "status": "ffmpeg_unavailable",
+                }
+                preserved.append(item)
+            return preserved, []
+        asset_by_id = {
+            str(asset.get("asset_id") or ""): asset for asset in assets
+        }
+        refined: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
+        reviewable = [
+            item for item in candidates
+            if float(item.get("cut_out_sec", 0) or 0)
+            - float(item.get("cut_in_sec", 0) or 0) <= 8.0
+        ]
+        self.logger.info(
+            "动作密集复审：%d/%d 个短事件原子，最高 4 fps / Dense temporal review: %d/%d short atoms at up to 4 fps",
+            len(reviewable), len(candidates), len(reviewable), len(candidates),
+        )
+        for index, raw in enumerate(candidates, start=1):
+            item = dict(raw)
+            start = float(item.get("cut_in_sec", 0) or 0)
+            end = float(item.get("cut_out_sec", start) or start)
+            duration = max(0.0, end - start)
+            if duration > 8.0:
+                item["temporal_refinement"] = {
+                    "version": TEMPORAL_REFINEMENT_VERSION,
+                    "status": (
+                        "dialogue_timing_from_whisper"
+                        if bool(item.get("has_dialogue"))
+                        else "broad_context_atom_not_extended"
+                    ),
+                }
+                refined.append(item)
+                continue
+            asset = asset_by_id.get(str(item.get("asset_id") or ""), {})
+            authoritative_duration = self._authoritative_asset_duration(asset)
+            media_text = str(
+                asset.get("proxy_file_name") or asset.get("source_video") or item.get("file_name") or ""
+            ).strip()
+            media = Path(media_text).expanduser()
+            if not media.is_file():
+                item["temporal_refinement"] = {
+                    "version": TEMPORAL_REFINEMENT_VERSION,
+                    "status": "media_unavailable",
+                }
+                refined.append(item)
+                continue
+            review_start = max(0.0, start - 0.35)
+            review_end = min(
+                authoritative_duration if authoritative_duration > 0 else end + 0.35,
+                end + 0.35,
+            )
+            review_duration = max(0.25, review_end - review_start)
+            sample_fps, frame_budget = self._dense_refinement_sampling_plan(
+                item, review_start, review_end
+            )
+            self.logger.info(
+                "动作精修 %d/%d：%s %.3f-%.3fs @ %.2ffps，%d 帧（Context 自适应） / "
+                "Temporal refinement %d/%d at %.2f fps with %d context-safe frames",
+                index, len(candidates), media.name, review_start, review_end,
+                sample_fps, frame_budget, index, len(candidates), sample_fps,
+                frame_budget,
+            )
+            try:
+                with tempfile.TemporaryDirectory(prefix="cybereditor-atom-") as temporary:
+                    frame_root = Path(temporary)
+                    pattern = frame_root / "frame_%03d.jpg"
+                    completed = subprocess.run(
+                        [
+                            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                            "-ss", f"{review_start:.6f}", "-t", f"{review_duration:.6f}",
+                            "-i", str(media),
+                            "-vf", f"fps={sample_fps:.6f},scale=768:-2:flags=lanczos",
+                            "-frames:v", str(frame_budget), "-q:v", "4", str(pattern),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                    )
+                    frames = sorted(frame_root.glob("frame_*.jpg"))
+                    if completed.returncode != 0 or len(frames) < 2:
+                        item["temporal_refinement"] = {
+                            "version": TEMPORAL_REFINEMENT_VERSION,
+                            "status": "ffmpeg_failed",
+                            "detail": self._compact_prompt_text(completed.stderr, 240),
+                        }
+                        refined.append(item)
+                        continue
+                    images = [
+                        base64.b64encode(frame.read_bytes()).decode("ascii")
+                        for frame in frames
+                    ]
+                    frame_times = [
+                        round(review_start + frame_index / sample_fps, 4)
+                        for frame_index in range(len(frames))
+                    ]
+                    prompt = self._dense_refinement_prompt(
+                        item, review_start, review_end, frame_times
+                    )
+                    if not self._request_has_multimodal_capacity(
+                        prompt,
+                        ATOM_REFINEMENT_SCHEMA,
+                        len(images),
+                        reserve_output_tokens=1024,
+                    ):
+                        raise DirectorError(
+                            "FFmpeg 实际帧数超过密集复审 Context 预算，已在请求前阻止。 / "
+                            "Actual dense-review frames exceed the preflight budget."
+                        )
+                    response = self._request_json(
+                        prompt,
+                        ATOM_REFINEMENT_SCHEMA,
+                        images=images,
+                        model=self.model,
+                        progress_activity="temporal_atom_refinement",
+                    )
+            except (DirectorError, OSError, subprocess.SubprocessError) as exc:
+                # One malformed response must not discard an hours-long neutral
+                # evidence pass. Preserve the original atom and make the degraded
+                # refinement explicit in the ledger for later inspection.
+                # 单个响应异常不得抹掉数小时的中立审片；保留原事件并在账本中显式降级。
+                item["temporal_refinement"] = {
+                    "version": TEMPORAL_REFINEMENT_VERSION,
+                    "status": "refinement_failed_preserved",
+                    "detail": self._compact_prompt_text(str(exc), 300),
+                }
+                refined.append(item)
+                self.logger.warning(
+                    "动作精修失败但已保留原事件：%s / Dense refinement failed; original atom preserved",
+                    exc,
+                )
+                continue
+            try:
+                trim_in = self._finite_float(response.get("trim_in_sec"), "trim_in_sec")
+                apex = self._finite_float(response.get("action_apex_sec"), "action_apex_sec")
+                trim_out = self._finite_float(response.get("trim_out_sec"), "trim_out_sec")
+            except DirectorError:
+                trim_in, apex, trim_out = start, (start + end) / 2.0, end
+            trim_in = max(review_start, min(review_end, trim_in))
+            trim_out = max(review_start, min(review_end, trim_out))
+            apex = max(trim_in, min(trim_out, apex))
+            if not bool(response.get("keep")) or trim_out - trim_in < 0.4:
+                rejected.append({
+                    "asset_id": str(item.get("asset_id") or ""),
+                    "original_in_sec": start,
+                    "original_out_sec": end,
+                    "reason": self._compact_prompt_text(
+                        response.get("decision_reason") or "Dense temporal review rejected the atom.", 400
+                    ),
+                })
+                # Dense review is a trim assistant, not the creative director.
+                # A silent short-clip pass may flag quality, but it must never erase
+                # neutral evidence (especially dialogue) before story selection.
+                # 密集复审只负责时间边界，不得在导演选题前删除中立证据（尤其对白）。
+                item["temporal_refinement"] = {
+                    "version": TEMPORAL_REFINEMENT_VERSION,
+                    "status": "model_rejected_but_preserved",
+                    "decision_reason": self._compact_prompt_text(
+                        response.get("decision_reason"), 400
+                    ),
+                }
+                refined.append(item)
+                continue
+            # Dialogue boundaries come from Whisper and must not be shortened
+            # by a silent visual-only model. It may still enrich motion states.
+            if not bool(item.get("has_dialogue")):
+                item["cut_in_sec"] = round(trim_in, 3)
+                item["cut_out_sec"] = round(trim_out, 3)
+            item["entry_state"] = self._compact_prompt_text(response.get("entry_state"), 300)
+            item["action_apex"] = self._compact_prompt_text(response.get("action_apex"), 300)
+            item["exit_state"] = self._compact_prompt_text(response.get("exit_state"), 300)
+            item["screen_direction"] = self._enum_value(
+                response.get("screen_direction"),
+                {"left", "right", "toward_camera", "away_from_camera", "mixed", "none"},
+                "none",
+            )
+            item["action_apex_sec"] = round(apex, 3)
+            item["continuity_risk"] = self._compact_prompt_text(
+                response.get("continuity_risk"), 300
+            )
+            item["temporal_refinement"] = {
+                "version": TEMPORAL_REFINEMENT_VERSION,
+                "status": "dense_reviewed",
+                "sample_fps": round(sample_fps, 4),
+                "frame_count": len(frames),
+                "frame_budget": frame_budget,
+                "original_in_sec": round(start, 3),
+                "original_out_sec": round(end, 3),
+                "decision_reason": self._compact_prompt_text(
+                    response.get("decision_reason"), 400
+                ),
+            }
+            refined.append(item)
+        return refined, rejected
+
+    def _review_footage_neutrally(
+        self,
+        assets: Sequence[Dict[str, Any]],
+        raw_path: Path,
+        ledger_path: Path,
+    ) -> Dict[str, Any]:
+        """
+        Inspect every saved temporal sample before choosing any story.
+        在选择任何故事之前，按时间顺序审看全部已保存采样帧。
+
+        Parameters / 参数:
+            assets: Validated project assets. / 已校验项目素材。
+            raw_path: Combined extraction handoff. / 合并提取交接文件。
+            ledger_path: Durable neutral evidence output. / 持久化中立证据输出。
+        """
+        reusable = self._load_footage_ledger(ledger_path, raw_path)
+        if reusable is not None:
+            self._asset_continuity_summaries = {
+                str(key): str(value)
+                for key, value in (
+                    reusable.get("continuity_summaries", {}).items()
+                    if isinstance(reusable.get("continuity_summaries"), dict) else []
+                )
+            }
+            self._active_evidence_candidates = [
+                dict(item) for item in reusable["candidate_audit"]
+                if isinstance(item, dict)
+            ]
+            self.logger.info(
+                "证据指纹匹配，复用完整中立审片账本 / Reusing fingerprint-matched neutral footage ledger"
+            )
+            return reusable
+
+        chunks = self._build_visual_review_chunks(assets)
+        fingerprint = build_evidence_fingerprint(raw_path, self.model)
+        checkpoint_path = ledger_path.with_name("footage_ledger.checkpoint.json")
+        completed_chunks = self._load_director_checkpoint(
+            checkpoint_path, fingerprint
+        )
+        candidates: List[Dict[str, Any]] = []
+        self._asset_continuity_summaries = {}
+        coverage_by_asset: Dict[str, Dict[str, Any]] = {
+            str(asset.get("asset_id") or ""): {
+                "asset_id": str(asset.get("asset_id") or ""),
+                "source_order": source_order,
+                "file": Path(str(asset.get("source_video") or "")).name,
+                "duration_sec": round(float(asset.get("duration_sec", 0) or 0), 3),
+                "saved_visual_samples": len(asset.get("keyframes", [])),
+                "windows_reviewed": 0,
+                "empty_windows": 0,
+                "candidate_atom_count": 0,
+            }
+            for source_order, asset in enumerate(assets)
+        }
+        self.logger.info(
+            "中立完整审片：%d 个视频、%d 个连续窗口；导演阐述尚未生成 / "
+            "Neutral full review: %d videos, %d temporal windows; no treatment exists yet",
+            len(assets), len(chunks), len(assets), len(chunks),
+        )
+        self.check_ollama(require_vision=True)
+        for index, chunk in enumerate(chunks, start=1):
+            asset_id = str(chunk["asset_id"])
+            coverage = coverage_by_asset[asset_id]
+            coverage["windows_reviewed"] += 1
+            chunk["continuity_context"] = self._asset_continuity_summaries.get(
+                asset_id,
+                "This is the beginning of the source; no earlier visual state exists.",
+            )
+            chunk_key = self._director_chunk_key(chunk)
+            cached = completed_chunks.get(chunk_key)
+            if isinstance(cached, list):
+                cached_summary = next(
+                    (
+                        str(item.get("continuity_summary") or "").strip()
+                        for item in reversed(cached)
+                        if isinstance(item, dict)
+                        and str(item.get("continuity_summary") or "").strip()
+                    ),
+                    "",
+                )
+                if cached_summary:
+                    self._asset_continuity_summaries[asset_id] = cached_summary
+                actual = [
+                    dict(item) for item in cached
+                    if isinstance(item, dict) and not item.get("_coverage_only")
+                ]
+                if not actual:
+                    coverage["empty_windows"] += 1
+                candidates.extend(actual)
+                continue
+            self.logger.info(
+                "中立视觉审片 %d/%d：%s %.1fs-%.1fs / Neutral visual review %d/%d: %s %.1fs-%.1fs",
+                index, len(chunks), chunk["asset_label"], chunk["start_sec"], chunk["end_sec"],
+                index, len(chunks), chunk["asset_label"], chunk["start_sec"], chunk["end_sec"],
+            )
+            response = self.request_chunk(
+                chunk,
+                str(chunk["source_name"]),
+                schema=EVIDENCE_ATOM_SCHEMA,
+                include_images=True,
+                treatment=None,
+            )
+            decisions = self.validate_chunk_decisions(
+                response,
+                chunk,
+                str(chunk["source_name"]),
+                neutral_evidence=True,
+            )
+            summary = self._compact_prompt_text(
+                response.get("continuity_summary")
+                or self._local_continuity_summary(chunk, decisions),
+                2400,
+            )
+            self._asset_continuity_summaries[asset_id] = summary
+            for decision in decisions:
+                decision["asset_id"] = asset_id
+                decision["source_order"] = int(chunk["source_order"])
+                decision["continuity_summary"] = summary
+                decision["evidence_prompt_version"] = VISUAL_EVIDENCE_PROMPT_VERSION
+            if not decisions:
+                coverage["empty_windows"] += 1
+            candidates.extend(decisions)
+            checkpoint_records = [dict(item) for item in decisions] or [{
+                "_coverage_only": True,
+                "continuity_summary": summary,
+            }]
+            completed_chunks[chunk_key] = checkpoint_records
+            self._write_director_checkpoint(
+                checkpoint_path, fingerprint, completed_chunks
+            )
+
+        candidates = self._deduplicate_event_atoms(candidates)
+        candidates = self._sanitize_candidate_bounds(candidates, assets)
+        candidates = self._attach_candidate_dialogue(candidates, assets)
+        candidates = self._attach_complete_transcript_atoms(candidates, assets)
+        candidates, temporal_rejections = self._refine_event_atoms_temporally(
+            candidates, assets
+        )
+        candidates = self._sanitize_candidate_bounds(candidates, assets)
+        candidates = self._attach_candidate_dialogue(candidates, assets)
+        for index, candidate in enumerate(candidates, start=1):
+            candidate["candidate_id"] = f"C{index:04d}"
+            coverage_by_asset[str(candidate.get("asset_id") or "")][
+                "candidate_atom_count"
+            ] += 1
+        if not candidates:
+            raise DirectorError(
+                "完整中立审片没有识别出任何可读事件原子；拒绝虚构影片。"
+                " / Neutral full review found no readable event atoms; refusing to invent a film."
+            )
+        asset_coverage = []
+        for asset in assets:
+            item = coverage_by_asset[str(asset.get("asset_id") or "")]
+            item["disposition"] = (
+                "event_atoms_recorded"
+                if int(item["candidate_atom_count"]) > 0
+                else "reviewed_no_distinct_edit_atom"
+            )
+            item["review_conclusion"] = self._compact_prompt_text(
+                self._asset_continuity_summaries.get(str(item["asset_id"]), ""),
+                800,
+            )
+            asset_coverage.append(item)
+        temporal_refined_count = sum(
+            1
+            for item in candidates
+            if isinstance(item.get("temporal_refinement"), dict)
+            and item["temporal_refinement"].get("status") == "dense_reviewed"
+        )
+        temporal_attempted_count = len(
+            [
+                item for item in candidates
+                if isinstance(item.get("temporal_refinement"), dict)
+                and item["temporal_refinement"].get("status") not in {
+                    "dialogue_timing_from_whisper", "broad_context_atom_not_extended",
+                    "media_unavailable", "ffmpeg_unavailable",
+                }
+            ]
+        )
+        temporal_sample_rates = [
+            float(item["temporal_refinement"].get("sample_fps", 0) or 0)
+            for item in candidates
+            if isinstance(item.get("temporal_refinement"), dict)
+            and item["temporal_refinement"].get("status") == "dense_reviewed"
+        ]
+        ledger = {
+            "schema_version": "1.0",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "visual_review_version": VISUAL_REVIEW_VERSION,
+            "visual_prompt_version": VISUAL_EVIDENCE_PROMPT_VERSION,
+            "evidence_fingerprint": fingerprint,
+            "vision_model": self.model,
+            "mode": "neutral_complete_temporal_coverage",
+            "transport_batch_sec": 10.0,
+            "transport_overlap_sec": 1.0,
+            "transport_batch_count": len(chunks),
+            "saved_visual_sample_count": sum(
+                len(asset.get("keyframes", [])) for asset in assets
+            ),
+            "second_stage_frame_subsampling": True,
+            "temporal_refinement_version": TEMPORAL_REFINEMENT_VERSION,
+            "temporal_refinement_mode": (
+                "context_adaptive_dense_up_to_4fps_for_atoms_le_8s"
+                if temporal_refined_count
+                else "dense_refinement_not_completed_original_atoms_preserved"
+            ),
+            "temporal_refined_count": temporal_refined_count,
+            "temporal_refinement_attempted_count": temporal_attempted_count,
+            "temporal_refinement_failed_count": max(
+                0, temporal_attempted_count - temporal_refined_count
+            ),
+            "temporal_refinement_max_sample_fps": round(
+                max(temporal_sample_rates, default=0.0), 4
+            ),
+            "temporal_rejections": temporal_rejections,
+            "continuity_summaries": dict(self._asset_continuity_summaries),
+            "asset_coverage": asset_coverage,
+            "candidate_count": len(candidates),
+            "candidate_audit": candidates,
+        }
+        self._active_evidence_candidates = [dict(item) for item in candidates]
+        self._atomic_write_json(ledger, ledger_path)
+        try:
+            checkpoint_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self.logger.info(
+            "中立证据账本完成：%d 个动作/事件原子，%d/%d 条素材有候选 / "
+            "Neutral evidence ledger complete: %d atoms; %d/%d assets have candidates",
+            len(candidates),
+            sum(1 for item in asset_coverage if item["candidate_atom_count"]),
+            len(asset_coverage),
+            len(candidates),
+            sum(1 for item in asset_coverage if item["candidate_atom_count"]),
+            len(asset_coverage),
+        )
+        return ledger
+
     def _run_multi_asset(
         self,
         raw_data: Dict[str, Any],
@@ -1481,69 +2929,25 @@ class AIDirector:
         Run visual candidate selection followed by global story assembly.
         先执行视觉候选片段筛选，再进行全局故事编排。
 
-        Every saved one-fps visual sample is inspected exactly once in a small
-        overlapping transport batch. A rolling continuity summary carries the
-        whole source's state between calls. A second constrained model call sees
-        the completed source summaries and candidates from every asset.
+        The neutral ledger is produced before treatment and reused here only
+        when its source/model/prompt fingerprint matches. Story directing never
+        filters what the visual pass was allowed to observe.
 
-        每个已保存的一帧/秒视觉证据都会在小型重叠传输批次中被审看；滚动连续性摘要
-        在调用间携带整条素材状态。第二次受约束模型调用会看到完整素材摘要与全部候选。
+        中立证据账本先于导演阐述生成，且仅在素材/模型/提示指纹一致时复用；故事导演
+        不再反向限制视觉层允许观察的内容。
         """
         assets = raw_data["assets"]
-        chunks: List[Dict[str, Any]] = []
-        for asset_order, asset in enumerate(assets):
-            # Ollama cannot accept thousands of images in one request. These
-            # overlapping 16-second batches are transport envelopes only: no
-            # saved frame is sampled away, and continuity is carried forward.
-            # Ollama 无法一次接收数千张图片。16 秒重叠批次仅是传输容器：不会再次
-            # 抽样丢帧，并会把连续性状态传给下一批。
-            asset_chunks = self.chunk_raw_data(
-                asset, window_sec=16.0, overlap_sec=2.0
-            )
-            source_name = str(
-                asset.get("proxy_file_name")
-                or asset.get("source_video")
-                or ""
-            ).strip()
-            if not source_name:
-                raise DirectorError(
-                    f"素材 {asset.get('asset_id')} 缺少媒体路径 / asset has no media path."
-                )
-            for chunk in asset_chunks:
-                chunk["asset_id"] = str(asset["asset_id"])
-                chunk["source_name"] = source_name
-                chunk["source_video"] = str(asset.get("source_video") or "")
-                chunk["asset_label"] = Path(
-                    str(asset.get("source_video") or source_name)
-                ).name
-                chunk["source_order"] = asset_order
-                chunks.append(chunk)
-
-        checkpoint_path = destination.with_name(
-            destination.stem + ".director-checkpoint.json"
-        )
-        checkpoint_fingerprint = self._checkpoint_fingerprint(raw_path)
-        completed_chunks = self._load_director_checkpoint(
-            checkpoint_path, checkpoint_fingerprint
-        )
-        if completed_chunks:
-            self.logger.info(
-                "已恢复 %d 个导演分块检查点；不会重复分析 / Resuming %d completed director chunks",
-                len(completed_chunks),
-                len(completed_chunks),
-            )
-
-        self.logger.info(
-            "多素材视觉导演：%d 个视频，%d 个分块 / Multi-asset visual director: %d videos, %d chunks",
-            len(assets),
-            len(chunks),
-            len(assets),
-            len(chunks),
-        )
-        candidates: List[Dict[str, Any]] = []
-        self._asset_continuity_summaries = {}
+        ledger_anchor = self.treatment_path or destination
+        ledger_path = self._footage_ledger_path(ledger_anchor)
         try:
-            self.check_ollama(require_vision=True)
+            ledger = self._review_footage_neutrally(
+                assets, raw_path, ledger_path
+            )
+            candidates = [
+                dict(item) for item in ledger.get("candidate_audit", [])
+                if isinstance(item, dict)
+            ]
+            self._active_evidence_candidates = candidates
             self._music_analysis = self.load_music_analysis()
             analyzed_tracks = self._music_analysis.get("tracks", [])
             self._music_files = [
@@ -1551,113 +2955,207 @@ class AIDirector:
                 for item in analyzed_tracks
                 if isinstance(item, dict) and str(item.get("file_name") or "").strip()
             ] or self.discover_music_files()
-            treatment = self.load_treatment(assets)
-            self._active_treatment = treatment
-            for index, chunk in enumerate(chunks, start=1):
-                asset_id = str(chunk["asset_id"])
-                chunk["continuity_context"] = self._asset_continuity_summaries.get(
-                    asset_id,
-                    "This is the beginning of the source; no earlier visual state exists.",
-                )
-                chunk_key = self._director_chunk_key(chunk)
-                cached_decisions = completed_chunks.get(chunk_key)
-                if isinstance(cached_decisions, list):
-                    self.logger.info(
-                        "复用视觉分析 %d/%d：%s / Reusing visual analysis %d/%d: %s",
-                        index,
-                        len(chunks),
-                        chunk["asset_label"],
-                        index,
-                        len(chunks),
-                        chunk["asset_label"],
-                    )
-                    cached_summary = next(
-                        (
-                            str(item.get("continuity_summary") or "").strip()
-                            for item in reversed(cached_decisions)
-                            if isinstance(item, dict)
-                            and str(item.get("continuity_summary") or "").strip()
-                        ),
-                        "",
-                    )
-                    if cached_summary:
-                        self._asset_continuity_summaries[asset_id] = cached_summary
-                    candidates.extend(dict(item) for item in cached_decisions)
-                    continue
-                self.logger.info(
-                    "视觉分析 %d/%d：%s %.1fs–%.1fs / Visual analysis %d/%d: %s %.1fs–%.1fs",
-                    index,
-                    len(chunks),
-                    chunk["asset_label"],
-                    chunk["start_sec"],
-                    chunk["end_sec"],
-                    index,
-                    len(chunks),
-                    chunk["asset_label"],
-                    chunk["start_sec"],
-                    chunk["end_sec"],
-                )
-                response_payload = self.request_chunk(
-                    chunk,
-                    str(chunk["source_name"]),
-                    schema=CANDIDATE_SCHEMA,
-                    include_images=True,
-                    treatment=treatment,
-                )
-                decisions = self.validate_chunk_decisions(
-                    response_payload,
-                    chunk,
-                    str(chunk["source_name"]),
-                )
-                continuity_summary = self._compact_prompt_text(
-                    response_payload.get("continuity_summary")
-                    or self._local_continuity_summary(chunk, decisions),
-                    1200,
-                )
-                self._asset_continuity_summaries[asset_id] = continuity_summary
-                for decision in decisions:
-                    decision["asset_id"] = asset_id
-                    decision["source_order"] = int(chunk["source_order"])
-                    decision["continuity_summary"] = continuity_summary
-                candidates.extend(decisions)
-                completed_chunks[chunk_key] = [dict(item) for item in decisions]
-                self._write_director_checkpoint(
-                    checkpoint_path,
-                    checkpoint_fingerprint,
-                    completed_chunks,
-                )
-
-            candidates = self.merge_decisions(candidates)
-            candidates = self._sanitize_candidate_bounds(candidates, assets)
-            candidates = self._attach_candidate_dialogue(candidates, assets)
-            # Do not discard footage with a fixed score-based shortlist. Every
-            # candidate receives a stable id and is considered by the text
-            # director. request_sequence() either sends the complete ledger in
-            # one request or uses context-safe director review pages.
-            # 不再用固定分数上限提前丢弃镜头；每个候选都会进入文字导演流程。
-            candidates = sorted(
-                candidates,
-                key=lambda item: (
-                    int(item.get("source_order", 0) or 0),
-                    float(item.get("cut_in_sec", 0) or 0),
-                    float(item.get("cut_out_sec", 0) or 0),
-                ),
-            )
-            for index, candidate in enumerate(candidates, start=1):
-                candidate["candidate_id"] = f"C{index:04d}"
-            if not candidates:
-                raise DirectorError(
-                    "视觉导演未找到任何可用片段 / Visual director found no usable clips."
-                )
             if self.text_model.casefold() != self.model.casefold():
                 self.logger.info(
-                    "视觉候选完成，卸载 %s 后加载文字导演 %s / Switching from vision to text director",
+                    "完整视觉证据就绪，卸载 %s 后加载文字导演 %s / Switching from vision to text director",
                     self.model,
                     self.text_model,
                 )
                 self.unload_model(self.model)
                 self.check_ollama(model=self.text_model)
-            sequence_payload = self.request_sequence(candidates, assets, treatment)
+            else:
+                self.check_ollama(model=self.text_model)
+            if self.treatment_path is None:
+                concepts = self.request_story_concepts(
+                    assets, candidates, ledger.get("asset_coverage", [])
+                )
+                concept_rows = [
+                    item for item in concepts.get("concepts", [])
+                    if isinstance(item, dict)
+                ]
+                preferred_id = str(concepts.get("selected_concept_id") or "")
+                attempt_ids = [preferred_id] + [
+                    str(item.get("concept_id") or "")
+                    for item in sorted(
+                        concept_rows,
+                        key=lambda item: int(item.get("feasibility_score", 0) or 0),
+                        reverse=True,
+                    )
+                    if str(item.get("concept_id") or "") != preferred_id
+                ]
+                concept_attempts: List[Dict[str, Any]] = []
+                treatment = {}
+                sequence_payload = {}
+                for concept_attempt, concept_id in enumerate(attempt_ids, start=1):
+                    attempt_tournament = dict(concepts)
+                    attempt_tournament["selected_concept_id"] = concept_id
+                    if concept_attempt > 1:
+                        attempt_tournament["selection_reason"] = (
+                            "The higher-ranked concept failed the blind-viewer editorial gate; "
+                            "testing the next independently grounded concept."
+                        )
+                        self.logger.warning(
+                            "首选构想未通过成片质量门，改试构想 %d/%d：%s / "
+                            "Preferred concept failed; trying concept %d/%d: %s",
+                            concept_attempt,
+                            len(attempt_ids),
+                            concept_id,
+                            concept_attempt,
+                            len(attempt_ids),
+                            concept_id,
+                        )
+                    self._active_concept_tournament = attempt_tournament
+                    treatment_payload = self.request_treatment(
+                        assets,
+                        evidence_candidates=candidates,
+                        concept_tournament=attempt_tournament,
+                        asset_coverage=ledger.get("asset_coverage", []),
+                    )
+                    attempted_treatment = self.validate_treatment(
+                        treatment_payload, assets
+                    )
+                    attempted_treatment["concept_tournament"] = attempt_tournament
+                    attempted_treatment["selected_concept_id"] = concept_id
+                    attempted_treatment["footage_ledger"] = str(ledger_path)
+                    attempted_treatment["evidence_fingerprint"] = ledger[
+                        "evidence_fingerprint"
+                    ]
+                    self._active_treatment = attempted_treatment
+                    try:
+                        attempted_sequence = self.request_sequence(
+                            candidates, assets, attempted_treatment
+                        )
+                    except EditorialQualityError as exc:
+                        concept_attempts.append(
+                            {
+                                "concept_id": concept_id,
+                                "status": "failed_editorial_gate",
+                                "violations": list(exc.violations),
+                                "metrics": dict(exc.metrics),
+                                "blind_viewer_review": dict(exc.blind_review),
+                            }
+                        )
+                        continue
+                    concept_attempts.append(
+                        {"concept_id": concept_id, "status": "passed"}
+                    )
+                    treatment = attempted_treatment
+                    treatment["concept_attempt_audit"] = concept_attempts
+                    sequence_payload = attempted_sequence
+                    break
+                if not treatment or not sequence_payload:
+                    raise DirectorError(
+                        "三种证据化构想及其重剪均未通过陌生观众质量门；已在进入 Resolve "
+                        "前停止，请提供更明确主题或检查 footage_ledger.json。 / All three "
+                        "evidence-backed concepts failed the blind-viewer gate; stopped before Resolve."
+                    )
+            else:
+                treatment = self.load_treatment(assets)
+                self._require_treatment_evidence_fingerprint(
+                    treatment, str(ledger["evidence_fingerprint"])
+                )
+                self._active_treatment = treatment
+                try:
+                    sequence_payload = self.request_sequence(
+                        candidates, assets, treatment
+                    )
+                except EditorialQualityError as first_failure:
+                    tournament = treatment.get("concept_tournament")
+                    tournament = tournament if isinstance(tournament, dict) else {}
+                    original_id = str(
+                        treatment.get("selected_concept_id")
+                        or tournament.get("selected_concept_id")
+                        or ""
+                    )
+                    alternatives = [
+                        str(item.get("concept_id") or "")
+                        for item in sorted(
+                            (
+                                item for item in tournament.get("concepts", [])
+                                if isinstance(item, dict)
+                            ),
+                            key=lambda item: int(
+                                item.get("feasibility_score", 0) or 0
+                            ),
+                            reverse=True,
+                        )
+                        if str(item.get("concept_id") or "")
+                        and str(item.get("concept_id") or "") != original_id
+                    ]
+                    concept_attempts = [
+                        {
+                            "concept_id": original_id,
+                            "status": "failed_editorial_gate",
+                            "violations": list(first_failure.violations),
+                            "metrics": dict(first_failure.metrics),
+                            "blind_viewer_review": dict(
+                                first_failure.blind_review
+                            ),
+                        }
+                    ]
+                    sequence_payload = {}
+                    for offset, concept_id in enumerate(alternatives, start=2):
+                        self.logger.warning(
+                            "已保存的首选构想未通过成片质量门，改试构想 %d/%d：%s / "
+                            "Saved preferred concept failed; trying %d/%d: %s",
+                            offset,
+                            len(alternatives) + 1,
+                            concept_id,
+                            offset,
+                            len(alternatives) + 1,
+                            concept_id,
+                        )
+                        attempt_tournament = dict(tournament)
+                        attempt_tournament["selected_concept_id"] = concept_id
+                        attempt_tournament["selection_reason"] = (
+                            "The previously selected concept failed the blind-viewer gate; "
+                            "testing the next grounded concept."
+                        )
+                        treatment_payload = self.request_treatment(
+                            assets,
+                            evidence_candidates=candidates,
+                            concept_tournament=attempt_tournament,
+                            asset_coverage=ledger.get("asset_coverage", []),
+                        )
+                        attempted_treatment = self.validate_treatment(
+                            treatment_payload, assets
+                        )
+                        attempted_treatment["concept_tournament"] = attempt_tournament
+                        attempted_treatment["selected_concept_id"] = concept_id
+                        attempted_treatment["footage_ledger"] = str(ledger_path)
+                        attempted_treatment["evidence_fingerprint"] = ledger[
+                            "evidence_fingerprint"
+                        ]
+                        self._active_treatment = attempted_treatment
+                        try:
+                            attempted_sequence = self.request_sequence(
+                                candidates, assets, attempted_treatment
+                            )
+                        except EditorialQualityError as exc:
+                            concept_attempts.append(
+                                {
+                                    "concept_id": concept_id,
+                                    "status": "failed_editorial_gate",
+                                    "violations": list(exc.violations),
+                                    "metrics": dict(exc.metrics),
+                                    "blind_viewer_review": dict(exc.blind_review),
+                                }
+                            )
+                            continue
+                        concept_attempts.append(
+                            {"concept_id": concept_id, "status": "passed"}
+                        )
+                        treatment = attempted_treatment
+                        treatment["concept_attempt_audit"] = concept_attempts
+                        sequence_payload = attempted_sequence
+                        break
+                    if not sequence_payload:
+                        raise DirectorError(
+                            "已保存构想及其全部证据化备选均未通过陌生观众质量门；"
+                            "已在 Resolve 前停止。 / The saved concept and every grounded "
+                            "alternative failed the blind-viewer gate; stopped before Resolve."
+                        )
+            self._active_treatment = treatment
             final_clips = self.validate_sequence(
                 sequence_payload, candidates, treatment
             )
@@ -1674,6 +3172,22 @@ class AIDirector:
         music_plan = self.validate_music_plan(
             sequence_payload.get("music_plan"), program_duration
         )
+        final_clips = self.snap_visual_cuts_to_beats(
+            final_clips, music_plan, assets
+        )
+        # Keep the normal and reassembly paths identical: ducking must consume
+        # dialogue ranges derived from the final, post-snap source boundaries.
+        # 正常与重组路径都必须让 ducking 使用卡点后的最终对白范围。
+        final_clips = self._attach_candidate_dialogue(final_clips, assets)
+        program_duration = sum(
+            max(
+                0.0,
+                float(item.get("cut_out_sec", 0))
+                - float(item.get("cut_in_sec", 0)),
+            )
+            for item in final_clips
+        )
+        music_plan["program_duration_sec"] = round(program_duration, 4)
         music_plan = self.enforce_dialogue_ducking(final_clips, music_plan)
         music_plan = self.enrich_music_sync_points(final_clips, music_plan)
         graphics_plan = self.validate_graphics_plan(
@@ -1730,17 +3244,42 @@ class AIDirector:
             "chunk_duration_sec": self.chunk_duration_sec,
             "asset_count": len(assets),
             "visual_review": {
-                "mode": "continuous_all_saved_samples",
+                "mode": "neutral_complete_temporal_coverage",
                 "candidate_audit_complete": True,
-                "candidate_audit_version": 2,
-                "transport_batch_sec": 16.0,
-                "transport_overlap_sec": 2.0,
-                "transport_batch_count": len(chunks),
-                "saved_visual_sample_count": sum(
-                    len(asset.get("keyframes", [])) for asset in assets
+                "candidate_audit_version": VISUAL_REVIEW_VERSION,
+                "visual_prompt_version": VISUAL_EVIDENCE_PROMPT_VERSION,
+                "evidence_fingerprint": ledger["evidence_fingerprint"],
+                "transport_batch_sec": ledger["transport_batch_sec"],
+                "transport_overlap_sec": ledger["transport_overlap_sec"],
+                "transport_batch_count": ledger["transport_batch_count"],
+                "saved_visual_sample_count": ledger["saved_visual_sample_count"],
+                "second_stage_frame_subsampling": bool(
+                    ledger.get("second_stage_frame_subsampling")
                 ),
-                "second_stage_frame_subsampling": False,
+                "temporal_refinement_version": str(
+                    ledger.get("temporal_refinement_version") or ""
+                ),
+                "temporal_refinement_mode": str(
+                    ledger.get("temporal_refinement_mode") or ""
+                ),
+                "temporal_refined_count": int(
+                    ledger.get("temporal_refined_count", 0) or 0
+                ),
+                "temporal_refinement_attempted_count": int(
+                    ledger.get("temporal_refinement_attempted_count", 0) or 0
+                ),
+                "temporal_refinement_failed_count": int(
+                    ledger.get("temporal_refinement_failed_count", 0) or 0
+                ),
+                "temporal_refinement_max_sample_fps": float(
+                    ledger.get("temporal_refinement_max_sample_fps", 0) or 0
+                ),
+                "temporal_rejections": list(
+                    ledger.get("temporal_rejections", [])
+                ),
                 "continuity_summaries": dict(self._asset_continuity_summaries),
+                "asset_coverage": list(ledger.get("asset_coverage", [])),
+                "footage_ledger": str(ledger_path),
             },
             "candidate_count": len(candidates),
             "candidate_audit": candidates,
@@ -1770,14 +3309,6 @@ class AIDirector:
             "clips": final_clips,
         }
         self._atomic_write_json(output, destination)
-        try:
-            checkpoint_path.unlink(missing_ok=True)
-        except OSError as exc:
-            self.logger.warning(
-                "无法删除已完成的导演检查点：%s / Could not remove completed director checkpoint: %s",
-                exc,
-                exc,
-            )
         self.logger.info(
             "全局编排完成：从 %d 个候选中选出 %d 个片段 / Global assembly selected %d of %d candidates",
             len(candidates),
@@ -1990,6 +3521,25 @@ class AIDirector:
         if not isinstance(keyframes, list):
             asset["keyframes"] = []
             keyframes = []
+        sampling = asset.get("visual_sampling")
+        if isinstance(sampling, dict) and (
+            sampling.get("mode") == "continuous_temporal_coverage"
+            and sampling.get("complete_source_span") is not True
+        ):
+            raise DirectorError(
+                f"{prefix}.visual_sampling 没有完整覆盖素材时间轴；请重新运行提取。"
+                " / visual sampling is incomplete; rerun extraction."
+            )
+        if isinstance(sampling, dict):
+            try:
+                recorded_count = int(sampling.get("saved_frame_count", len(keyframes)))
+            except (TypeError, ValueError):
+                recorded_count = -1
+            if recorded_count != len(keyframes):
+                raise DirectorError(
+                    f"{prefix}.visual_sampling 帧数与关键帧清单不一致；缓存可能损坏。"
+                    " / saved-frame count does not match the keyframe ledger."
+                )
         if not transcript and not keyframes:
             raise DirectorError(
                 f"{prefix} 没有台词或关键帧 / has no transcript or keyframes."
@@ -2136,6 +3686,138 @@ class AIDirector:
             result.append(item)
         return result
 
+    def _attach_complete_transcript_atoms(
+        self,
+        candidates: Sequence[Dict[str, Any]],
+        assets: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Preserve every complete Whisper segment independently of visual windows.
+        将每条完整 Whisper 语段独立保留，不受视觉传输窗口边界影响。
+
+        Parameters / 参数:
+            candidates: Neutral visual atoms with dialogue overlaps. / 已附对白重叠的视觉原子。
+            assets: Full extracted transcripts and source identities. / 完整字幕与素材身份。
+
+        A 10-second image transport window must never cut a 25-second spoken
+        thought into fragments.  Short segments already wholly represented by
+        one visual atom are not duplicated; every other complete segment becomes
+        a neutral transcript atom for the later text director to accept or reject.
+
+        10 秒图像传输窗口绝不能截断 25 秒完整表达。已被单个视觉原子完整覆盖的短语段
+        不重复；其余完整语段都会成为中立字幕原子，是否采用仍由后续导演决定。
+        """
+        result = [dict(item) for item in candidates if isinstance(item, dict)]
+        visual_by_asset: Dict[str, List[Dict[str, Any]]] = {}
+        for item in result:
+            visual_by_asset.setdefault(str(item.get("asset_id") or ""), []).append(item)
+        added = 0
+        for source_order, asset in enumerate(assets):
+            asset_id = str(asset.get("asset_id") or "")
+            source_name = str(
+                asset.get("proxy_file_name") or asset.get("source_video") or ""
+            ).strip()
+            duration = self._authoritative_asset_duration(asset)
+            visual_atoms = visual_by_asset.get(asset_id, [])
+            for segment_index, raw_segment in enumerate(asset.get("transcript", [])):
+                if not isinstance(raw_segment, dict):
+                    continue
+                try:
+                    start = max(0.0, float(raw_segment.get("start_sec", 0) or 0))
+                    end = float(raw_segment.get("end_sec", start) or start)
+                except (TypeError, ValueError):
+                    continue
+                if duration > 0:
+                    end = min(end, duration)
+                text = " ".join(str(raw_segment.get("text") or "").split())
+                if end - start < 0.2 or not text:
+                    continue
+                segment_duration = end - start
+                covering = next(
+                    (
+                        item for item in visual_atoms
+                        if min(end, float(item.get("cut_out_sec", 0) or 0))
+                        - max(start, float(item.get("cut_in_sec", 0) or 0))
+                        >= segment_duration * 0.98
+                    ),
+                    None,
+                )
+                if covering is not None:
+                    continue
+                nearest: Dict[str, Any] = {}
+                nearest_overlap = 0.0
+                for visual_atom in visual_atoms:
+                    overlap = max(
+                        0.0,
+                        min(end, float(visual_atom.get("cut_out_sec", 0) or 0))
+                        - max(start, float(visual_atom.get("cut_in_sec", 0) or 0)),
+                    )
+                    if overlap >= 0.15 and overlap > nearest_overlap:
+                        nearest = visual_atom
+                        nearest_overlap = overlap
+                excerpt = self._compact_prompt_text(text, 500)
+                atom = {
+                    "asset_id": asset_id,
+                    "source_order": source_order,
+                    "file_name": source_name,
+                    "cut_in_sec": round(start, 3),
+                    "cut_out_sec": round(end, 3),
+                    "evidence_type": "transcript_atom",
+                    "literal_observation": f"Timestamped spoken segment: {excerpt}",
+                    "visual_summary": self._compact_prompt_text(
+                        nearest.get("visual_summary")
+                        or "Visual state is represented by overlapping neutral visual atoms.",
+                        260,
+                    ),
+                    "subject_action": f"Speaker says: {excerpt}",
+                    "emotion": self._compact_prompt_text(
+                        nearest.get("emotion") or "Not determined from transcript alone.", 120
+                    ),
+                    "entry_state": "The timestamped spoken thought begins.",
+                    "action_apex": self._compact_prompt_text(text, 260),
+                    "exit_state": "The timestamped spoken thought ends.",
+                    "screen_direction": str(nearest.get("screen_direction") or "none"),
+                    "identity_tags": list(nearest.get("identity_tags") or [])[:8],
+                    "action_phase": "development",
+                    "shot_scale": str(nearest.get("shot_scale") or "medium"),
+                    "camera_motion": str(nearest.get("camera_motion") or "static"),
+                    "continuity_tags": ["complete_transcript_segment"],
+                    "technical_readability": "clear",
+                    "confidence": 0.95,
+                    "quality_score": 0.8,
+                    "has_dialogue": True,
+                    "dialogue_excerpt": self._compact_prompt_text(
+                        f"[{start:.1f}-{end:.1f}] {text}", 520
+                    ),
+                    "dialogue_ranges_sec": [
+                        {
+                            "start_sec": round(start, 3),
+                            "end_sec": round(end, 3),
+                            "text": self._compact_prompt_text(text, 400),
+                        }
+                    ],
+                    "transcript_segment_index": segment_index,
+                    "production_context_hint": False,
+                }
+                atom["production_context_hint"] = self._is_production_chatter(atom)
+                result.append(atom)
+                added += 1
+        if added:
+            self.logger.info(
+                "已补入 %d 个跨视觉窗口的完整字幕原子 / "
+                "Added %d complete transcript atoms spanning visual windows",
+                added,
+                added,
+            )
+        return sorted(
+            result,
+            key=lambda item: (
+                int(item.get("source_order", 0) or 0),
+                float(item.get("cut_in_sec", 0) or 0),
+                0 if item.get("evidence_type") == "visual_atom" else 1,
+            ),
+        )
+
     def _normalize_coverage_synopsis(
         self,
         payload: Dict[str, Any],
@@ -2190,6 +3872,34 @@ class AIDirector:
                 ]
             normalized["continuity_risks"] = continuity_risks
             normalized["absent_or_unproven_events"] = absent_events
+            if (
+                (not isinstance(normalized.get("event_timeline"), list)
+                 or not normalized["event_timeline"])
+                and self._active_evidence_candidates
+            ):
+                normalized["event_timeline"] = [
+                    {
+                        "asset_id": str(item.get("asset_id") or ""),
+                        "source_order": int(item.get("source_order", 0) or 0),
+                        "event": self._compact_prompt_text(
+                            item.get("subject_action") or item.get("visual_summary"), 500
+                        ),
+                        "story_meaning": "Literal neutral-review event; meaning remains for the director to determine.",
+                    }
+                    for item in self._active_evidence_candidates[:24]
+                ]
+            if (
+                (not isinstance(normalized.get("visual_motifs"), list)
+                 or not normalized["visual_motifs"])
+                and self._active_evidence_candidates
+            ):
+                normalized["visual_motifs"] = list(dict.fromkeys(
+                    "{} {}".format(
+                        str(item.get("shot_scale") or "medium"),
+                        str(item.get("camera_motion") or "static"),
+                    )
+                    for item in self._active_evidence_candidates
+                ))[:10]
             return normalized
 
         memory = payload.get("project_memory")
@@ -2362,35 +4072,76 @@ class AIDirector:
             treatment: Preliminary creative hypothesis. / 初步创作假设。
         """
         previous_review = self._rough_cut_feedback or {}
-        prompt = (
-            "EVIDENCE-FIRST STORY CONTRACT. Act as an archivist/producer, not as the "
-            "editor who will later defend a cut. Reconcile the preliminary treatment with "
-            "the literal candidate evidence. Each causal_chain item must cite one supplied "
-            "candidate_id and describe a visible or audible state change. Three distinct "
-            "state changes are required before has_causal_arc may be true. Routine setup talk, "
-            "a pose, a countdown, readiness, or a title is not automatically a consequence. "
-            "If the evidence has no causal arc, choose mood_montage or character_vignette and "
-            "do not preserve explanatory production chatter merely to manufacture a story. "
-            "For bts_process, the chain must show an actual problem, attempt, and observed result. "
-            "Put every promised but unseen event in unsupported_promises. Define three to six "
-            "viewer-testable success criteria. The preliminary treatment is only a hypothesis "
-            "and must be rejected where evidence conflicts. Return JSON only.\n"
-            f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
-            f"PRELIMINARY TREATMENT: {json.dumps(treatment, ensure_ascii=False, separators=(',', ':'))}\n"
-            f"FULL-FOOTAGE AUDIT: {json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
-            f"PREVIOUS RENDERED ROUGH-CUT REVIEW: {json.dumps(previous_review, ensure_ascii=False, separators=(',', ':'))}\n"
-            f"COMPLETE CANDIDATE EVIDENCE: {json.dumps(candidates, ensure_ascii=False, separators=(',', ':'))}"
-        )
+        def contract_prompt(
+            prompt_candidates: Sequence[Dict[str, Any]], evidence_label: str
+        ) -> str:
+            return (
+                "EVIDENCE-FIRST STORY CONTRACT. Act as an archivist/producer, not as the "
+                "editor who will later defend a cut. Reconcile the preliminary treatment with "
+                "the literal candidate evidence. Each causal_chain item must cite one supplied "
+                "candidate_id and describe a visible or audible state change. Three distinct "
+                "state changes are required before has_causal_arc may be true. Routine setup talk, "
+                "a pose, a countdown, readiness, or a title is not automatically a consequence. "
+                "If the evidence has no causal arc, choose mood_montage or character_vignette and "
+                "do not preserve explanatory production chatter merely to manufacture a story. "
+                "For bts_process, the chain must show an actual problem, attempt, and observed result. "
+                "Put every promised but unseen event in unsupported_promises. Define three to six "
+                "viewer-testable success criteria. The preliminary treatment is only a hypothesis "
+                "and must be rejected where evidence conflicts. Return JSON only.\n"
+                f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
+                f"PRELIMINARY TREATMENT: {json.dumps(treatment, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"FULL-FOOTAGE AUDIT: {json.dumps(coverage_synopsis, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"PREVIOUS RENDERED ROUGH-CUT REVIEW: {json.dumps(previous_review, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"{evidence_label}: {json.dumps(list(prompt_candidates), ensure_ascii=False, separators=(',', ':'))}"
+            )
+
+        prompt_candidates = list(candidates)
+        evidence_scope = "complete_candidate_ledger"
+        prompt = contract_prompt(prompt_candidates, "COMPLETE CANDIDATE EVIDENCE")
         if not self._request_has_capacity(
             prompt,
             NARRATIVE_CONTRACT_SCHEMA,
             model=self.text_model,
             reserve_output_tokens=1536,
         ):
-            raise DirectorError(
-                "事件证据契约无法完整放入当前 Context；请提高 Context。"
-                " / Evidence-first narrative contract does not fit the current Context."
+            tournament = self._active_concept_tournament
+            selected_id = str(tournament.get("selected_concept_id") or "")
+            selected_concept = next(
+                (
+                    item for item in tournament.get("concepts", [])
+                    if isinstance(item, dict)
+                    and str(item.get("concept_id") or "") == selected_id
+                ),
+                {},
             )
+            proof_ids = set(
+                str(value) for value in selected_concept.get("proof_candidate_ids", [])
+            )
+            proof_ids.add(str(selected_concept.get("ending_candidate_id") or ""))
+            prompt_candidates = [
+                item for item in candidates
+                if str(item.get("candidate_id") or "") in proof_ids
+            ]
+            if not prompt_candidates:
+                raise DirectorError(
+                    "事件契约超过 Context，且优胜构想没有可回查证据；请提高 Context。"
+                    " / Contract exceeds Context and the winning concept has no retrievable proof."
+                )
+            evidence_scope = "winning_concept_proof_after_all_atom_review"
+            prompt = contract_prompt(
+                prompt_candidates,
+                "WINNING-CONCEPT PROOF (all candidates were reviewed upstream)",
+            )
+            if not self._request_has_capacity(
+                prompt,
+                NARRATIVE_CONTRACT_SCHEMA,
+                model=self.text_model,
+                reserve_output_tokens=1536,
+            ):
+                raise DirectorError(
+                    "优胜构想的事件契约仍无法放入当前 Context；请提高 Context。"
+                    " / Winning-concept contract evidence still exceeds Context."
+                )
         self.logger.info(
             "正在建立逐事件证据契约 / Building cited event-by-event narrative contract"
         )
@@ -2400,9 +4151,13 @@ class AIDirector:
             model=self.text_model,
             progress_activity="narrative_contract",
         )
-        return self._normalize_narrative_contract(
+        normalized = self._normalize_narrative_contract(
             payload, candidates, coverage_synopsis
         )
+        normalized["evidence_scope"] = evidence_scope
+        normalized["prompt_candidate_count"] = len(prompt_candidates)
+        normalized["all_candidate_count"] = len(candidates)
+        return normalized
 
     @staticmethod
     def _blind_storyboard(
@@ -2852,38 +4607,12 @@ class AIDirector:
                 f"Measured preserved-dialogue ratio is {dialogue_ratio:.1%}; "
                 "this is not an evidence-supported dialogue-led film and must be <=55%."
             )
-        elif (
-            not dialogue_led
-            and (duration >= 15.0 or clip_count >= 4)
-            and dialogue_ratio > 0.72
-        ):
-            violations.append(
-                f"Measured audible-speech ratio is {dialogue_ratio:.1%}; no interview or "
-                "explicit evidence-supported dialogue-led structure justifies that dominance."
-            )
-        chatter_ratio = float(metrics.get("production_chatter_ratio", 0) or 0)
-        narrative_mode = str(
-            narrative_contract.get("narrative_mode") or ""
-        ).casefold()
-        chain = narrative_contract.get("causal_chain")
-        chain = chain if isinstance(chain, list) else []
-        if (
-            not dialogue_led
-            and chatter_ratio > 0.35
-            and narrative_mode != "bts_process"
-        ):
-            violations.append(
-                f"Production-process chatter occupies {chatter_ratio:.1%} of the film, "
-                "but the evidence contract did not choose a BTS process story."
-            )
-        elif chatter_ratio > 0.60 and (
-            narrative_mode != "bts_process" or len(chain) < 3
-        ):
-            violations.append(
-                f"Production-process chatter occupies {chatter_ratio:.1%}; a BTS cut may "
-                "keep that much only when at least three cited state changes prove a "
-                "problem-attempt-result progression."
-            )
+        # ``production_context_hint`` is evidence for the director, never a
+        # Python censorship rule.  Set talk can be premise, texture, comedy,
+        # contrast, or noise; only the authored audio_intent and the blind-viewer
+        # coherence review may decide whether it works in this particular film.
+        # ``production_context_hint`` 只向导演提供证据，绝不是 Python 自动删词规则；
+        # 现场讨论可能是主题、质感、喜剧或干扰，最终完全服从导演与陌生观众盲审。
         long_dialogue = int(metrics.get("long_dialogue_shots_over_6_sec", 0) or 0)
         if explicitly_visual_led and not dialogue_led and long_dialogue > 1:
             violations.append(
@@ -2932,6 +4661,11 @@ class AIDirector:
                 "The cut has no authored escalation, contrast, or payoff beat between "
                 "its hook and closure."
             )
+        narrative_mode = str(
+            narrative_contract.get("narrative_mode") or ""
+        ).casefold()
+        chain = narrative_contract.get("causal_chain")
+        chain = chain if isinstance(chain, list) else []
         contract_ids = [
             str(item.get("candidate_id") or "")
             for item in chain if isinstance(item, dict)
@@ -3165,8 +4899,7 @@ class AIDirector:
             name
             for name in loaded
             if name
-            and name != selected_model
-            and name.split(":", 1)[0] != requested_base
+            and name.casefold() != selected_model.casefold()
         }
         if unrelated:
             commands = "；".join(f"ollama stop {name}" for name in sorted(unrelated))
@@ -3202,7 +4935,7 @@ class AIDirector:
                 return
             raise DirectorError(
                 f"模型 {self.model!r} 不支持看图，不能执行多视频视觉剪辑。"
-                "请安装视觉模型，例如：ollama pull qwen3.6:27b-mtp-q8_0\n"
+                "请安装视觉模型，例如：ollama pull qwen3.6:27b\n"
                 "The selected model has no vision capability. Install a vision model."
             )
         normalized = self.model.casefold().replace("_", "-")
@@ -3235,12 +4968,20 @@ class AIDirector:
         selected_frames = list(chunk.get("keyframes", []))
         if include_images and len(selected_frames) > 32:
             raise DirectorError(
-                "单个连续审片批次超过 32 张图；请使用默认 1 fps，不能静默丢帧。"
-                " / A full-review batch exceeds 32 images; use the default 1 fps."
+                "单个连续审片批次超过 32 张图；请缩短传输窗口，不能静默丢帧。"
+                " / A full-review batch exceeds 32 images; shorten the transport window."
             )
         images: List[str] = []
         if include_images:
             selected_frames, images = self._encode_images(selected_frames)
+            expected_frames = chunk.get("keyframes", [])
+            expected_count = len(expected_frames) if isinstance(expected_frames, list) else 0
+            if not selected_frames or len(selected_frames) != expected_count:
+                raise DirectorError(
+                    "连续审片窗口的视觉证据不完整；拒绝把缺图窗口标记为已审完。"
+                    "请重新运行提取阶段并检查磁盘/JPEG。 / Visual evidence is incomplete; "
+                    "refusing to mark this review window complete. Rerun extraction and check JPEGs."
+                )
         prompt_chunk = dict(chunk)
         prompt_chunk["keyframes"] = selected_frames
         active_schema = schema or DECISION_SCHEMA
@@ -3289,6 +5030,76 @@ class AIDirector:
             <= request_num_ctx
         )
 
+    @staticmethod
+    def _estimate_vision_tokens(image_count: int) -> int:
+        """Conservatively estimate visual tokens for 1280px JPEG samples. / 保守估算 1280px JPEG 的视觉 token。"""
+        return max(0, int(image_count)) * VISION_IMAGE_TOKEN_ESTIMATE
+
+    def _request_has_multimodal_capacity(
+        self,
+        prompt: str,
+        schema: Dict[str, Any],
+        image_count: int,
+        *,
+        reserve_output_tokens: int = 1024,
+    ) -> bool:
+        """
+        Check text, schema, and attached-image capacity together.
+        联合检查文本、Schema 与附加图片的 Context 容量。
+
+        Ollama does not expose final vision-token counts before generation, so
+        the estimate intentionally assumes the extractor's maximum 1280px
+        review image and retains a model-version safety margin.
+
+        Ollama 在生成前不会公开最终视觉 token 数，因此按提取器最大 1280px
+        审片图估算，并保留模型版本安全余量。
+        """
+        schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        estimated_input_tokens = self._estimate_prompt_tokens(
+            self._director_system_prompt() + "\n" + prompt + "\n" + schema_text
+        ) + self._estimate_vision_tokens(image_count)
+        return (
+            estimated_input_tokens + max(1024, int(reserve_output_tokens)) + 256
+            <= self._effective_num_ctx(self.model)
+        )
+
+    def _vision_image_budget(self, schema: Dict[str, Any]) -> int:
+        """
+        Return a conservative maximum image count for one visual request.
+        返回单次视觉请求可承载的保守图片上限。
+
+        The budget includes the real neutral-review instructions, schema, a
+        worst-case rolling continuity summary, output space, and image tokens.
+        预算包含真实中立审片提示、Schema、最长滚动连续性摘要、输出空间和图片 token。
+        """
+        skeleton = {
+            "start_sec": 0.0,
+            "end_sec": 10.0,
+            "core_start_sec": 0.0,
+            "core_end_sec": 10.0,
+            "source_order": 0,
+            "continuity_context": "x" * 1200,
+            "transcript": [],
+            "keyframes": [],
+        }
+        prompt = self.build_prompt(
+            skeleton,
+            "source.mp4",
+            schema,
+            treatment=None,
+        )
+        schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        fixed_tokens = self._estimate_prompt_tokens(
+            self._director_system_prompt() + "\n" + prompt + "\n" + schema_text
+        )
+        available = (
+            self._effective_num_ctx(self.model)
+            - fixed_tokens
+            - 1024
+            - 256
+        )
+        return min(32, max(1, available // VISION_IMAGE_TOKEN_ESTIMATE))
+
     def _request_json(
         self,
         prompt: str,
@@ -3320,7 +5131,7 @@ class AIDirector:
         schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
         estimated_input_tokens = self._estimate_prompt_tokens(
             system_prompt + "\n" + prompt + "\n" + schema_text
-        )
+        ) + self._estimate_vision_tokens(len(images))
         # Ollama's num_ctx is shared by the prompt and generated response. Keep
         # a safety margin and lower num_predict only when a compact request is
         # still close to the configured window. Semantic prompt compaction is
@@ -3332,9 +5143,9 @@ class AIDirector:
             raise DirectorError(
                 "Ollama 请求在发送前已被阻止：预计输入约 "
                 f"{estimated_input_tokens} token，但模型上下文仅 {request_num_ctx}。"
-                "候选必须先分层筛选或压缩，禁止让 Ollama 从左侧静默截断剧情证据。"
+                "候选必须先分层筛选、压缩，或缩短视觉窗口；禁止让 Ollama 从左侧静默截断证据。"
                 " / Request blocked before Ollama: the prompt cannot leave 1024 output "
-                "tokens. Compact or shortlist the evidence; silent left truncation is forbidden."
+                "tokens. Compact evidence or shorten the visual window; silent left truncation is forbidden."
             )
         num_predict = min(
             desired_num_predict,
@@ -3361,17 +5172,31 @@ class AIDirector:
                 request_num_ctx,
             )
         if "qwen3.6" in normalized_model:
-            # Qwen3.6 commonly spends the entire first structured generation in
-            # its separate thinking channel, then returns no parseable JSON.
-            # Starting with thinking disabled preserves schema enforcement and
-            # avoids doing every expensive mixed-memory request twice.
-            # Qwen3.6 常把首轮结构化生成预算消耗在独立 thinking 字段中，最终没有
-            # 可解析 JSON。首轮直接关闭显式思考仍保留 Schema 约束，并避免混合内存
-            # 推理的每个请求都重复执行一次。
-            attempts = (
-                ("direct-json", schema, False),
-                ("compatibility-json", "json", False),
-            )
+            # Temporal evidence extraction is a literal formatting task, but
+            # concept selection and picture editing benefit from Qwen's real
+            # reasoning pass. High-level calls therefore try thinking first and
+            # retain the proven direct-JSON fallback when Ollama spends the
+            # generation budget in its separate thinking field.
+            # 时序证据提取属于事实记录；概念选择和总剪辑则需要真正推理。高层任务先
+            # 启用 thinking，如 Ollama 将预算耗尽在 thinking 字段，仍回退直出 JSON。
+            high_reasoning_activities = {
+                "story_concepts", "director_treatment", "coverage_synthesis",
+                "story_seed_page", "narrative_contract", "candidate_page_review",
+                "picture_sequence", "picture_assembly", "picture_supervision",
+                "picture_critique", "picture_recut", "blind_viewer",
+                "blind_viewer_review", "music_direction", "music_spotting",
+            }
+            if activity in high_reasoning_activities:
+                attempts = (
+                    ("quality-reasoning", schema, True),
+                    ("direct-json", schema, False),
+                    ("compatibility-json", "json", False),
+                )
+            else:
+                attempts = (
+                    ("direct-json", schema, False),
+                    ("compatibility-json", "json", False),
+                )
         else:
             attempts = (
                 ("quality", schema, quality_think),
@@ -3546,6 +5371,25 @@ class AIDirector:
             marker in normalized for marker in ("70b", "72b")
         ) else self.num_ctx
 
+    def _context_capacity_guidance(self, model: str) -> str:
+        """Return truthful capacity advice for the selected model. / 返回所选模型的真实容量建议。"""
+        effective = self._effective_num_ctx(model)
+        if effective < self.num_ctx:
+            return (
+                f"该 70B/72B 模型在混合内存安全策略下的有效 Context 固定为 {effective}，"
+                f"界面配置的 {self.num_ctx} 不会提高本次请求上限；请依赖分页协议、减少固定证据，"
+                "或改用拥有更大有效上下文的模型。 / "
+                f"This 70B/72B model is hard-capped to an effective {effective}-token "
+                f"context by the mixed-memory safety policy; raising the configured "
+                f"{self.num_ctx}-token value does not raise this request limit. Use paging, "
+                "reduce fixed evidence, or choose a model with a larger effective context."
+            )
+        return (
+            f"当前有效 Context 为 {effective}；请减少固定证据或提高实际可用 Context。 / "
+            f"The effective context is {effective}; reduce fixed evidence or raise the "
+            "genuinely available context."
+        )
+
     def _local_continuity_summary(
         self,
         chunk: Dict[str, Any],
@@ -3621,37 +5465,60 @@ class AIDirector:
         treatment_text = json.dumps(
             treatment or {}, ensure_ascii=False, separators=(",", ":")
         )
+        if treatment:
+            review_mission = (
+                "Use the treatment only to evaluate relevance after recording literal evidence. "
+                "Never alter, omit, or reinterpret an observed action merely because it conflicts "
+                "with the treatment. "
+            )
+            selection_guidance = (
+                "Prefer complete sentences, expressive visuals, stable/focused shots, meaningful "
+                "B-roll, and authentic moments; reject dead air, genuine repetition, camera setup, "
+                "severe shake, accidental frames, and unusable audio. "
+            )
+        else:
+            review_mission = (
+                "NEUTRAL EVIDENCE PASS: no story, theme, genre, or treatment has been chosen. "
+                "Act as a script supervisor, not as a selector. Record every distinct observable "
+                "action, reaction, state change, complete useful spoken thought, shot-size change, "
+                "camera move, focus/quality change, and possible beginning or ending. Do not rank "
+                "events by an imagined film. Routine setup and static states may be recorded when "
+                "they establish continuity, but describe them literally. Split consecutive actions "
+                "into separate edit atoms; do not return one broad summary range. Most visual atoms "
+                "should last 1.0-6.0 seconds and have a precise entry_state, action_apex, exit_state, "
+                "screen_direction, and stable identity_tags. A complete spoken thought may be longer. "
+            )
+            selection_guidance = (
+                "Do not discard a literal event merely because it looks like camera setup, dead air, "
+                "or repetition: the later director, not this evidence pass, decides whether it belongs. "
+                "Record its technical weakness in technical_readability/continuity_tags and omit it only when "
+                "nothing changes or the image/audio is genuinely unreadable. "
+            )
         return (
             "Analyze only this source-video window: "
             "{start:.3f}s to {end:.3f}s.\n"
-            "Follow the DIRECTOR TREATMENT below. Select only concise, coherent "
-            "ranges that actively serve its theme and beats. Use "
+            "{review_mission}Use "
             "absolute seconds in this source, not time relative to the chunk. "
-            "Inspect every attached image in the listed IMAGE order. Prefer complete "
+            "Inspect every attached image in the listed IMAGE order. "
             "The images are time-ordered evidence, not independent thumbnails: compare "
             "adjacent timestamps and describe how subject action, camera motion, emotion, "
             "and shot scale progress. Infer continuity only from adjacent supplied frames; "
-            "never invent an unseen action. Fill subject_action, action_phase, continuity_tags, "
-            "and rhythmic_potential so the final director can match action to music. Prefer complete "
+            "never invent an unseen action. Fill subject_action, temporal_phase, continuity_tags, "
+            "entry_state, action_apex, exit_state, screen_direction, identity_tags, and "
+            "technical_readability so the final director can reason about real temporal continuity. "
             "Read CONTINUITY FROM THE PREVIOUS BATCH first, then update continuity_summary "
             "into a cumulative account of the source so far. Preserve identities, locations, "
             "ongoing actions, unresolved intentions, and meaningful changes; do not reset the "
             "story at this transport boundary. OVERLAP_CONTEXT images are shown only to reconnect "
-            "motion and must not create duplicate edit decisions. "
-            "sentences, expressive visuals, stable/focused shots, meaningful B-roll, "
-            "and authentic moments; reject dead air, repetition, camera setup, severe "
-            "shake, accidental frames, and unusable audio. Suggest restrained effects "
-            "only from the schema enums. Stabilize only genuinely shaky shots; request "
-            "Magic Mask tracking only when a clear subject benefits from it. DRX names "
-            "refer to optional user-exported Resolve presets and should be 'none' unless "
-            "the look is clearly justified. Strong audio cleanup is for visibly/noisily "
-            "problematic speech; transitions should serve the story, not decorate it. "
-            "Every range must remain inside this window, cut_out_sec must be "
-            "greater than cut_in_sec, and each candidate must be no longer than "
-            "dynamic duration limits: B-roll 10s, bridges 12s, context/opening 20s, "
-            "climax 25s, closing 30s, and complete interview thoughts up to 45s. "
-            "Do not keep an entire setup conversation. An empty "
-            "decisions array is preferred when this source adds no new story value.\n"
+            "motion and must not create duplicate evidence atoms. "
+            "{selection_guidance}Do not suggest transitions, color, filters, audio treatment, "
+            "stabilization, story roles, or whether an event belongs in the final film. "
+            "Every range must remain inside this transport window and cut_out_sec must be "
+            "greater than cut_in_sec. Do not shorten an observed event to fit an imagined "
+            "editing rhythm. Use an empty decisions "
+            "array only when the window contains no distinct observable action, useful complete "
+            "thought, reaction, state change, or usable visual state; explain that fact in the "
+            "continuity_summary.\n"
             "Source order in the shoot: {source_order}. Preserve production chronology.\n"
             "Source/proxy media: {source}\n"
             "CORE RANGE FOR NEW EVIDENCE: {core_start:.3f}s to {core_end:.3f}s\n"
@@ -3669,143 +5536,790 @@ class AIDirector:
             continuity=self._compact_prompt_text(
                 chunk.get("continuity_context", ""), 1200
             ),
+            review_mission=review_mission,
+            selection_guidance=selection_guidance,
             treatment=treatment_text,
             schema=schema_text,
             transcript="\n".join(transcript_lines) or "(none)",
             keyframes="\n".join(keyframe_lines) or "(none)",
         )
 
-    def request_treatment(
-        self, assets: Sequence[Dict[str, Any]]
+    @classmethod
+    def _compact_story_evidence(
+        cls, candidates: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Preserve every event atom in a compact story-facing ledger. / 紧凑保留每个事件原子供导演使用。"""
+        return [
+            {
+                "candidate_id": str(item.get("candidate_id") or ""),
+                "asset_id": str(item.get("asset_id") or ""),
+                "source_order": int(item.get("source_order", 0) or 0),
+                "in": round(float(item.get("cut_in_sec", 0) or 0), 3),
+                "out": round(float(item.get("cut_out_sec", 0) or 0), 3),
+                "literal_visual": cls._compact_prompt_text(
+                    item.get("visual_summary") or item.get("reason_for_cut"), 180
+                ),
+                "action": cls._compact_prompt_text(item.get("subject_action"), 120),
+                "entry": cls._compact_prompt_text(item.get("entry_state"), 100),
+                "apex": cls._compact_prompt_text(item.get("action_apex"), 100),
+                "exit": cls._compact_prompt_text(item.get("exit_state"), 100),
+                "phase": str(item.get("action_phase") or "action"),
+                "scale": str(item.get("shot_scale") or "medium"),
+                "camera": str(item.get("camera_motion") or "static"),
+                "direction": str(item.get("screen_direction") or "none"),
+                "emotion": cls._compact_prompt_text(item.get("emotion"), 70),
+                "dialogue": cls._compact_prompt_text(item.get("dialogue_excerpt"), 180),
+                "quality": item.get("quality_score", 0.5),
+                "temporal_review": (
+                    {
+                        "status": str(item["temporal_refinement"].get("status") or ""),
+                        "advisory": cls._compact_prompt_text(
+                            item["temporal_refinement"].get("decision_reason"), 180
+                        ),
+                    }
+                    if isinstance(item.get("temporal_refinement"), dict)
+                    else {}
+                ),
+            }
+            for item in candidates
+            if isinstance(item, dict)
+        ]
+
+    @classmethod
+    def _compact_asset_coverage_for_prompt(
+        cls,
+        asset_coverage: Sequence[Dict[str, Any]],
+        max_listed_sources: int = 24,
     ) -> Dict[str, Any]:
         """
-        Create one project-wide director treatment before selecting shots.
-        在选择镜头前生成一份覆盖全项目的导演阐述。
+        Build a bounded model-facing view of the durable source audit.
+        为持久化逐素材审计构建有界的模型提示视图。
 
         Parameters / 参数:
-            assets: Validated source assets in their real shooting order.
-                按真实拍摄顺序排列的已校验素材。
+            asset_coverage: Complete durable coverage rows. / 完整逐素材审计行。
+            max_listed_sources: Maximum source identities placed in one prompt. /
+                单次提示最多列出的素材身份数。
+
+        Long rolling ``review_conclusion`` text is already represented by the
+        event atoms and remains intact in ``footage_ledger.json``. Repeating up
+        to 800 characters for every source made the fixed prefix alone exceed
+        an 8K 72B context before recursive story reduction could begin.
+
+        较长的 ``review_conclusion`` 已由事件原子承载，并完整保留在
+        ``footage_ledger.json``。若在每个提示中为每条素材重复最多 800 字，
+        固定前缀本身就会超过 72B 的 8K Context，递归归并也无从生效。
         """
-        total_duration = sum(float(item.get("duration_sec", 0)) for item in assets)
-        automatic_target = min(180.0, max(45.0, total_duration * 0.12))
-        requested_target = self.target_duration_sec or automatic_target
-        self._active_target_duration_sec = round(requested_target, 1)
-        representative_frames: List[Dict[str, Any]] = []
-        if len(assets) <= 12:
-            representative_assets = list(assets)
+        rows = [dict(item) for item in asset_coverage if isinstance(item, dict)]
+        limit = max(1, int(max_listed_sources))
+        if len(rows) <= limit:
+            listed = rows
         else:
-            representative_assets = [
-                assets[round(index * (len(assets) - 1) / 11)]
-                for index in range(12)
-            ]
-        per_asset_limit = max(
-            1, min(3, 12 // max(1, len(representative_assets)))
-        )
-        for asset in representative_assets:
-            for frame in self._select_keyframes(
-                asset.get("keyframes", []), limit=per_asset_limit
-            ):
-                annotated = dict(frame)
-                annotated["asset_id"] = str(asset.get("asset_id") or "")
-                representative_frames.append(annotated)
-        representative_frames, images = self._encode_images(
-            representative_frames[:12]
-        )
-        image_legend = [
-            {
-                "image_index": index,
-                "asset_id": frame.get("asset_id", ""),
-                "timestamp_sec": round(float(frame.get("timestamp_sec", 0)), 3),
-            }
-            for index, frame in enumerate(representative_frames, start=1)
-        ]
-        compact_assets: List[Dict[str, Any]] = []
-        transcript_budget = max(
-            2400,
-            min(8000, int(self._effective_num_ctx(self.model) * 0.40)),
-        )
-        per_asset_budget = max(160, transcript_budget // max(1, len(assets)))
-        for source_order, asset in enumerate(assets):
-            transcript, transcript_count = self._compact_transcript_excerpt(
-                asset.get("transcript", []), per_asset_budget
+            # Preserve both the beginning and the ending of shooting order.
+            # The roll-up below still accounts for every omitted source.
+            head_count = (limit + 1) // 2
+            tail_count = limit - head_count
+            listed = rows[:head_count] + (rows[-tail_count:] if tail_count else [])
+
+        disposition_counts: Dict[str, int] = {}
+        total_duration = 0.0
+        total_samples = 0
+        total_atoms = 0
+        for item in rows:
+            status = cls._compact_prompt_text(
+                item.get("disposition") or "unknown", 64
             )
-            compact_assets.append(
+            disposition_counts[status] = disposition_counts.get(status, 0) + 1
+            try:
+                total_duration += max(0.0, float(item.get("duration_sec", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_samples += max(0, int(item.get("saved_visual_samples", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_atoms += max(0, int(item.get("candidate_atom_count", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+
+        compact_rows: List[Dict[str, Any]] = []
+        for item in listed:
+            compact_rows.append(
                 {
-                    "source_order": source_order,
-                    "asset_id": asset.get("asset_id", ""),
-                    "file": Path(str(asset.get("source_video") or "")).name,
-                    "duration_sec": round(float(asset.get("duration_sec", 0)), 2),
-                    "transcript_excerpt": transcript,
-                    "transcript_segment_count": transcript_count,
-                    "keyframe_count": len(asset.get("keyframes", [])),
+                    "id": cls._compact_prompt_text(item.get("asset_id"), 80),
+                    "order": int(item.get("source_order", 0) or 0),
+                    "file": cls._compact_prompt_text(item.get("file"), 80),
+                    "duration_sec": round(float(item.get("duration_sec", 0) or 0), 2),
+                    "visual_samples": int(item.get("saved_visual_samples", 0) or 0),
+                    "event_atoms": int(item.get("candidate_atom_count", 0) or 0),
+                    "status": cls._compact_prompt_text(
+                        item.get("disposition") or "unknown", 64
+                    ),
                 }
             )
-        brief = self.creative_brief or (
-            "Discover the strongest truthful theme in the footage. Make a concise "
-            "director-led short with a clear setup, development, payoff, and ending. "
-            "Choose the most effective form: story film, kinetic style reel, atmospheric "
-            "piece, dialogue-led scene, or a hybrid. Prefer the footage's strongest visual "
-            "transformation and human behavior. Do not default to a behind-the-scenes film "
-            "merely because production chatter exists; BTS needs real conflict, discovery, "
-            "or character change, not routine logistics."
+        return {
+            "total_sources": len(rows),
+            "total_duration_sec": round(total_duration, 2),
+            "total_visual_samples": total_samples,
+            "total_event_atoms": total_atoms,
+            "disposition_counts": disposition_counts,
+            "listed_sources": compact_rows,
+            "omitted_source_count": max(0, len(rows) - len(compact_rows)),
+            "durable_audit_note": (
+                "Full per-source conclusions remain in footage_ledger.json; "
+                "event atoms are the authoritative semantic evidence."
+            ),
+        }
+
+    def _synthesize_story_seed_pages(
+        self,
+        evidence: Sequence[Dict[str, Any]],
+        asset_coverage: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Review every event atom in context-safe neutral pages before concept selection.
+        在上下文安全的中立分页中逐一审阅所有事件原子，再进行全局构想选择。
+
+        Parameters / 参数:
+            evidence: Complete compact event ledger. / 完整紧凑事件账本。
+            asset_coverage: Review disposition for every source. / 每条素材的审片结论。
+
+        Returns / 返回:
+            Reproducible page summaries and evidence-cited story seeds. / 可复核的分页摘要与证据化故事种子。
+
+        This is a hierarchical review, not a fixed Top-N shortcut: every input id
+        appears in exactly one page audit and remains available in the durable
+        footage ledger. / 这是分层审阅而非固定 Top-N：每个输入 id 都恰好出现在一页
+        审计中，原始事件仍完整保存在 footage ledger。
+        """
+        coverage_json = json.dumps(
+            self._compact_asset_coverage_for_prompt(asset_coverage),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        def page_prompt(page: Sequence[Dict[str, Any]], index: int) -> str:
+            return (
+                "NEUTRAL STORY-SEED REVIEW. This page is only one chronological portion of a "
+                "complete event ledger; do not choose the final film yet. Examine EVERY atom. "
+                "Identify factual progressions, character behavior, visual motifs, dialogue turns, "
+                "and possible endings that a later global tournament could combine across pages. "
+                "A seed must cite only supplied candidate ids. Do not promote routine production "
+                "talk into BTS unless this page proves an observable state change. A pose, readiness, "
+                "or countdown is not a departure. Describe limitations and missing payoff honestly. "
+                "Return JSON only.\n"
+                f"PAGE NUMBER: {index}\n"
+                f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
+                f"ASSET COVERAGE: {coverage_json}\n"
+                f"EVENT ATOMS: {json.dumps(list(page), ensure_ascii=False, separators=(',', ':'))}"
+            )
+
+        if not self._request_has_capacity(
+            page_prompt([], 1),
+            STORY_SEED_PAGE_SCHEMA,
+            model=self.text_model,
+            reserve_output_tokens=1536,
+        ):
+            raise DirectorError(
+                "故事证据分页的固定素材摘要已超过 Context；请减少素材数或提高 Context。"
+                " / The fixed story-page coverage prefix exceeds Context before any atoms are added."
+            )
+
+        pages: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        for item in evidence:
+            trial = current + [dict(item)]
+            if current and (
+                len(trial) > 24
+                or not self._request_has_capacity(
+                    page_prompt(trial, len(pages) + 1),
+                    STORY_SEED_PAGE_SCHEMA,
+                    model=self.text_model,
+                    reserve_output_tokens=1536,
+                )
+            ):
+                pages.append(current)
+                current = [dict(item)]
+            else:
+                current = trial
+        if current:
+            pages.append(current)
+
+        audits: List[Dict[str, Any]] = []
+        for page_index, page in enumerate(pages, start=1):
+            prompt = page_prompt(page, page_index)
+            if not self._request_has_capacity(
+                prompt,
+                STORY_SEED_PAGE_SCHEMA,
+                model=self.text_model,
+                reserve_output_tokens=1536,
+            ):
+                raise DirectorError(
+                    "单个故事证据页仍超过 Context；请提高 Context。"
+                    " / One story-evidence page still exceeds Context; increase it."
+                )
+            self.logger.info(
+                "长片故事证据审阅 %d/%d：%d 个事件原子 / Story evidence page %d/%d: %d atoms",
+                page_index, len(pages), len(page), page_index, len(pages), len(page),
+            )
+            payload = self._request_json(
+                prompt,
+                STORY_SEED_PAGE_SCHEMA,
+                model=self.text_model,
+                progress_activity="story_seed_page",
+            )
+            page_ids = {
+                str(item.get("candidate_id") or "") for item in page
+                if str(item.get("candidate_id") or "")
+            }
+            valid_seeds: List[Dict[str, Any]] = []
+            for raw_seed in payload.get("story_seeds", []):
+                if not isinstance(raw_seed, dict):
+                    continue
+                proof_ids = list(dict.fromkeys(
+                    str(value) for value in raw_seed.get("proof_candidate_ids", [])
+                    if str(value) in page_ids
+                ))
+                if not proof_ids:
+                    continue
+                seed = dict(raw_seed)
+                ending_id = str(seed.get("possible_ending_candidate_id") or "")
+                if ending_id in page_ids and ending_id not in proof_ids:
+                    proof_ids = proof_ids[:9] + [ending_id]
+                elif ending_id not in page_ids:
+                    ending_id = proof_ids[-1]
+                seed["proof_candidate_ids"] = proof_ids
+                seed["possible_ending_candidate_id"] = ending_id
+                valid_seeds.append(seed)
+            if not valid_seeds:
+                raise DirectorError(
+                    f"故事证据第 {page_index} 页没有返回有效候选 id。"
+                    " / Story-evidence page returned no valid candidate ids."
+                )
+            audits.append({
+                "page": page_index,
+                "input_candidate_ids": [
+                    str(item.get("candidate_id") or "") for item in page
+                ],
+                "page_summary": self._compact_prompt_text(
+                    payload.get("page_summary"), 1200
+                ),
+                "story_seeds": valid_seeds,
+            })
+        return {
+            "mode": "hierarchical_all_atoms_reviewed",
+            "all_candidates_considered": True,
+            "input_candidate_count": len(evidence),
+            "page_count": len(audits),
+            "pages": audits,
+        }
+
+    @classmethod
+    def _story_seed_prompt_view(
+        cls,
+        review: Dict[str, Any],
+        nodes: Optional[Sequence[Dict[str, Any]]] = None,
+        reduction_depth: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Build a bounded prompt view without durable page provenance.
+        构建不含持久化分页溯源的有界提示视图。
+
+        Parameters / 参数:
+            review: Complete durable hierarchical audit. / 完整持久化分层审计。
+            nodes: Optional already-reduced seed nodes. / 可选的已归并种子节点。
+            reduction_depth: Number of recursive reduction levels. / 递归归并层数。
+
+        Candidate-id page membership remains in ``review['pages']`` on disk but
+        never re-enters the model context. / 候选 ID 的分页归属仍保存在
+        磁盘审计中，但不会再进入模型 Context。
+        """
+        source_nodes = list(nodes) if nodes is not None else [
+            {
+                "page_summary": page.get("page_summary", ""),
+                "story_seeds": page.get("story_seeds", []),
+            }
+            for page in review.get("pages", [])
+            if isinstance(page, dict)
+        ]
+        return {
+            "mode": "recursive_story_seed_summary",
+            "all_leaf_pages_reviewed": bool(review.get("all_candidates_considered")),
+            "input_candidate_count": int(review.get("input_candidate_count", 0) or 0),
+            "leaf_page_count": int(review.get("page_count", len(source_nodes)) or 0),
+            "reduction_depth": int(reduction_depth),
+            "nodes": [
+                cls._compact_prompt_value(node)
+                for node in source_nodes
+                if isinstance(node, dict)
+            ],
+        }
+
+    def _reduce_story_seed_nodes(
+        self,
+        nodes: Sequence[Dict[str, Any]],
+        level: int,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Recursively merge story-seed nodes into fewer context-safe nodes.
+        递归将故事种子节点归并为更少的 Context 安全节点。
+
+        Parameters / 参数:
+            nodes: Chronological summaries from the previous level. / 上一层的时序摘要。
+            level: One-based reduction level. / 从 1 开始的归并层级。
+
+        Returns / 返回:
+            Reduced prompt nodes plus a durable provenance audit. /
+            归并后的提示节点与持久化溯源审计。
+        """
+        if not nodes:
+            raise DirectorError(
+                "没有可归并的故事种子 / No story-seed nodes to reduce."
+            )
+
+        def reduce_prompt(group: Sequence[Dict[str, Any]], group_index: int) -> str:
+            return (
+                "RECURSIVE STORY-SEED REDUCTION. These chronological nodes summarize earlier "
+                "evidence pages. Examine EVERY node and merge only evidence-supported progressions. "
+                "Do not select the final film. Preserve distinct possible endings and limitations. "
+                "Every proof_candidate_id and possible_ending_candidate_id must already occur in "
+                "the supplied nodes. Return JSON only.\n"
+                f"REDUCTION LEVEL: {level}\nGROUP: {group_index}\n"
+                f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
+                "SEED NODES: "
+                + json.dumps(list(group), ensure_ascii=False, separators=(",", ":"))
+            )
+
+        groups: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        for raw_node in nodes:
+            node = self._compact_prompt_value(raw_node)
+            if not isinstance(node, dict):
+                continue
+            trial = current + [node]
+            if current and (
+                len(trial) > 8
+                or not self._request_has_capacity(
+                    reduce_prompt(trial, len(groups) + 1),
+                    STORY_SEED_PAGE_SCHEMA,
+                    model=self.text_model,
+                    reserve_output_tokens=1536,
+                )
+            ):
+                groups.append(current)
+                current = [node]
+            else:
+                current = trial
+        if current:
+            groups.append(current)
+
+        reduced: List[Dict[str, Any]] = []
+        group_audits: List[Dict[str, Any]] = []
+        for group_index, group in enumerate(groups, start=1):
+            prompt = reduce_prompt(group, group_index)
+            if not self._request_has_capacity(
+                prompt,
+                STORY_SEED_PAGE_SCHEMA,
+                model=self.text_model,
+                reserve_output_tokens=1536,
+            ):
+                raise DirectorError(
+                    "单个故事种子归并组仍超过 Context。"
+                    " / One story-seed reduction group still exceeds Context."
+                )
+            allowed_ids = {
+                str(candidate_id).strip()
+                for node in group
+                for seed in (
+                    node.get("story_seeds", []) if isinstance(node, dict) else []
+                )
+                if isinstance(seed, dict)
+                for candidate_id in (
+                    list(seed.get("proof_candidate_ids", []))
+                    + [seed.get("possible_ending_candidate_id")]
+                )
+                if candidate_id is not None and str(candidate_id).strip()
+            }
+            payload = self._request_json(
+                prompt,
+                STORY_SEED_PAGE_SCHEMA,
+                model=self.text_model,
+                progress_activity="story_seed_reduce",
+            )
+            valid_seeds: List[Dict[str, Any]] = []
+            for raw_seed in payload.get("story_seeds", []):
+                if not isinstance(raw_seed, dict):
+                    continue
+                proof_ids = list(dict.fromkeys(
+                    str(value) for value in raw_seed.get("proof_candidate_ids", [])
+                    if str(value) in allowed_ids
+                ))
+                if not proof_ids:
+                    continue
+                seed = dict(raw_seed)
+                ending_id = str(seed.get("possible_ending_candidate_id") or "")
+                if ending_id in allowed_ids and ending_id not in proof_ids:
+                    proof_ids = proof_ids[:9] + [ending_id]
+                elif ending_id not in allowed_ids:
+                    ending_id = proof_ids[-1]
+                seed["proof_candidate_ids"] = proof_ids
+                seed["possible_ending_candidate_id"] = ending_id
+                valid_seeds.append(seed)
+            if not valid_seeds:
+                raise DirectorError(
+                    f"故事种子归并层 {level} 组 {group_index} 没有有效证据 ID。"
+                    " / Story-seed reduction returned no grounded ids."
+                )
+            node = {
+                "page_summary": self._compact_prompt_text(
+                    payload.get("page_summary"), 900
+                ),
+                "story_seeds": valid_seeds,
+            }
+            reduced.append(node)
+            group_audits.append({
+                "group": group_index,
+                "input_node_count": len(group),
+                "input_proof_candidate_ids": sorted(allowed_ids),
+                "output_node": node,
+            })
+        return reduced, {
+            "level": level,
+            "input_node_count": len(nodes),
+            "output_node_count": len(reduced),
+            "groups": group_audits,
+        }
+
+    def request_story_concepts(
+        self,
+        assets: Sequence[Dict[str, Any]],
+        candidates: Sequence[Dict[str, Any]],
+        asset_coverage: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Propose and evidence-check three genuinely different possible films.
+        提出三种真正不同的成片方案，并逐一用全片证据验证。
+
+        Parameters / 参数:
+            assets: All source assets in shooting order. / 按拍摄顺序排列的全部素材。
+            candidates: Complete neutral event-atom ledger. / 完整中立事件原子账本。
+            asset_coverage: Explicit reviewed/rejected status for every asset.
+                每条素材明确的已审看/无可剪事件状态。
+        """
+        evidence = self._compact_story_evidence(candidates)
+        valid_ids = {str(item.get("candidate_id") or "") for item in candidates}
+        coverage_prompt_view = self._compact_asset_coverage_for_prompt(
+            asset_coverage
+        )
+        prompt_prefix = (
+            "STORY CONCEPT TOURNAMENT. The complete footage was reviewed neutrally before any "
+            "theme was chosen. Propose exactly three materially different films that this evidence "
+            "can honestly support. At least one option should be a concise visual/style form when "
+            "the material lacks a causal event; do not automatically choose BTS because production "
+            "talk exists. Each concept must name exact proof_candidate_ids and an observed ending "
+            "candidate. A pose, countdown, readiness, headlight, or forward lean is not a departure. "
+            "Reject imagined smoke, travel, conflict, transformation, or payoff. Select the concept "
+            "with the clearest blind-viewer premise, observable progression, strongest distinct "
+            "ending, and least dependence on explanatory text. Prefer a focused 15-35 second film "
+            "over padding when evidence is thin. Respect the user's brief. Return JSON only.\n"
+            f"USER CREATIVE BRIEF: {self.creative_brief or '(free direction)'}\n"
+            "ASSET COVERAGE SUMMARY (complete audit is durable outside this prompt): "
+            f"{json.dumps(coverage_prompt_view, ensure_ascii=False, separators=(',', ':'))}\n"
         )
         prompt = (
-            "Create the director treatment before any shot selection. The sources "
-            "are listed in real shooting order. Choose an edit_style deliberately; "
-            "strict chronology is not mandatory unless the user asks for it, and a "
-            "short teaser is useful when it gives the viewer an immediate promise. Do not "
-            "make a chronological dump: identify one central theme and design a "
-            "complete emotional arc. "
-            "State one concrete viewer_takeaway that the finished film must communicate. "
-            "Design restrained typography in the user's or dominant transcript language: "
-            "a title, chapter words, or an end card may "
-            "clarify the premise or heighten style, but cannot explain away weak shots. "
-            "Dialogue about microphones, filters, blocking, takes, or camera setup is "
-            "marked only as possible production context. You are the director: decide "
-            "whether it is irrelevant, revealing, funny, authentic, useful as natural "
-            "texture, or central to a behind-the-scenes idea. Do not exclude or mute it "
-            "by category; make an editorial decision from the chosen theme. "
-            "Do not claim an engine start, rollout, departure, arrival, reaction, or other "
-            "future action unless the supplied visual evidence directly observes the state "
-            "change across time. A countdown, readiness pose, headlight, or forward lean proves "
-            "only anticipation. When the footage contains mostly routine setup without real "
-            "conflict, discovery, or character change, do not force a behind-the-scenes story; "
-            "choose a concise visual mood/style form and minimize explanatory dialogue. "
-            "Choose 4-8 story_anchors from the supplied exact asset_id and absolute "
-            "timestamps. Anchors must cover at least three beats and at least three "
-            "different sources when the footage supports it. Use dynamic duration: "
-            "1.5-10 seconds for B-roll, up to 20 seconds for context, and up to 45 "
-            "seconds for an uninterrupted complete spoken thought; never cross an "
-            "asset duration. Anchors are hypotheses for later full-footage review, not "
-            "clips that must be protected or included. Include a complete "
-            "ending action rather than a one-word tail. "
-            "Design the music before searching: provide 2-6 specific multilingual "
-            "search queries, instrumentation, a useful tempo range, vocal policy, "
-            "one to three cues, and intentional silence. Prefer instrumental music "
-            "under dialogue. Search terms must describe emotion, genre, pacing, and "
-            "instrumentation rather than copyrighted song titles. Treat the requested "
-            "duration as an editorial target, never as permission to pad with repeated "
-            "or weak footage. Create an executable color_bible that supports the theme: "
-            "choose one coherent palette and subtle opening/development/payoff/ending grade "
-            "changes. Base it on the real lighting and emotional arc, preserve skin and practical "
-            "light color, and avoid random shot-by-shot tint changes. The camera profile is only "
-            "a technical input transform; the color_bible is the creative grade. Return JSON only.\n"
-            f"USER CREATIVE BRIEF: {brief}\n"
-            f"REQUESTED TARGET DURATION: {self._active_target_duration_sec:.1f} seconds\n"
-            f"CAMERA PROFILE: {self.camera_profile}\n"
-            f"REPRESENTATIVE IMAGE ORDER: {json.dumps(image_legend, ensure_ascii=False)}\n"
-            f"SCHEMA: {json.dumps(TREATMENT_SCHEMA, ensure_ascii=False)}\n"
-            f"SOURCES: {json.dumps(compact_assets, ensure_ascii=False)}"
+            prompt_prefix
+            + f"COMPLETE EVENT LEDGER ({len(evidence)} atoms): "
+            + json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
         )
+        hierarchical_review: Optional[Dict[str, Any]] = None
+        if not self._request_has_capacity(
+            prompt, STORY_CONCEPTS_SCHEMA, model=self.text_model, reserve_output_tokens=2048
+        ):
+            fixed_prefix_probe = (
+                prompt_prefix
+                + "HIERARCHICAL EVIDENCE SUMMARY: "
+                + json.dumps(
+                    {
+                        "mode": "recursive_story_seed_summary",
+                        "nodes": [],
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            if not self._request_has_capacity(
+                fixed_prefix_probe,
+                STORY_CONCEPTS_SCHEMA,
+                model=self.text_model,
+                reserve_output_tokens=2048,
+            ):
+                raise DirectorError(
+                    "故事构想的固定素材摘要已超过 Context；尚未开始昂贵的故事分页。"
+                    " / The fixed concept prefix exceeds Context; story-page generation was not started."
+                )
+            self.logger.info(
+                "完整事件账本超过单次 Context，改用全量分层审阅；不会静默截断 / "
+                "Complete ledger exceeds one request; using hierarchical all-atom review"
+            )
+            hierarchical_review = self._synthesize_story_seed_pages(
+                evidence, asset_coverage
+            )
+            nodes = self._story_seed_prompt_view(hierarchical_review)["nodes"]
+            reduction_levels: List[Dict[str, Any]] = []
+            reduction_depth = 0
+            while True:
+                prompt_view = self._story_seed_prompt_view(
+                    hierarchical_review,
+                    nodes=nodes,
+                    reduction_depth=reduction_depth,
+                )
+                prompt = (
+                    prompt_prefix
+                    + "HIERARCHICAL EVIDENCE SUMMARY. Every candidate was examined in exactly "
+                    "one chronological leaf page; the durable ledger and page audit remain "
+                    "authoritative outside this prompt. Combine every supplied seed node and cite "
+                    "only candidate ids present below: "
+                    + json.dumps(
+                        prompt_view, ensure_ascii=False, separators=(",", ":")
+                    )
+                )
+                if self._request_has_capacity(
+                    prompt,
+                    STORY_CONCEPTS_SCHEMA,
+                    model=self.text_model,
+                    reserve_output_tokens=2048,
+                ):
+                    break
+                if reduction_depth >= 8:
+                    raise DirectorError(
+                        "故事种子经过 8 层归并仍超过 Context。"
+                        " / Story seeds still exceed Context after eight reduction levels."
+                    )
+                before_size = len(json.dumps(nodes, ensure_ascii=False))
+                reduced_nodes, reduction_audit = self._reduce_story_seed_nodes(
+                    nodes, reduction_depth + 1
+                )
+                after_size = len(json.dumps(reduced_nodes, ensure_ascii=False))
+                if (
+                    not reduced_nodes
+                    or len(reduced_nodes) > len(nodes)
+                    or (
+                        len(reduced_nodes) == len(nodes)
+                        and after_size >= before_size
+                    )
+                ):
+                    raise DirectorError(
+                        "故事种子归并未减少 Context，拒绝无限重试。"
+                        " / Story-seed reduction made no context progress."
+                    )
+                nodes = reduced_nodes
+                reduction_levels.append(reduction_audit)
+                reduction_depth += 1
+            hierarchical_review["reduction_levels"] = reduction_levels
+            hierarchical_review["prompt_summary"] = prompt_view
         self.logger.info(
-            "正在生成导演阐述与叙事弧线 / Creating director treatment and story arc"
+            "正在比较三种证据化成片构想 / Comparing three evidence-backed film concepts"
         )
-        return self._request_json(
+        payload = self._request_json(
+            prompt,
+            STORY_CONCEPTS_SCHEMA,
+            model=self.text_model,
+            progress_activity="story_concepts",
+        )
+        concepts = payload.get("concepts")
+        if not isinstance(concepts, list) or len(concepts) != 3:
+            raise DirectorError(
+                "导演必须返回三种成片构想 / Director must return exactly three concepts."
+            )
+        seen_forms = set()
+        seen_concept_ids = set()
+        valid_concepts: List[Dict[str, Any]] = []
+        for concept in concepts:
+            if not isinstance(concept, dict):
+                continue
+            concept_id = str(concept.get("concept_id") or "").strip()
+            if not concept_id or concept_id in seen_concept_ids:
+                continue
+            proof_ids = [
+                str(value) for value in concept.get("proof_candidate_ids", [])
+                if str(value) in valid_ids
+            ]
+            ending_id = str(concept.get("ending_candidate_id") or "")
+            minimum_proof = min(3, max(1, len(valid_ids)))
+            unique_proof_ids = list(dict.fromkeys(proof_ids))
+            if (
+                len(unique_proof_ids) < minimum_proof
+                or ending_id not in unique_proof_ids
+            ):
+                continue
+            normalized = dict(concept)
+            normalized["proof_candidate_ids"] = unique_proof_ids
+            normalized["ending_candidate_id"] = ending_id
+            seen_forms.add(str(normalized.get("form") or ""))
+            seen_concept_ids.add(concept_id)
+            valid_concepts.append(normalized)
+        if len(valid_concepts) != 3 or len(seen_forms) < 2:
+            raise DirectorError(
+                "三种构想没有提供足够且不同的真实证据；拒绝在薄弱前提上继续剪辑。"
+                " / The three concepts lack distinct, grounded proof; refusing a weak premise."
+            )
+        selected_id = str(payload.get("selected_concept_id") or "")
+        if selected_id not in {
+            str(item.get("concept_id") or "") for item in valid_concepts
+        }:
+            selected_id = str(max(
+                valid_concepts,
+                key=lambda item: int(item.get("feasibility_score", 0) or 0),
+            ).get("concept_id") or "")
+        result = {
+            "concepts": valid_concepts,
+            "selected_concept_id": selected_id,
+            "selection_reason": self._compact_prompt_text(
+                payload.get("selection_reason"), 800
+            ),
+        }
+        if hierarchical_review is not None:
+            result["evidence_review"] = hierarchical_review
+        return result
+
+    def request_treatment(
+        self,
+        assets: Sequence[Dict[str, Any]],
+        evidence_candidates: Optional[Sequence[Dict[str, Any]]] = None,
+        concept_tournament: Optional[Dict[str, Any]] = None,
+        asset_coverage: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a treatment only after neutral full-footage evidence exists.
+        仅在中立完整审片证据形成后创建导演阐述。
+
+        Parameters / 参数:
+            assets: Validated sources in shooting order. / 按拍摄顺序的已校验素材。
+            evidence_candidates: Complete neutral event atoms. / 完整中立事件原子。
+            concept_tournament: Three evidence-backed concepts and the selected one.
+                三种证据化构想及其优胜方案。
+            asset_coverage: Explicit review status for every source. / 每条素材的审片状态。
+        """
+        total_duration = sum(float(item.get("duration_sec", 0)) for item in assets)
+        automatic_target = min(180.0, max(20.0, total_duration * 0.08))
+        requested_target = self.target_duration_sec or automatic_target
+        self._active_target_duration_sec = round(requested_target, 1)
+        evidence = self._compact_story_evidence(evidence_candidates or [])
+        if not evidence:
+            raise DirectorError(
+                "导演阐述前没有完整视觉证据账本 / No full visual evidence ledger exists before treatment."
+            )
+        tournament = concept_tournament if isinstance(concept_tournament, dict) else {}
+        selected_id = str(tournament.get("selected_concept_id") or "")
+        selected_concept = next(
+            (
+                dict(item) for item in tournament.get("concepts", [])
+                if isinstance(item, dict) and str(item.get("concept_id") or "") == selected_id
+            ),
+            {},
+        )
+        if not selected_concept:
+            raise DirectorError(
+                "导演阐述缺少已验证的优胜构想 / Treatment lacks a validated winning concept."
+            )
+        compact_assets = [
+            {
+                "source_order": source_order,
+                "asset_id": str(asset.get("asset_id") or ""),
+                "file": Path(str(asset.get("source_video") or "")).name,
+                "duration_sec": round(float(asset.get("duration_sec", 0)), 2),
+                "review_summary": self._compact_prompt_text(
+                    self._asset_continuity_summaries.get(str(asset.get("asset_id") or ""), ""),
+                    700,
+                ),
+            }
+            for source_order, asset in enumerate(assets)
+        ]
+        brief = self.creative_brief or (
+            "Discover the strongest truthful theme and make a concise, complete film."
+        )
+        tournament_for_prompt = {
+            "concepts": list(tournament.get("concepts", [])),
+            "selected_concept_id": selected_id,
+            "selection_reason": str(tournament.get("selection_reason") or ""),
+        }
+        coverage_prompt_view = self._compact_asset_coverage_for_prompt(
+            asset_coverage or []
+        )
+
+        def treatment_prompt(
+            prompt_evidence: Sequence[Dict[str, Any]], evidence_label: str
+        ) -> str:
+            return (
+                "Turn the winning evidence-backed concept into one executable director treatment. "
+                "This happens AFTER neutral full-footage review; never replace literal evidence with "
+                "genre assumptions. Use only candidate timestamps from the supplied evidence for "
+                "story_anchors. The opening must promise the actual film, development must change what "
+                "the viewer understands or feels, payoff must be visibly earned, and ending must be an "
+                "observed complete state rather than a title pretending to create closure. Typography "
+                "may heighten a real idea but cannot explain incoherent footage. Decide whether set talk "
+                "is story, texture, comedy, or distraction; no automatic muting rule. Design music and "
+                "one coherent color bible around the chosen emotional arc. Prefer instrumental score "
+                "under dialogue. Treat duration as a ceiling, not padding. Return JSON only.\n"
+                f"USER CREATIVE BRIEF: {brief}\n"
+                f"REQUESTED TARGET DURATION: {self._active_target_duration_sec:.1f}s\n"
+                f"CAMERA PROFILE: {self.camera_profile}\n"
+                f"WINNING CONCEPT: {json.dumps(selected_concept, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"CONCEPT TOURNAMENT: {json.dumps(tournament_for_prompt, ensure_ascii=False, separators=(',', ':'))}\n"
+                "ASSET COVERAGE SUMMARY (full audit remains in footage_ledger.json): "
+                f"{json.dumps(coverage_prompt_view, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"SOURCE SUMMARIES: {json.dumps(compact_assets, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"{evidence_label}: {json.dumps(list(prompt_evidence), ensure_ascii=False, separators=(',', ':'))}"
+            )
+
+        prompt = treatment_prompt(evidence, "COMPLETE EVENT LEDGER")
+        if not self._request_has_capacity(
+            prompt, TREATMENT_SCHEMA, model=self.text_model, reserve_output_tokens=2048
+        ):
+            proof_ids = set(
+                str(value) for value in selected_concept.get("proof_candidate_ids", [])
+            )
+            proof_ids.add(str(selected_concept.get("ending_candidate_id") or ""))
+            selected_evidence = [
+                item for item in evidence
+                if str(item.get("candidate_id") or "") in proof_ids
+            ]
+            if not selected_evidence:
+                raise DirectorError(
+                    "优胜构想没有可用于导演阐述的真实证据 / "
+                    "Winning concept has no usable evidence for treatment."
+                )
+            self.logger.info(
+                "导演阐述使用优胜构想引用的 %d 个证据原子；全部原子此前已完成分层审阅 / "
+                "Treatment uses %d winning-concept proof atoms after hierarchical all-atom review",
+                len(selected_evidence), len(selected_evidence),
+            )
+            prompt = treatment_prompt(
+                selected_evidence,
+                "WINNING-CONCEPT PROOF LEDGER (all atoms were reviewed upstream)",
+            )
+            if not self._request_has_capacity(
+                prompt,
+                TREATMENT_SCHEMA,
+                model=self.text_model,
+                reserve_output_tokens=2048,
+            ):
+                raise DirectorError(
+                    "优胜构想证据仍超过当前 Context；请提高 Context。"
+                    " / Winning-concept evidence still exceeds Context; increase it."
+                )
+        self.logger.info(
+            "正在生成优胜构想的导演阐述 / Creating treatment for the winning concept"
+        )
+        payload = self._request_json(
             prompt,
             TREATMENT_SCHEMA,
-            images=images,
+            model=self.text_model,
             progress_activity="director_treatment",
         )
+        payload["concept_tournament"] = tournament
+        payload["selected_concept_id"] = selected_id
+        return payload
 
     @staticmethod
     def _compact_transcript_excerpt(
@@ -4007,6 +6521,19 @@ class AIDirector:
                 "opening", "development", "payoff", "ending"
             } or not reason:
                 continue
+            if self._active_evidence_candidates and not any(
+                str(item.get("asset_id") or "") == asset_id
+                and min(cut_out, float(item.get("cut_out_sec", 0) or 0))
+                - max(cut_in, float(item.get("cut_in_sec", 0) or 0))
+                >= 0.5
+                for item in self._active_evidence_candidates
+            ):
+                self.logger.warning(
+                    "已拒绝没有视觉账本依据的导演锚点 %s %.3f-%.3f / "
+                    "Rejected treatment anchor without ledger evidence",
+                    asset_id, cut_in, cut_out,
+                )
+                continue
             anchors.append({
                 "asset_id": asset_id,
                 "cut_in_sec": round(cut_in, 3),
@@ -4014,6 +6541,59 @@ class AIDirector:
                 "beat": beat,
                 "reason": reason,
             })
+        if len(anchors) < 3 and self._active_evidence_candidates:
+            tournament_payload = payload.get("concept_tournament")
+            tournament_payload = (
+                tournament_payload if isinstance(tournament_payload, dict) else {}
+            )
+            selected_id = str(
+                payload.get("selected_concept_id")
+                or tournament_payload.get("selected_concept_id")
+                or ""
+            )
+            selected_concept = next(
+                (
+                    item for item in tournament_payload.get("concepts", [])
+                    if isinstance(item, dict)
+                    and str(item.get("concept_id") or "") == selected_id
+                ),
+                {},
+            )
+            by_candidate_id = {
+                str(item.get("candidate_id") or ""): item
+                for item in self._active_evidence_candidates
+            }
+            proof_ids = [
+                str(value) for value in selected_concept.get("proof_candidate_ids", [])
+                if str(value) in by_candidate_id
+            ]
+            if len(proof_ids) >= 3:
+                generated: List[Dict[str, Any]] = []
+                ending_id = str(selected_concept.get("ending_candidate_id") or "")
+                for index, candidate_id in enumerate(proof_ids[:8]):
+                    item = by_candidate_id[candidate_id]
+                    if candidate_id == ending_id:
+                        beat = "ending"
+                    elif index == 0:
+                        beat = "opening"
+                    elif index >= len(proof_ids[:8]) - 2:
+                        beat = "payoff"
+                    else:
+                        beat = "development"
+                    generated.append({
+                        "asset_id": str(item.get("asset_id") or ""),
+                        "cut_in_sec": round(float(item.get("cut_in_sec", 0) or 0), 3),
+                        "cut_out_sec": round(float(item.get("cut_out_sec", 0) or 0), 3),
+                        "beat": beat,
+                        "reason": self._compact_prompt_text(
+                            item.get("reason_for_cut") or item.get("visual_summary"), 300
+                        ),
+                    })
+                anchors = generated
+                self.logger.warning(
+                    "AI 导演锚点不足，已从优胜构想的真实证据补足 / "
+                    "Treatment anchors were incomplete; restored winning-concept evidence"
+                )
         if len(anchors) < 3:
             anchors = self._fallback_story_anchors(assets)
             self.logger.warning(
@@ -4031,21 +6611,37 @@ class AIDirector:
                     float(anchors[index]["cut_in_sec"]),
                 ),
             )
-            for index, anchor in enumerate(anchors):
-                if anchor["beat"] == "ending" and index != latest_index:
-                    anchor["beat"] = "development"
-            anchors[latest_index]["beat"] = "ending"
-            latest_asset = by_id[str(anchors[latest_index]["asset_id"])]
-            latest_duration = float(latest_asset.get("duration_sec", 0))
-            latest_anchor = anchors[latest_index]
-            if float(latest_anchor["cut_out_sec"]) - float(latest_anchor["cut_in_sec"]) < 5.0:
+            explicit_endings = [
+                index for index, anchor in enumerate(anchors)
+                if anchor["beat"] == "ending"
+            ]
+            ending_index = explicit_endings[-1] if explicit_endings else latest_index
+            for index in explicit_endings[:-1]:
+                anchors[index]["beat"] = "development"
+            anchors[ending_index]["beat"] = "ending"
+            ending_asset = by_id[str(anchors[ending_index]["asset_id"])]
+            ending_duration = float(ending_asset.get("duration_sec", 0))
+            ending_anchor = anchors[ending_index]
+            if float(ending_anchor["cut_out_sec"]) - float(ending_anchor["cut_in_sec"]) < 3.0:
                 expanded_out = min(
-                    latest_duration, float(latest_anchor["cut_in_sec"]) + 5.0
+                    ending_duration, float(ending_anchor["cut_in_sec"]) + 3.0
                 )
-                expanded_in = max(0.0, expanded_out - 5.0)
-                latest_anchor["cut_in_sec"] = round(expanded_in, 3)
-                latest_anchor["cut_out_sec"] = round(expanded_out, 3)
+                expanded_in = max(0.0, expanded_out - 3.0)
+                ending_anchor["cut_in_sec"] = round(expanded_in, 3)
+                ending_anchor["cut_out_sec"] = round(expanded_out, 3)
         treatment["story_anchors"] = anchors[:12]
+        tournament = payload.get("concept_tournament")
+        if isinstance(tournament, dict):
+            treatment["concept_tournament"] = tournament
+            treatment["selected_concept_id"] = str(
+                payload.get("selected_concept_id")
+                or tournament.get("selected_concept_id")
+                or ""
+            )
+        if str(payload.get("footage_ledger") or "").strip():
+            treatment["footage_ledger"] = str(payload["footage_ledger"])
+        if str(payload.get("evidence_fingerprint") or "").strip():
+            treatment["evidence_fingerprint"] = str(payload["evidence_fingerprint"])
         return treatment
 
     @staticmethod
@@ -4388,14 +6984,6 @@ class AIDirector:
             if timeline_out - timeline_in < 0.25:
                 continue
             track_in = number(raw.get("track_in_sec"), 0, 0, track_duration)
-            if cue_index == 1 and timeline_in > 8.0 and track_in > 0:
-                # A free-direction montage should not accidentally spend tens of
-                # seconds with no score. Extend the selected musical phrase
-                # backwards while preserving every later beat-to-picture mapping.
-                # 防止模型把开场二十多秒误留成无配乐；向前延展同一音乐段且不破坏后续卡点。
-                extension = min(timeline_in, track_in)
-                timeline_in -= extension
-                track_in -= extension
             desired = timeline_out - timeline_in
             track_out = number(
                 raw.get("track_out_sec"), track_in + desired, track_in, track_duration
@@ -4597,6 +7185,57 @@ class AIDirector:
                 )
         return violations
 
+    def _request_quality_gated_music_plan(
+        self,
+        music_prompt: str,
+        locked_duration: float,
+        treatment: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Request music at most twice and fail closed on measured mismatch.
+        配乐最多请求两次；若仍与实测能量不符则关闭式失败。
+
+        An explicitly authored empty cue list is valid intentional silence.
+        导演明确返回空 cue 表示有意不用音乐，属于合法方案。
+        """
+        music_request = music_prompt
+        for music_revision in range(2):
+            music_payload = self._request_json(
+                music_request,
+                MUSIC_PLAN_SCHEMA,
+                model=self.text_model,
+                progress_activity="music_spotting",
+            )
+            normalized_music = self.validate_music_plan(
+                music_payload.get("music_plan"), locked_duration
+            )
+            violations = self.music_plan_quality_violations(
+                normalized_music, treatment
+            )
+            if not violations:
+                return normalized_music
+            if music_revision >= 1:
+                raise DirectorError(
+                    "配乐导演两次选择均违反实测能量约束，质量优先模式拒绝输出已知"
+                    "不匹配的音乐床：" + "；".join(violations)
+                    + " / Music directing failed measured energy constraints twice; "
+                    "quality-first mode refuses a known-mismatched music bed: "
+                    + "; ".join(violations)
+                )
+            self.logger.warning(
+                "Music cue sheet contradicted measured audio energy; returning it "
+                "to the director for one grounded reselection: %s",
+                "; ".join(violations),
+            )
+            music_request = (
+                music_prompt + "\nREJECTED MUSIC PLAN:\n"
+                + json.dumps(normalized_music, ensure_ascii=False, separators=(",", ":"))
+                + "\nMEASURED MUSIC FAILURES:\n"
+                + json.dumps(violations, ensure_ascii=False)
+                + "\nReturn a materially different, measurement-grounded music_plan."
+            )
+        raise DirectorError("Unreachable music quality-gate state.")
+
     def enforce_dialogue_ducking(
         self,
         clips: Sequence[Dict[str, Any]],
@@ -4729,7 +7368,13 @@ class AIDirector:
             absolute_beats.extend(
                 float(value) for value in beats if isinstance(value, (int, float))
             )
-        if not absolute_beats:
+        absolute_beats = sorted(
+            {value for value in absolute_beats if math.isfinite(value)}
+        )
+        absolute_priority = sorted(
+            {value for value in absolute_priority if math.isfinite(value)}
+        )
+        if not absolute_beats and not absolute_priority:
             return [dict(item) for item in clips]
         asset_duration = {
             str(asset.get("asset_id") or ""): self._authoritative_asset_duration(asset)
@@ -4750,22 +7395,56 @@ class AIDirector:
             proposed_end = timeline_cursor + duration
             source_in = float(item.get("cut_in_sec", 0))
             source_out = float(item.get("cut_out_sec", 0))
-            has_dialogue = str(item.get("story_role") or "").casefold() == "interview" or any(
+            has_dialogue = bool(item.get("has_dialogue")) or str(
+                item.get("story_role") or ""
+            ).casefold() == "interview" or any(
                 min(source_out, float(segment.get("end_sec", 0)))
                 - max(source_in, float(segment.get("start_sec", 0))) >= 0.15
                 for segment in transcript_by_asset.get(str(item.get("asset_id") or ""), [])
             )
             music_role = str(item.get("music_edit_role") or "on_beat").casefold()
-            landmarks = (
-                absolute_priority
-                if music_role in {"phrase_start", "payoff_hit", "release"} and absolute_priority
-                else absolute_beats
-            )
+            if music_role in {"phrase_start", "payoff_hit", "release"}:
+                landmarks = absolute_priority or absolute_beats
+            else:
+                landmarks = absolute_beats or absolute_priority
             if not has_dialogue and music_role != "natural_sound" and landmarks:
                 nearest = min(landmarks, key=lambda beat: abs(beat - proposed_end))
                 shift = nearest - proposed_end
                 source_end = float(item.get("cut_out_sec", 0)) + shift
-                maximum = asset_duration.get(str(item.get("asset_id") or ""), source_end)
+                reviewed_bounds = item.get("reviewed_trim_bounds")
+                try:
+                    reviewed_out = float(
+                        reviewed_bounds.get("out_sec")
+                        if isinstance(reviewed_bounds, dict)
+                        else source_out
+                    )
+                except (TypeError, ValueError):
+                    reviewed_out = source_out
+                if not math.isfinite(reviewed_out):
+                    reviewed_out = source_out
+                # Missing reviewed bounds are fail-closed: an old plan may be
+                # shortened to a beat, but it may never invent unseen handles.
+                # 缺少已审句柄时采用保守策略：可缩短，不得向未审画面延长。
+                maximum = max(source_in, reviewed_out)
+                source_duration = asset_duration.get(
+                    str(item.get("asset_id") or ""), 0.0
+                )
+                if source_duration > 0:
+                    maximum = min(maximum, source_duration)
+                try:
+                    action_apex = float(item.get("action_apex_sec", source_in))
+                except (TypeError, ValueError):
+                    action_apex = source_in
+                if not math.isfinite(action_apex):
+                    action_apex = source_in
+                minimum_out = max(source_in + 0.4, action_apex)
+                extension_has_dialogue = source_end > source_out and any(
+                    min(source_end, float(segment.get("end_sec", 0)))
+                    - max(source_out, float(segment.get("start_sec", 0))) > 1e-6
+                    for segment in transcript_by_asset.get(
+                        str(item.get("asset_id") or ""), []
+                    )
+                )
                 new_duration = duration + shift
                 allowed_shift = (
                     0.75 if music_role == "payoff_hit"
@@ -4776,7 +7455,9 @@ class AIDirector:
                     abs(shift) <= allowed_shift
                     and new_duration >= 0.4
                     and source_end <= maximum + 1e-6
+                    and source_end >= minimum_out - 1e-6
                     and source_end > source_in
+                    and not extension_has_dialogue
                 ):
                     item["cut_out_sec"] = round(source_end, 3)
                     item["beat_snap"] = {
@@ -4894,6 +7575,315 @@ class AIDirector:
         }
         return plan
 
+    @staticmethod
+    def _require_exact_picture_page(
+        payload: Dict[str, Any],
+        expected_ids: Sequence[str],
+        *,
+        page_index: int,
+        stage: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Require one staged-output page to preserve every requested shot in order.
+        要求分阶段输出页逐一、按顺序保留全部指定镜头。
+        """
+        raw_shots = payload.get("shots")
+        shots = [item for item in raw_shots if isinstance(item, dict)] \
+            if isinstance(raw_shots, list) else []
+        returned_ids = [str(item.get("candidate_id") or "").strip() for item in shots]
+        wanted_ids = [str(value) for value in expected_ids]
+        if returned_ids != wanted_ids:
+            raise DirectorError(
+                f"{stage} 第 {page_index} 页镜头 ID 不完整或顺序改变："
+                f"expected={wanted_ids}, returned={returned_ids}。禁止静默补齐或丢镜头。 / "
+                f"{stage} page {page_index} changed or lost shot IDs. Silent filling or "
+                "dropping is forbidden."
+            )
+        try:
+            returned_page_index = int(payload.get("page_index", page_index))
+        except (TypeError, ValueError):
+            returned_page_index = -1
+        if returned_page_index != page_index:
+            raise DirectorError(
+                f"{stage} 返回错误 page_index={returned_page_index}，应为 {page_index}。 / "
+                f"{stage} returned the wrong page index; expected {page_index}."
+            )
+        return shots
+
+    @staticmethod
+    def _picture_candidate_bounds(candidate: Dict[str, Any]) -> tuple[float, float]:
+        """Read bounds from compact or canonical candidate data. / 从紧凑或标准候选读取边界。"""
+        try:
+            start = float(candidate.get("in", candidate.get("cut_in_sec", 0)) or 0)
+            end = float(candidate.get("out", candidate.get("cut_out_sec", start)) or start)
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+        return start, end
+
+    def _request_staged_picture_plan(
+        self,
+        base_prompt: str,
+        candidates: Sequence[Dict[str, Any]],
+        *,
+        include_review: bool,
+        progress_activity: str,
+    ) -> Dict[str, Any]:
+        """
+        Author a long picture lock without one unbounded verbose JSON response.
+        通过紧凑全局顺序与严格分页生成长片锁画，避免一次返回无限长 JSON。
+
+        Parameters / 参数:
+            base_prompt: Global editorial evidence and instructions. / 全局剪辑证据与指令。
+            candidates: Context-safe candidates eligible for selection. / 可选的上下文安全候选。
+            include_review: Require supervising review scores and notes. / 是否要求总剪辑复审。
+            progress_activity: Existing UI progress activity label. / 现有 UI 进度活动标签。
+        """
+        candidate_map = {
+            str(item.get("candidate_id") or "").strip(): item
+            for item in candidates
+            if isinstance(item, dict) and str(item.get("candidate_id") or "").strip()
+        }
+        if not candidate_map:
+            raise DirectorError(
+                "分阶段锁画没有可用候选 / Staged picture lock has no candidates."
+            )
+        order_schema = (
+            PICTURE_ORDER_REVIEW_SCHEMA if include_review else PICTURE_ORDER_SCHEMA
+        )
+        order_prompt = (
+            base_prompt
+            + "\n\nPICTURE ORDER MANIFEST — BOUNDED OUTPUT PROTOCOL. "
+            "This instruction replaces any earlier wording that asks for a complete verbose "
+            "sequence. Decide the global film now, but return only project_summary, "
+            "viewer_takeaway, editorial_style, and ordered_candidate_ids. "
+            "The array is the immutable complete picture order: include every selected shot "
+            "exactly once and no unselected IDs. Do not return trims, annotations, effects, "
+            "graphics, or a sequence object in this response. Later bounded pages will author "
+            "those details without changing this order. "
+            + (
+                "Also return the required supervising review for this revised order. "
+                if include_review else ""
+            )
+            + f"Select no more than {PICTURE_MAX_SHOTS} shots. Return JSON only."
+        )
+        order_payload = self._request_json(
+            order_prompt,
+            order_schema,
+            model=self.text_model,
+            progress_activity=progress_activity,
+        )
+        # Compatibility for older tests/adapters that return a complete parsed
+        # plan despite the new schema. A truncated response never reaches here
+        # because it is not parseable JSON. Real schema-constrained calls use
+        # ``ordered_candidate_ids`` and therefore always take the paged path.
+        # 兼容仍按旧协议返回完整且可解析方案的测试/适配器；真实 Schema 请求始终走分页。
+        legacy_sequence = order_payload.get("sequence")
+        if (
+            "ordered_candidate_ids" not in order_payload
+            and isinstance(legacy_sequence, list)
+            and legacy_sequence
+        ):
+            order_payload["_staged_output_audit"] = {
+                "protocol": "legacy-complete-compatible",
+                "selected_shot_count": len(legacy_sequence),
+                "full_verbose_sequence_requests": 1,
+            }
+            return order_payload
+
+        raw_order = order_payload.get("ordered_candidate_ids")
+        ordered_ids = [str(value).strip() for value in raw_order] \
+            if isinstance(raw_order, list) else []
+        if not ordered_ids:
+            raise DirectorError(
+                "锁画顺序清单为空 / Picture-order manifest is empty."
+            )
+        if len(ordered_ids) > PICTURE_MAX_SHOTS:
+            raise DirectorError(
+                f"锁画顺序超过协议上限 {PICTURE_MAX_SHOTS} / Picture order exceeds "
+                f"the bounded protocol limit of {PICTURE_MAX_SHOTS}."
+            )
+        if len(set(ordered_ids)) != len(ordered_ids):
+            raise DirectorError(
+                "锁画顺序包含重复 candidate_id / Picture order contains duplicate IDs."
+            )
+        unknown_ids = [candidate_id for candidate_id in ordered_ids if candidate_id not in candidate_map]
+        if unknown_ids:
+            raise DirectorError(
+                f"锁画顺序引用未知候选：{unknown_ids} / Picture order references unknown candidates."
+            )
+
+        global_direction = {
+            "project_summary": order_payload.get("project_summary", ""),
+            "viewer_takeaway": order_payload.get("viewer_takeaway", ""),
+            "editorial_style": order_payload.get("editorial_style", "hybrid_cinematic"),
+            "ordered_candidate_ids": ordered_ids,
+        }
+        skeleton: List[Dict[str, Any]] = []
+        skeleton_pages = 0
+        for offset in range(0, len(ordered_ids), PICTURE_SKELETON_PAGE_SIZE):
+            skeleton_pages += 1
+            page_ids = ordered_ids[offset:offset + PICTURE_SKELETON_PAGE_SIZE]
+            page_candidates = [candidate_map[candidate_id] for candidate_id in page_ids]
+            previous_id = ordered_ids[offset - 1] if offset else ""
+            next_offset = offset + len(page_ids)
+            next_id = ordered_ids[next_offset] if next_offset < len(ordered_ids) else ""
+            page_prompt = (
+                f"PICTURE SKELETON PAGE {skeleton_pages}. The global order is immutable. "
+                "Return exactly one shots item for every REQUIRED ID, in exactly that order. "
+                "Do not add, remove, or reorder IDs. Choose exact source-bounded trim_in_sec and "
+                "trim_out_sec plus narrative_function, audio_intent, and music_edit_role. "
+                "Preserve complete meaningful speech; visual shots should enter just before and "
+                "leave just after their useful action. Return JSON only.\n"
+                f"GLOBAL DIRECTION:\n{json.dumps(global_direction, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"PREVIOUS NEIGHBOR ID: {previous_id or '(opening)'}\n"
+                f"NEXT NEIGHBOR ID: {next_id or '(ending)'}\n"
+                f"REQUIRED IDS:\n{json.dumps(page_ids, ensure_ascii=False)}\n"
+                f"CANDIDATE EVIDENCE:\n{json.dumps(page_candidates, ensure_ascii=False, separators=(',', ':'))}"
+            )
+            page_payload = self._request_json(
+                page_prompt,
+                PICTURE_SKELETON_PAGE_SCHEMA,
+                model=self.text_model,
+                progress_activity=progress_activity,
+            )
+            page_shots = self._require_exact_picture_page(
+                page_payload,
+                page_ids,
+                page_index=skeleton_pages,
+                stage="picture skeleton",
+            )
+            for shot in page_shots:
+                candidate_id = str(shot["candidate_id"])
+                candidate_in, candidate_out = self._picture_candidate_bounds(
+                    candidate_map[candidate_id]
+                )
+                try:
+                    trim_in = float(shot.get("trim_in_sec"))
+                    trim_out = float(shot.get("trim_out_sec"))
+                except (TypeError, ValueError) as exc:
+                    raise DirectorError(
+                        f"镜头 {candidate_id} 的剪点不是数字 / Non-numeric trim."
+                    ) from exc
+                if trim_in < candidate_in - 0.001 or trim_out > candidate_out + 0.001 or trim_out <= trim_in:
+                    raise DirectorError(
+                        f"镜头 {candidate_id} 剪点越界：{trim_in}-{trim_out}，"
+                        f"候选范围 {candidate_in}-{candidate_out} / Staged trim is out of bounds."
+                    )
+                skeleton.append(dict(shot))
+
+        skeleton_by_id = {
+            str(item["candidate_id"]): item for item in skeleton
+        }
+        enrichment_by_id: Dict[str, Dict[str, Any]] = {}
+        enrichment_pages = 0
+        for offset in range(0, len(ordered_ids), PICTURE_ENRICHMENT_PAGE_SIZE):
+            enrichment_pages += 1
+            page_ids = ordered_ids[offset:offset + PICTURE_ENRICHMENT_PAGE_SIZE]
+            page_skeleton = [skeleton_by_id[candidate_id] for candidate_id in page_ids]
+            page_candidates = [candidate_map[candidate_id] for candidate_id in page_ids]
+            neighbor_start = max(0, offset - 1)
+            neighbor_end = min(len(ordered_ids), offset + len(page_ids) + 1)
+            neighbor_skeleton = [
+                skeleton_by_id[candidate_id]
+                for candidate_id in ordered_ids[neighbor_start:neighbor_end]
+            ]
+            page_prompt = (
+                f"PICTURE ENRICHMENT PAGE {enrichment_pages}. The global order, IDs, trims, "
+                "narrative functions, audio intents, and music roles are already locked. "
+                "Return exactly one shots item per REQUIRED ID in exactly that order. Do not "
+                "change or omit a shot. Add concise literal viewer information, position reason, "
+                "evidence claim, connection to previous, and executable technical choices. "
+                "Evidence claims must remain visible/audible facts. Use a hard cut unless an "
+                "explicit supported chapter boundary requires otherwise. Return JSON only.\n"
+                f"GLOBAL DIRECTION:\n{json.dumps(global_direction, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"REQUIRED IDS:\n{json.dumps(page_ids, ensure_ascii=False)}\n"
+                f"LOCKED PAGE SKELETON:\n{json.dumps(page_skeleton, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"NEIGHBOR CONTEXT:\n{json.dumps(neighbor_skeleton, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"CANDIDATE EVIDENCE:\n{json.dumps(page_candidates, ensure_ascii=False, separators=(',', ':'))}"
+            )
+            page_payload = self._request_json(
+                page_prompt,
+                PICTURE_ENRICHMENT_PAGE_SCHEMA,
+                model=self.text_model,
+                progress_activity=progress_activity,
+            )
+            page_shots = self._require_exact_picture_page(
+                page_payload,
+                page_ids,
+                page_index=enrichment_pages,
+                stage="picture enrichment",
+            )
+            enrichment_by_id.update(
+                (str(item["candidate_id"]), dict(item)) for item in page_shots
+            )
+
+        sequence: List[Dict[str, Any]] = []
+        for candidate_id in ordered_ids:
+            merged = dict(skeleton_by_id[candidate_id])
+            merged.update(enrichment_by_id[candidate_id])
+            sequence.append(merged)
+        if [str(item.get("candidate_id") or "") for item in sequence] != ordered_ids:
+            raise DirectorError(
+                "分页锁画合并后 ID 不一致 / Staged picture merge changed shot IDs."
+            )
+
+        graphics_evidence = [
+            {
+                "candidate_id": candidate_id,
+                "narrative_function": skeleton_by_id[candidate_id].get("narrative_function"),
+                "visual_summary": self._compact_prompt_text(
+                    candidate_map[candidate_id].get("visual_summary", ""), 80
+                ),
+            }
+            for candidate_id in ordered_ids
+        ]
+        graphics_prompt = (
+            "PICTURE GRAPHICS PASS. Picture order and trims are locked. Design at most six "
+            "executable graphics using only selected candidate IDs as anchors. Prefer zero to "
+            "two graphics for a sub-two-minute film; never use text to invent a missing event. "
+            "Return graphics_plan JSON only.\n"
+            f"GLOBAL DIRECTION:\n{json.dumps(global_direction, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"SELECTED SHOTS:\n{json.dumps(graphics_evidence, ensure_ascii=False, separators=(',', ':'))}"
+        )
+        graphics_payload = self._request_json(
+            graphics_prompt,
+            PICTURE_GRAPHICS_SCHEMA,
+            model=self.text_model,
+            progress_activity=progress_activity,
+        )
+        result: Dict[str, Any] = {
+            "project_summary": global_direction["project_summary"],
+            "viewer_takeaway": global_direction["viewer_takeaway"],
+            "editorial_style": global_direction["editorial_style"],
+            "graphics_plan": graphics_payload.get(
+                "graphics_plan", {"strategy": "No graphics.", "items": []}
+            ),
+            "sequence": sequence,
+            "_staged_output_audit": {
+                "protocol": "ordered-manifest+paged-skeleton+paged-enrichment+graphics-v1",
+                "selected_shot_count": len(sequence),
+                "skeleton_page_size": PICTURE_SKELETON_PAGE_SIZE,
+                "enrichment_page_size": PICTURE_ENRICHMENT_PAGE_SIZE,
+                "skeleton_pages": skeleton_pages,
+                "enrichment_pages": enrichment_pages,
+                "full_verbose_sequence_requests": 0,
+                "max_verbose_shots_in_any_request": PICTURE_ENRICHMENT_PAGE_SIZE,
+                "output_request_count": 2 + skeleton_pages + enrichment_pages,
+            },
+        }
+        if include_review:
+            result["review"] = order_payload.get("review", {})
+        self.logger.info(
+            "长片锁画分页完成：%d 镜头，骨架 %d 页，富化 %d 页，每次最多 %d 个富文本镜头 / "
+            "Paged picture lock complete: %d shots, %d skeleton pages, %d enrichment pages, "
+            "at most %d verbose shots per output request",
+            len(sequence), skeleton_pages, enrichment_pages,
+            PICTURE_ENRICHMENT_PAGE_SIZE,
+            len(sequence), skeleton_pages, enrichment_pages,
+            PICTURE_ENRICHMENT_PAGE_SIZE,
+        )
+        return result
+
     def request_sequence(
         self,
         candidates: Sequence[Dict[str, Any]],
@@ -4967,6 +7957,16 @@ class AIDirector:
                     ),
                     "confidence": item.get("confidence", 0.5),
                     "quality_score": item.get("quality_score", 0.5),
+                    "temporal_review": (
+                        {
+                            "status": str(item["temporal_refinement"].get("status") or ""),
+                            "advisory": self._compact_prompt_text(
+                                item["temporal_refinement"].get("decision_reason"), 180
+                            ),
+                        }
+                        if isinstance(item.get("temporal_refinement"), dict)
+                        else {}
+                    ),
                 }
             )
             if speech_intervals is None:
@@ -5066,7 +8066,8 @@ class AIDirector:
         ]
         coverage_prompt = (
             "CONTINUOUS FULL-FOOTAGE SYNTHESIS. The vision pass has inspected every "
-            "saved one-fps visual sample in chronological order and carried state across "
+            "saved 2-fps survey sample in chronological order, densely rewatched short "
+            "event atoms, and carried state across "
             "overlapping transport batches. Synthesize the complete source summaries into "
             "one grounded project memory before selecting shots. Track people, locations, "
             "actions, reactions, cause/effect, recurring motifs, and unresolved intentions. "
@@ -5091,6 +8092,7 @@ class AIDirector:
             coverage_prompt,
             COVERAGE_SYNOPSIS_SCHEMA,
             model=self.text_model,
+            progress_activity="coverage_synthesis",
         )
         coverage_synopsis = self._normalize_coverage_synopsis(
             coverage_synopsis, compact_treatment
@@ -5102,9 +8104,10 @@ class AIDirector:
             active_candidates: Sequence[Dict[str, Any]],
         ) -> str:
             return (
-                "PICTURE ASSEMBLY STEP 1/2. You have already inspected every saved one-fps frame and transcripts "
+                "PICTURE ASSEMBLY STEP 1/2. You have already inspected every saved 2-fps survey frame, "
+                "densely rewatched short event atoms, and read transcripts "
                 "from every source video in continuous order. The FULL COVERAGE SYNOPSIS was synthesized "
-                "from every one-fps visual sample in chronological order; use it to understand "
+                "from complete chronological evidence; use it to understand "
                 "the whole action and intention, not only the editable candidates. Build one "
                 "coherent documentary edit from "
                 "the candidate list below. Select only useful candidate_id values, "
@@ -5146,10 +8149,11 @@ class AIDirector:
                 "chapter words, lower thirds, or an end card only when they clarify the premise, "
                 "structure, identity, or payoff; typography may be bold and stylish but cannot name "
                 "an event that the selected picture never shows. "
-                "Choose restrained "
-                "transitions and effects from the schema; default to hard cuts, use "
-                "cross dissolves for genuine time/mood changes, and fade_black only "
-                "for major chapter endings. Keep the sum of selected clip durations at "
+                "Use hard cuts for this automated deliverable: they are the only transition "
+                "that the public Resolve API, FFmpeg review, and conformed audio can execute "
+                "with identical timing. Express genuine chapter changes through shot choice, "
+                "sound, graphics, or a cut to black, not an unsupported overlap. Keep the sum "
+                "of selected clip durations at "
                 f"or below {self._active_target_duration_sec * 1.10:.1f} seconds. A shorter "
                 "complete film is better than padding to the target: never repeat an action, "
                 "idea, lineup, countdown, or setup merely to reach runtime. Select only "
@@ -5174,7 +8178,13 @@ class AIDirector:
         sequence_prompt = build_sequence_prompt(compact_candidates)
         candidate_directing: Dict[str, Any] = {
             "mode": "single_pass_full_ledger",
+            "requested_context_tokens": self.num_ctx,
             "configured_context_tokens": self._effective_num_ctx(self.text_model),
+            "context_policy": (
+                "70b_72b_mixed_memory_hard_cap"
+                if self._effective_num_ctx(self.text_model) < self.num_ctx
+                else "configured_context"
+            ),
             "all_candidate_count": len(compact_candidates),
             "final_assembly_candidate_count": len(compact_candidates),
             "all_candidates_considered": True,
@@ -5191,14 +8201,15 @@ class AIDirector:
         review_round_number = 0
         while not self._request_has_capacity(
             build_sequence_prompt(review_pool),
-            SEQUENCE_SELECTION_SCHEMA,
+            PICTURE_ORDER_SCHEMA,
             model=self.text_model,
-            reserve_output_tokens=2048,
+            reserve_output_tokens=1024,
         ):
             if len(review_pool) <= 1:
                 raise DirectorError(
-                    "即使只有一个候选，完整导演上下文仍然超限；请提高 Context。"
-                    " / Even one candidate cannot fit the global director context; increase Context."
+                    "即使只有一个候选，全局导演固定证据仍无法放入有效 Context。 / "
+                    "Even one candidate cannot fit the global director fixed evidence. "
+                    + self._context_capacity_guidance(self.text_model)
                 )
             review_round_number += 1
             previous_count = len(review_pool)
@@ -5212,8 +8223,9 @@ class AIDirector:
             candidate_directing["review_rounds"].append(round_audit)
             if len(review_pool) >= previous_count:
                 raise DirectorError(
-                    "分页导演未能缩小最终汇总输入；请提高 Context 后重试。"
-                    " / Paged directing did not reduce the final assembly input; increase Context."
+                    "分页导演未能缩小最终汇总输入。 / "
+                    "Paged directing did not reduce final assembly input. "
+                    + self._context_capacity_guidance(self.text_model)
                 )
             if review_round_number >= 8:
                 raise DirectorError(
@@ -5238,11 +8250,14 @@ class AIDirector:
             len(candidates),
             len(candidates),
         )
-        sequence_payload = self._request_json(
+        sequence_payload = self._request_staged_picture_plan(
             sequence_prompt,
-            SEQUENCE_SELECTION_SCHEMA,
-            model=self.text_model,
+            review_pool,
+            include_review=False,
             progress_activity="picture_assembly",
+        )
+        candidate_directing["draft_picture_output_protocol"] = dict(
+            sequence_payload.get("_staged_output_audit") or {}
         )
 
         # A separate supervising-editor pass protects narrative logic and factual
@@ -5297,24 +8312,28 @@ class AIDirector:
         )
         if not self._request_has_capacity(
             supervising_prompt,
-            SUPERVISING_EDITOR_SCHEMA,
+            PICTURE_ORDER_REVIEW_SCHEMA,
             model=self.text_model,
-            reserve_output_tokens=1536,
+            reserve_output_tokens=1024,
         ):
             raise DirectorError(
-                "总剪辑复审无法完整放入当前 Context；请提高 Context，禁止跳过叙事复审。"
-                " / Supervising-editor review does not fit the current Context; increase it."
+                "总剪辑复审的固定证据无法完整放入有效 Context；禁止跳过叙事复审。 / "
+                "Supervising-editor fixed evidence does not fit; review cannot be skipped. "
+                + self._context_capacity_guidance(self.text_model)
             )
         self.logger.info(
             "正在由总剪辑师复审叙事与证据（镜头第 2/2 步）/ "
             "Supervising editor reviewing story and evidence (picture step 2/2)"
         )
         draft_sequence_payload = sequence_payload
-        sequence_payload = self._request_json(
+        sequence_payload = self._request_staged_picture_plan(
             supervising_prompt,
-            SUPERVISING_EDITOR_SCHEMA,
-            model=self.text_model,
+            review_pool,
+            include_review=True,
             progress_activity="picture_critique",
+        )
+        candidate_directing["supervised_picture_output_protocol"] = dict(
+            sequence_payload.get("_staged_output_audit") or {}
         )
         quality_audit_rounds: List[Dict[str, Any]] = []
         max_quality_revisions = 3
@@ -5528,13 +8547,14 @@ class AIDirector:
             )
             if not self._request_has_capacity(
                 recut_prompt,
-                SUPERVISING_EDITOR_SCHEMA,
+                PICTURE_ORDER_REVIEW_SCHEMA,
                 model=self.text_model,
-                reserve_output_tokens=2048,
+                reserve_output_tokens=1024,
             ):
                 raise DirectorError(
-                    "质量门重剪无法完整放入当前 Context；请提高 Context。"
-                    " / Quality-gate recut cannot fit the current Context; increase Context."
+                    "质量门重剪的固定证据无法完整放入有效 Context。 / "
+                    "Quality-gate recut fixed evidence does not fit. "
+                    + self._context_capacity_guidance(self.text_model)
                 )
             self.logger.info(
                 "正在执行质量门退回重剪 %d/%d / Quality-gate recut %d/%d",
@@ -5551,10 +8571,10 @@ class AIDirector:
                     max_quality_revisions,
                 )
             structural_reset_used = structural_reset_used or force_structural_reset
-            sequence_payload = self._request_json(
+            sequence_payload = self._request_staged_picture_plan(
                 recut_prompt,
-                SUPERVISING_EDITOR_SCHEMA,
-                model=self.text_model,
+                review_pool,
+                include_review=True,
                 progress_activity="picture_recut",
             )
 
@@ -5564,23 +8584,19 @@ class AIDirector:
         blind_review = best_blind_review
         quality_gate_degraded = bool(quality_violations)
         if quality_gate_degraded:
-            # Narrative quality scores are advisory after all bounded AI recuts have
-            # been exhausted.  They must not turn a structurally valid, complete edit
-            # into a late workflow crash.  Preserve the best director-authored plan;
-            # do not let Python invent a replacement edit behind the director's back.
-            # 叙事质量分在有限次 AI 重剪耗尽后属于质量告警，不能把结构完整的最佳导演
-            # 方案变成工作流末尾崩溃；Python 也不得越权静默改剪。
-            details = json.dumps(
-                quality_violations,
-                ensure_ascii=False,
-                separators=(",", ":"),
+            # Never ship a cut that the system itself says a blind viewer cannot
+            # understand.  The caller may retry a different evidence-backed
+            # concept; if all concepts fail, the workflow stops before Resolve.
+            # 绝不交付系统自己判定“陌生观众看不懂”的版本；调用方可改试另一构想，
+            # 三种构想均失败时则在进入 Resolve 前停止。
+            self.logger.error(
+                "导演质量门耗尽重剪且仍未通过；拒绝把已知不合格版本送入 Resolve / "
+                "Editorial gate exhausted all recuts; refusing a known-bad Resolve render"
             )
-            self.logger.warning(
-                "导演质量门已耗尽有限重剪；将保留评分最高的完整导演方案并继续后续阶段。"
-                "未解决问题会写入 timeline_cuts.json / Director quality gate exhausted "
-                "its bounded recuts; preserving the best complete director-authored plan "
-                "and continuing. Unresolved advisories: %s",
-                details,
+            raise EditorialQualityError(
+                quality_violations,
+                metrics=final_metrics,
+                blind_review=blind_review,
             )
 
         draft_picture_signature = json.dumps(
@@ -5619,6 +8635,9 @@ class AIDirector:
         candidate_directing["blind_viewer_review"] = blind_review
         candidate_directing["supervising_review"] = sequence_payload.get("review", {})
         candidate_directing["draft_picture_plan"] = draft_sequence_payload
+        candidate_directing["final_picture_output_protocol"] = dict(
+            sequence_payload.get("_staged_output_audit") or {}
+        )
         self.logger.info(
             "总剪辑复审指标：对白占比 %.1f%% → %.1f%%，字卡 %d → %d，平均镜长 %.1fs → %.1fs / "
             "Supervising metrics: dialogue %.1f%% -> %.1f%%, graphics %d -> %d, average shot %.1fs -> %.1fs",
@@ -5679,56 +8698,12 @@ class AIDirector:
                 "正在设计最终配乐（第 2/2 步：音乐）/ "
                 "Designing final music (step 2/2: cue sheet)"
             )
-            music_request = music_prompt
-            music_plan = None
-            music_violations: List[str] = []
-            for music_revision in range(2):
-                music_payload = self._request_json(
-                    music_request,
-                    MUSIC_PLAN_SCHEMA,
-                    model=self.text_model,
-                    progress_activity="music_spotting",
-                )
-                music_plan = music_payload.get("music_plan")
-                normalized_music = self.validate_music_plan(music_plan, locked_duration)
-                music_violations = self.music_plan_quality_violations(
-                    normalized_music, compact_treatment
-                )
-                # Always hand the structurally validated form to downstream audio
-                # conforming, even when its artistic energy match remains imperfect.
-                # 即使艺术能量匹配仍不理想，下游也只接收经过结构校验的安全版本。
-                music_plan = normalized_music
-                if not music_violations:
-                    break
-                if music_revision >= 1:
-                    self.logger.warning(
-                        "配乐导演重选后仍有能量匹配告警；将保留校验后的最佳方案并继续。"
-                        " / Music reselection still has measured energy advisories; "
-                        "preserving the validated plan and continuing: %s",
-                        "; ".join(music_violations),
-                    )
-                    break
-                self.logger.warning(
-                    "Music cue sheet contradicted measured audio energy; returning it "
-                    "to the director for one grounded reselection: %s",
-                    "; ".join(music_violations),
-                )
-                music_request = (
-                    music_prompt + "\nREJECTED MUSIC PLAN:\n"
-                    + json.dumps(music_plan, ensure_ascii=False, separators=(",", ":"))
-                    + "\nMEASURED MUSIC FAILURES:\n"
-                    + json.dumps(music_violations, ensure_ascii=False)
-                    + "\nReturn a materially different, measurement-grounded music_plan."
-                )
-            candidate_directing["music_quality_gate_passed"] = not bool(
-                music_violations
+            music_plan = self._request_quality_gated_music_plan(
+                music_prompt, locked_duration, compact_treatment
             )
-            candidate_directing["music_quality_gate_degraded_acceptance"] = bool(
-                music_violations
-            )
-            candidate_directing["unresolved_music_advisories"] = list(
-                music_violations
-            )
+            candidate_directing["music_quality_gate_passed"] = True
+            candidate_directing["music_quality_gate_degraded_acceptance"] = False
+            candidate_directing["unresolved_music_advisories"] = []
         else:
             music_plan = {
                 "strategy": "No analyzed music candidates were supplied.",
@@ -5899,7 +8874,12 @@ class AIDirector:
                 len(pages),
                 len(candidate_page),
             )
-            payload = self._request_json(prompt, schema, model=self.text_model)
+            payload = self._request_json(
+                prompt,
+                schema,
+                model=self.text_model,
+                progress_activity="candidate_page_review",
+            )
             page_by_id = {
                 str(item.get("candidate_id") or ""): item for item in candidate_page
             }
@@ -5955,21 +8935,84 @@ class AIDirector:
         return text if len(text) <= limit else text[: max(1, limit - 1)].rstrip() + "…"
 
     @classmethod
+    def _compact_prompt_value(cls, value: Any, depth: int = 0) -> Any:
+        """
+        Recursively bound a schema value and remove durable audit structures.
+        递归限制 Schema 值，并移除只应持久化的审片结构。
+
+        Parameters / 参数:
+            value: Validated value crossing into a model prompt. / 将进入模型提示的已校验值。
+            depth: Current recursion depth. / 当前递归深度。
+        """
+        if isinstance(value, str):
+            return cls._compact_prompt_text(value, 320 if depth <= 1 else 180)
+        if isinstance(value, (bool, int, float)) or value is None:
+            return value
+        if depth >= 5:
+            return [] if isinstance(value, (list, tuple)) else {}
+        if isinstance(value, (list, tuple)):
+            return [
+                cls._compact_prompt_value(item, depth + 1)
+                for item in list(value)[:16]
+            ]
+        if isinstance(value, dict):
+            blocked = {
+                "candidate_audit", "evidence_review", "pages",
+                "input_candidate_ids", "footage_ledger", "evidence_fingerprint",
+                "generated_at_utc", "director_model",
+            }
+            return {
+                str(key): cls._compact_prompt_value(nested, depth + 1)
+                for key, nested in list(value.items())[:24]
+                if str(key) not in blocked
+            }
+        return cls._compact_prompt_text(value, 180)
+
+    @classmethod
     def _compact_treatment_for_prompt(cls, treatment: Dict[str, Any]) -> Dict[str, Any]:
-        """Keep treatment semantics while removing prompt-only verbosity. / 保留导演意图并压缩提示。"""
+        """
+        Keep treatment semantics without embedding durable audit pages.
+        保留导演意图，但绝不将持久化审片分页嵌入模型提示。
+
+        ``concept_tournament.evidence_review`` can contain every hierarchical
+        ledger page and is provenance, not a directing instruction. Copying it
+        into every downstream prompt causes recursive context growth. Only the
+        selected concept and bounded treatment-schema fields cross this boundary.
+
+        ``concept_tournament.evidence_review`` 可能包含全部分层账本，它是
+        溯源记录而非导演指令。此边界只传递优胜构想与有界的阐述字段。
+        """
+        allowed = set(TREATMENT_SCHEMA.get("properties", {})) | {
+            "selected_concept_id",
+        }
         compact: Dict[str, Any] = {}
         for key, value in treatment.items():
-            if key in {"generated_at_utc", "director_model", "story_anchors"}:
+            if key not in allowed or key == "story_anchors":
                 continue
-            if isinstance(value, str):
-                compact[key] = cls._compact_prompt_text(value, 320)
-            elif isinstance(value, list):
-                compact[key] = [
-                    cls._compact_prompt_text(item, 180) if isinstance(item, str) else item
-                    for item in value[:12]
-                ]
-            else:
-                compact[key] = value
+            compact[key] = cls._compact_prompt_value(value)
+
+        tournament = treatment.get("concept_tournament")
+        if isinstance(tournament, dict):
+            selected_id = str(
+                treatment.get("selected_concept_id")
+                or tournament.get("selected_concept_id")
+                or ""
+            ).strip()
+            selected_concept = next(
+                (
+                    item for item in tournament.get("concepts", [])
+                    if isinstance(item, dict)
+                    and str(item.get("concept_id") or "") == selected_id
+                ),
+                {},
+            )
+            compact["concept_tournament"] = {
+                "selected_concept_id": selected_id,
+                "selection_reason": cls._compact_prompt_text(
+                    tournament.get("selection_reason"), 320
+                ),
+                "selected_concept": cls._compact_prompt_value(selected_concept),
+            }
         anchors = treatment.get("story_anchors") or []
         compact["story_anchors"] = [
             {
@@ -6241,6 +9284,14 @@ class AIDirector:
             clip = dict(by_id[candidate_id])
             candidate_in = float(clip.get("cut_in_sec", 0) or 0)
             candidate_out = float(clip.get("cut_out_sec", candidate_in) or candidate_in)
+            # Preserve the neutral/dense-reviewed candidate envelope before the
+            # text director applies an optional tighter trim. Beat snapping may
+            # use this verified handle but must never cross it.
+            # 文字导演二次收窄前保留中立/密集复审边界；卡点只能使用该已审句柄。
+            clip["reviewed_trim_bounds"] = {
+                "in_sec": round(candidate_in, 3),
+                "out_sec": round(candidate_out, 3),
+            }
             trim_in = self._finite_float(
                 sequence_item.get("trim_in_sec", candidate_in),
                 f"sequence[{index}].trim_in_sec",
@@ -6361,6 +9412,20 @@ class AIDirector:
                 if clip["transition_to_next"] == "cut"
                 else round(min(2.0, max(0.1, transition_duration)), 3)
             )
+            if clip["transition_to_next"] != "cut":
+                # Resolve's public API cannot place a general transition with
+                # deterministic overlap. Keeping it only in the FFmpeg preview
+                # shortens that render but not Resolve/program audio. Preserve the
+                # creative request as an audit hint and execute a matched hard cut.
+                # Resolve 公开 API 无法可靠创建带重叠的通用转场；为保证审片、原声和
+                # Resolve 同长，记录导演意图但实际统一执行硬切。
+                clip["requested_transition_to_next"] = clip["transition_to_next"]
+                clip["requested_transition_duration_sec"] = clip[
+                    "transition_duration_sec"
+                ]
+                clip["transition_execution"] = "hard_cut_for_cross_engine_sync"
+                clip["transition_to_next"] = "cut"
+                clip["transition_duration_sec"] = 0.0
             volume_db = self._finite_float(
                 sequence_item.get("volume_db", clip.get("volume_db", 0.0)),
                 f"sequence[{index}].volume_db",
@@ -6702,15 +9767,18 @@ class AIDirector:
         """
         available: List[Dict[str, Any]] = []
         encoded: List[str] = []
+        failures: List[str] = []
         for frame in frames:
             path_text = str(frame.get("image_path") or "").strip()
             if not path_text:
+                failures.append(str(frame.get("file_name") or "(missing image_path)"))
                 continue
             path = Path(path_text).expanduser()
             if not path.is_file():
                 self.logger.warning(
                     "关键帧不存在，跳过：%s / Missing keyframe: %s", path, path
                 )
+                failures.append(str(path))
                 continue
             try:
                 data = path.read_bytes()
@@ -6718,9 +9786,17 @@ class AIDirector:
                 self.logger.warning(
                     "无法读取关键帧 %s：%s / Cannot read keyframe", path, exc
                 )
+                failures.append(f"{path}: {exc}")
                 continue
             available.append(dict(frame))
             encoded.append(base64.b64encode(data).decode("ascii"))
+        if failures:
+            preview = "; ".join(failures[:5])
+            suffix = f" (+{len(failures) - 5})" if len(failures) > 5 else ""
+            raise DirectorError(
+                "关键帧证据缺失或不可读，不能继续完整审片："
+                f"{preview}{suffix} / Missing or unreadable visual evidence; full review aborted."
+            )
         return available, encoded
 
     @staticmethod
@@ -6792,6 +9868,7 @@ class AIDirector:
         payload: Dict[str, Any],
         chunk: Dict[str, Any],
         source_name: str,
+        neutral_evidence: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Validate model decisions and clamp only one-second boundary drift.
@@ -6835,7 +9912,7 @@ class AIDirector:
                 # the new core belong to the neighboring transport batch.
                 continue
             maximum_duration = self._max_candidate_duration(story_role)
-            if cut_out - cut_in > maximum_duration:
+            if not neutral_evidence and cut_out - cut_in > maximum_duration:
                 self.logger.warning(
                     "候选片段超过 %s 角色上限 %.1f 秒，已截短：%.3f-%.3f / Candidate exceeded role limit and was shortened",
                     story_role, maximum_duration, cut_in, cut_out,
@@ -6846,7 +9923,12 @@ class AIDirector:
                     f"decisions[{index}] 时间范围过短或无效 / range is invalid."
                 )
             reason = " ".join(
-                str(decision.get("reason_for_cut", "")).split()
+                str(
+                    decision.get("reason_for_cut")
+                    or decision.get("visual_summary")
+                    or decision.get("subject_action")
+                    or ""
+                ).split()
             )
             if not reason:
                 raise DirectorError(
@@ -6857,8 +9939,16 @@ class AIDirector:
                 confidence, f"decisions[{index}].confidence"
             )
             confidence_value = min(1.0, max(0.0, confidence_value))
+            readability = self._enum_value(
+                decision.get("technical_readability"),
+                {"clear", "limited", "unreadable"},
+                "clear",
+            )
             quality_value = self._finite_float(
-                decision.get("quality_score", confidence_value),
+                decision.get(
+                    "quality_score",
+                    {"clear": 0.85, "limited": 0.55, "unreadable": 0.2}[readability],
+                ),
                 f"decisions[{index}].quality_score",
             )
             quality_value = min(1.0, max(0.0, quality_value))
@@ -6871,14 +9961,16 @@ class AIDirector:
                 decision.get("transition_duration_sec", 0.0),
                 f"decisions[{index}].transition_duration_sec",
             )
-            validated.append(
-                {
+            validated_item = {
                     "file_name": source_name,
                     "cut_in_sec": round(cut_in, 3),
                     "cut_out_sec": round(cut_out, 3),
-                    "reason_for_cut": reason,
                     "confidence": round(confidence_value, 3),
                     "quality_score": round(quality_value, 3),
+                    "technical_readability": readability,
+                    "evidence_type": (
+                        "visual_atom" if neutral_evidence else "edit_candidate"
+                    ),
                     "visual_summary": " ".join(
                         str(decision.get("visual_summary") or reason).split()
                     ),
@@ -6886,12 +9978,41 @@ class AIDirector:
                         str(decision.get("subject_action") or reason).split()
                     ),
                     "emotion": " ".join(
-                        str(decision.get("emotion") or "observational").split()
+                        str(
+                            decision.get("observable_emotion")
+                            or decision.get("emotion")
+                            or "observational"
+                        ).split()
                     ),
+                    "entry_state": " ".join(
+                        str(decision.get("entry_state") or "State visible at the first supplied frame.").split()
+                    ),
+                    "action_apex": " ".join(
+                        str(decision.get("action_apex") or decision.get("subject_action") or reason).split()
+                    ),
+                    "exit_state": " ".join(
+                        str(decision.get("exit_state") or "State visible at the last supplied frame.").split()
+                    ),
+                    "screen_direction": self._enum_value(
+                        decision.get("screen_direction"),
+                        {"left", "right", "toward_camera", "away_from_camera", "mixed", "none"},
+                        "none",
+                    ),
+                    "identity_tags": [
+                        " ".join(str(value).split())
+                        for value in (
+                            decision.get("identity_tags")
+                            if isinstance(decision.get("identity_tags"), list) else []
+                        )[:8]
+                        if str(value).strip()
+                    ],
                     "action_phase": self._enum_value(
-                        decision.get("action_phase"),
-                        {"setup", "build", "action", "reaction", "payoff", "aftermath"},
-                        "action",
+                        decision.get("temporal_phase") or decision.get("action_phase"),
+                        {
+                            "state", "onset", "development", "apex", "reaction",
+                            "aftermath", "setup", "build", "action", "payoff",
+                        },
+                        "development",
                     ),
                     "shot_scale": self._enum_value(
                         decision.get("shot_scale"),
@@ -6985,7 +10106,20 @@ class AIDirector:
                         else False
                     ),
                 }
-            )
+            if neutral_evidence:
+                # No creative labels or executable finishing choices may leak
+                # into the immutable footage ledger.
+                for key in (
+                    "story_role", "transition_to_next", "transition_duration_sec",
+                    "audio_cleanup", "color_look", "motion", "volume_db",
+                    "drx_preset", "stabilization", "tracking", "smart_reframe",
+                    "rhythmic_potential",
+                ):
+                    validated_item.pop(key, None)
+                validated_item["literal_observation"] = reason
+            else:
+                validated_item["reason_for_cut"] = reason
+            validated.append(validated_item)
         return validated
 
     @staticmethod

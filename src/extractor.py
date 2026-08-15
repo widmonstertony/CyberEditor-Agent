@@ -78,9 +78,9 @@ class MediaExtractor:
         device: str = "auto",
         language: Optional[str] = None,
         scene_threshold: float = 0.28,
-        sample_interval_sec: float = 1.0,
-        min_keyframe_gap_sec: float = 1.0,
-        max_keyframes: int = 7200,
+        sample_interval_sec: float = 0.5,
+        min_keyframe_gap_sec: float = 0.5,
+        max_keyframes: int = 14400,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         """Initialize extraction policy without loading a model. / 初始化提取策略，但不加载模型。"""
@@ -199,6 +199,17 @@ class MediaExtractor:
         keyframes, video_metadata = self.extract_keyframes(
             source, frames_destination, source_color=source_color
         )
+        if not bool(video_metadata.get("visual_sampling_complete_source_span")):
+            raise ExtractionError(
+                "视觉抽帧没有覆盖完整素材时间轴，拒绝把不完整证据交给导演。"
+                f"素材：{source}；首次={video_metadata.get('visual_sampling_first_sec')}s，"
+                f"末次={video_metadata.get('visual_sampling_last_sec')}s，"
+                f"最大空洞={video_metadata.get('visual_sampling_max_gap_sec')}s，"
+                f"读取失败={video_metadata.get('visual_sampling_failed_read_count')}。"
+                "请确认 FFmpeg/OpenCV 能解码该素材并检查磁盘空间。\n"
+                "Visual sampling did not cover the complete source timeline; refusing an "
+                "incomplete director handoff. Check codec support and disk space."
+            )
         color_analysis = summarize_color_samples(
             item.get("color_metrics", {})
             for item in keyframes
@@ -235,10 +246,26 @@ class MediaExtractor:
             "visual_sampling": {
                 "mode": "continuous_temporal_coverage",
                 "requested_interval_sec": self.sample_interval_sec,
-                "effective_min_gap_sec": self.min_keyframe_gap_sec,
+                "effective_min_gap_sec": float(
+                    video_metadata.get(
+                        "visual_sampling_interval_sec",
+                        self.min_keyframe_gap_sec,
+                    )
+                ),
                 "hard_cap": self.max_keyframes,
                 "saved_frame_count": len(keyframes),
-                "complete_source_span": True,
+                "complete_source_span": bool(
+                    video_metadata.get("visual_sampling_complete_source_span")
+                ),
+                "attempted_sample_count": int(
+                    video_metadata.get("visual_sampling_attempt_count", 0) or 0
+                ),
+                "failed_read_count": int(
+                    video_metadata.get("visual_sampling_failed_read_count", 0) or 0
+                ),
+                "first_sample_sec": video_metadata.get("visual_sampling_first_sec"),
+                "last_sample_sec": video_metadata.get("visual_sampling_last_sec"),
+                "max_gap_sec": video_metadata.get("visual_sampling_max_gap_sec"),
             },
             "transcript": segments,
             "keyframes": keyframes,
@@ -372,21 +399,25 @@ class MediaExtractor:
             previous_gray = None
             last_saved_at = -self.min_keyframe_gap_sec
             timestamp = 0.0
+            attempted_samples = 0
+            failed_reads = 0
             coverage_gap = duration / max(1, self.max_keyframes - 1)
             effective_min_gap = max(
                 self.min_keyframe_gap_sec, coverage_gap
             )
             # Full-coverage mode saves every configured temporal sample.  The
             # hard cap only increases the interval for exceptionally long
-            # sources; a one-hour film at the default 1 fps stores every second.
+            # sources; a one-hour film at the default 2 fps stores every half-second.
             # 完整覆盖模式保存每个时间采样；仅当超长素材触及硬上限时才自动放宽间隔。
-            # 默认 1 fps 时，一小时素材的每一秒都会留下视觉证据。
+            # 默认 2 fps 时，一小时素材的每半秒都会留下视觉证据。
             temporal_sampling_interval = effective_min_gap
 
             while timestamp <= duration and len(keyframes) < self.max_keyframes:
+                attempted_samples += 1
                 capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
                 ok, frame = capture.read()
                 if not ok or frame is None:
+                    failed_reads += 1
                     timestamp += self.sample_interval_sec
                     continue
 
@@ -449,12 +480,41 @@ class MediaExtractor:
                 previous_gray = gray
                 timestamp += self.sample_interval_sec
 
+            saved_times = [
+                float(item.get("timestamp_sec", 0.0)) for item in keyframes
+            ]
+            coverage_gaps: List[float] = []
+            if saved_times:
+                coverage_gaps.append(max(0.0, saved_times[0]))
+                coverage_gaps.extend(
+                    max(0.0, right - left)
+                    for left, right in zip(saved_times, saved_times[1:])
+                )
+                coverage_gaps.append(max(0.0, duration - saved_times[-1]))
+            max_gap = max(coverage_gaps, default=float("inf"))
+            coverage_tolerance = max(0.2, temporal_sampling_interval * 1.6)
+            complete_source_span = bool(saved_times) and max_gap <= coverage_tolerance
             metadata = {
                 "fps": round(fps, 6),
                 "frame_count": frame_count,
                 "width": width,
                 "height": height,
                 "duration_sec": round(duration, 3),
+                "visual_sampling_interval_sec": round(
+                    temporal_sampling_interval, 6
+                ),
+                "visual_sampling_attempt_count": attempted_samples,
+                "visual_sampling_failed_read_count": failed_reads,
+                "visual_sampling_first_sec": (
+                    round(saved_times[0], 6) if saved_times else None
+                ),
+                "visual_sampling_last_sec": (
+                    round(saved_times[-1], 6) if saved_times else None
+                ),
+                "visual_sampling_max_gap_sec": (
+                    round(max_gap, 6) if math.isfinite(max_gap) else None
+                ),
+                "visual_sampling_complete_source_span": complete_source_span,
                 "source_color_profile": str(
                     (source_color or {}).get("camera_profile") or "unknown"
                 ),
@@ -714,9 +774,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--language")
     parser.add_argument("--scene-threshold", type=float, default=0.28)
-    parser.add_argument("--sample-interval", type=float, default=1.0)
-    parser.add_argument("--min-keyframe-gap", type=float, default=1.0)
-    parser.add_argument("--max-keyframes", type=int, default=7200)
+    parser.add_argument("--sample-interval", type=float, default=0.5)
+    parser.add_argument("--min-keyframe-gap", type=float, default=0.5)
+    parser.add_argument("--max-keyframes", type=int, default=14400)
     parser.add_argument(
         "--log-level",
         default="INFO",

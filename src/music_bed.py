@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 import logging
 import math
@@ -25,6 +26,12 @@ import shutil
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from .frame_edl import (
+    FrameEDLError,
+    map_original_time_to_record_frame,
+    validate_frame_edl,
+)
 
 
 LOGGER_NAME = "cybereditor.music_bed"
@@ -62,6 +69,13 @@ class MusicBedRenderer:
         if not executable:
             raise MusicBedError("未找到 FFmpeg / FFmpeg was not found on PATH.")
         self.ffmpeg = str(executable)
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            sibling = Path(self.ffmpeg).with_name("ffprobe.exe")
+            ffprobe = str(sibling) if sibling.is_file() else None
+        if not ffprobe:
+            raise MusicBedError("未找到 ffprobe / ffprobe was not found on PATH.")
+        self.ffprobe = str(ffprobe)
         self.logger = logger or logging.getLogger(LOGGER_NAME)
 
     def load_timeline(self) -> Dict[str, Any]:
@@ -76,12 +90,17 @@ class MusicBedRenderer:
 
     @staticmethod
     def _program_duration(payload: Dict[str, Any]) -> float:
-        """Calculate picture duration from validated source ranges. / 从已校验的源范围计算画面时长。"""
-        return sum(
-            max(0.0, float(item.get("cut_out_sec", 0)) - float(item.get("cut_in_sec", 0)))
-            for item in payload.get("clips", [])
-            if isinstance(item, dict)
-        )
+        """Read exact picture duration from the canonical record grid. / 从统一记录帧网格读取精确时长。"""
+        try:
+            schedule = validate_frame_edl(payload)
+            return float(
+                Decimal(int(schedule["total_record_frames"]))
+                / Decimal(str(schedule["project_fps"]))
+            )
+        except FrameEDLError as exc:
+            raise MusicBedError(
+                f"音乐床需要统一帧时间表 / Music bed requires frame_edl: {exc}"
+            ) from exc
 
     @staticmethod
     def _dialogue_intervals(payload: Dict[str, Any]) -> List[Tuple[float, float]]:
@@ -94,6 +113,20 @@ class MusicBedRenderer:
         interview clip falls back to whole-shot protection.
         旧版整镜头 ducking 会在每段都沾到一句话时压低整条音乐；现在仅保护真实说话区间。
         """
+        try:
+            schedule = validate_frame_edl(payload)
+        except FrameEDLError as exc:
+            raise MusicBedError(
+                f"对白 Ducking 需要统一帧时间表 / Dialogue ducking requires frame_edl: {exc}"
+            ) from exc
+        fps = Decimal(str(schedule["project_fps"]))
+
+        def program_second(value: object, rounding: str) -> float:
+            frame = map_original_time_to_record_frame(
+                schedule, value, rounding=rounding
+            )
+            return float(Decimal(frame) / fps)
+
         music_plan = payload.get("music_plan")
         planned = music_plan.get("dialogue_regions") if isinstance(music_plan, dict) else None
         if isinstance(planned, list):
@@ -102,8 +135,8 @@ class MusicBedRenderer:
                 if not isinstance(item, dict):
                     continue
                 try:
-                    start = float(item.get("timeline_in_sec", 0))
-                    end = float(item.get("timeline_out_sec", 0))
+                    start = program_second(item.get("timeline_in_sec", 0), "floor")
+                    end = program_second(item.get("timeline_out_sec", 0), "ceil")
                 except (TypeError, ValueError):
                     continue
                 if end - start >= 0.05:
@@ -111,15 +144,26 @@ class MusicBedRenderer:
             if explicit_ranges:
                 return explicit_ranges
         intervals: List[Tuple[float, float]] = []
-        cursor = 0.0
-        for clip in payload.get("clips", []):
+        for clip, frame_entry in zip(payload.get("clips", []), schedule["clips"]):
             if not isinstance(clip, dict):
                 continue
-            source_in = float(clip.get("cut_in_sec", 0))
-            duration = max(
-                0.0,
-                float(clip.get("cut_out_sec", 0)) - float(clip.get("cut_in_sec", 0)),
+            source_fps = Decimal(str(frame_entry["source_fps"]))
+            project_fps = fps
+            source_in_frame = Decimal(int(frame_entry["source_frame_in"]))
+            source_count = Decimal(int(frame_entry["source_frame_count"]))
+            record_in_frame = Decimal(int(frame_entry["record_frame_in"]))
+            record_count = Decimal(int(frame_entry["record_frame_count"]))
+            source_in = float(source_in_frame / source_fps)
+            source_out = float(
+                Decimal(int(frame_entry["source_frame_out_exclusive"])) / source_fps
             )
+            duration = float(record_count / project_fps)
+
+            def source_to_program(value: float) -> float:
+                source_position = Decimal(str(value)) * source_fps
+                fraction = (source_position - source_in_frame) / source_count
+                fraction = min(Decimal("1"), max(Decimal("0"), fraction))
+                return float((record_in_frame + fraction * record_count) / project_fps)
             audio_intent = str(clip.get("audio_intent") or "").casefold()
             exact_ranges = clip.get("dialogue_ranges_sec")
             added = False
@@ -128,10 +172,10 @@ class MusicBedRenderer:
                     if not isinstance(item, dict):
                         continue
                     start = max(source_in, float(item.get("start_sec", source_in)))
-                    end = min(source_in + duration, float(item.get("end_sec", source_in)))
+                    end = min(source_out, float(item.get("end_sec", source_in)))
                     if end - start < 0.05:
                         continue
-                    intervals.append((cursor + start - source_in, cursor + end - source_in))
+                    intervals.append((source_to_program(start), source_to_program(end)))
                     added = True
             if (
                 not added
@@ -150,8 +194,8 @@ class MusicBedRenderer:
                 )
                 and duration > 0
             ):
-                intervals.append((cursor, cursor + duration))
-            cursor += duration
+                clip_start = float(record_in_frame / project_fps)
+                intervals.append((clip_start, clip_start + duration))
         return intervals
 
     @staticmethod
@@ -267,6 +311,165 @@ class MusicBedRenderer:
             return float("-inf")
         return float(matches[-1])
 
+    def _probe_duration(self, path: Path) -> float:
+        """
+        Return exact container duration in seconds. / 返回容器的精确时长（秒）。
+
+        Parameters / 参数:
+            path: Existing audio file. / 已存在的音频文件。
+        """
+        completed = subprocess.run(
+            [
+                self.ffprobe, "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        try:
+            duration = float(completed.stdout.strip())
+        except (TypeError, ValueError):
+            duration = 0.0
+        if completed.returncode != 0 or not math.isfinite(duration) or duration <= 0:
+            raise MusicBedError(
+                f"无法读取音频时长 / Could not probe audio duration: {path}"
+            )
+        return duration
+
+    def _measure_window_peak_db(self, path: Path, start_sec: float, duration_sec: float) -> float:
+        """
+        Measure one planned cue window instead of only the whole bed.
+        测量单个计划 cue 时窗，而不是只验收整条音乐床。
+
+        Parameters / 参数:
+            path: Source or rendered WAV. / 源音频或已渲染 WAV。
+            start_sec: Window start in that file. / 文件内时窗起点。
+            duration_sec: Positive window duration. / 正数时窗时长。
+        """
+        completed = subprocess.run(
+            [
+                self.ffmpeg, "-hide_banner", "-nostats",
+                "-ss", f"{max(0.0, start_sec):.6f}",
+                "-t", f"{max(0.001, duration_sec):.6f}",
+                "-i", str(path), "-af", "volumedetect", "-f", "null", os.devnull,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        match = re.search(
+            r"max_volume:\s*(?P<value>-?(?:inf|\d+(?:\.\d+)?))\s*dB",
+            completed.stderr,
+            flags=re.IGNORECASE,
+        )
+        if completed.returncode != 0 or not match or match.group("value").casefold() == "-inf":
+            return float("-inf")
+        return float(match.group("value"))
+
+    @staticmethod
+    def _intervals_cover_duration(
+        intervals: Sequence[Tuple[float, float]], duration: float
+    ) -> bool:
+        """Return whether local intervals intentionally mute the whole cue. / 判断局部区间是否有意静音整条 cue。"""
+        if duration <= 0:
+            return True
+        cursor = 0.0
+        for start, end in sorted(intervals):
+            start = max(0.0, min(duration, float(start)))
+            end = max(start, min(duration, float(end)))
+            if start > cursor + 0.001:
+                return False
+            cursor = max(cursor, end)
+            if cursor >= duration - 0.001:
+                return True
+        return cursor >= duration - 0.001
+
+    def _render_stem_for_qa(
+        self,
+        *,
+        source: Path,
+        graph: str,
+        duration: float,
+        cue_id: str,
+        cue_index: int,
+        intentionally_silent: bool,
+    ) -> Optional[float]:
+        """
+        Render and inspect one isolated post-filter cue before mixing.
+        在混音前独立渲染并验收一条已经过全部滤镜的 cue。
+
+        This prevents another overlapping cue from hiding a broken/silent
+        stem in final-bed window QA. / 避免重叠曲目在最终混音时窗中掩盖坏掉的静音 stem。
+        """
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        stem_path = self.output_path.with_name(
+            f".{self.output_path.stem}.stem-{cue_index:03d}-{os.getpid()}.wav"
+        )
+        try:
+            stem_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise MusicBedError(
+                f"无法清理 cue 验收临时文件 / Could not clear stem QA file: {exc}"
+            ) from exc
+        command = [
+            self.ffmpeg,
+            "-hide_banner",
+            "-y",
+            "-i",
+            str(source),
+            "-filter_complex",
+            graph + "[stem]",
+            "-map",
+            "[stem]",
+            "-t",
+            f"{duration:.6f}",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s24le",
+            str(stem_path),
+        ]
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if completed.returncode != 0 or not stem_path.is_file():
+            tail = "\n".join(completed.stderr.splitlines()[-12:])
+            try:
+                stem_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise MusicBedError(
+                f"Cue {cue_id} 独立后滤镜验收渲染失败 / isolated stem render failed:\n{tail}"
+            )
+        peak = self._measure_peak_db(stem_path)
+        try:
+            stem_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if intentionally_silent:
+            return round(peak, 3) if math.isfinite(peak) else None
+        if not math.isfinite(peak) or peak <= -100.0:
+            raise MusicBedError(
+                f"Cue {cue_id} 在独立后滤镜验收中为静音 / "
+                f"isolated post-filter stem is silent ({peak:.1f} dBFS)."
+            )
+        return round(peak, 3)
+
     def render(self) -> Optional[Path]:
         """
         Render ``music_bed.wav`` and update the timeline's ``bed_file``.
@@ -277,6 +480,24 @@ class MusicBedRenderer:
             输出路径；若导演有意不配乐则返回 ``None``。
         """
         payload = self.load_timeline()
+        try:
+            frame_edl = validate_frame_edl(payload)
+        except FrameEDLError as exc:
+            raise MusicBedError(
+                f"音乐床需要统一帧时间表 / Music bed requires frame_edl: {exc}"
+            ) from exc
+        project_fps = Decimal(str(frame_edl["project_fps"]))
+
+        def mapped_second(value: object, rounding: str = "nearest") -> float:
+            return float(
+                Decimal(
+                    map_original_time_to_record_frame(
+                        frame_edl, value, rounding=rounding
+                    )
+                )
+                / project_fps
+            )
+
         music_plan = payload.get("music_plan")
         if not isinstance(music_plan, dict):
             return None
@@ -289,7 +510,10 @@ class MusicBedRenderer:
             raise MusicBedError("最终时间线时长为零 / Final timeline duration is zero.")
         dialogue = self._dialogue_intervals(payload)
         silence = [
-            (float(item.get("timeline_in_sec", 0)), float(item.get("timeline_out_sec", 0)))
+            (
+                mapped_second(item.get("timeline_in_sec", 0), "floor"),
+                mapped_second(item.get("timeline_out_sec", 0), "ceil"),
+            )
             for item in music_plan.get("silence_regions", [])
             if isinstance(item, dict)
         ]
@@ -305,14 +529,26 @@ class MusicBedRenderer:
         filters: List[str] = []
         cue_labels: List[str] = []
         audit_cues: List[Dict[str, Any]] = []
-        for cue in cues:
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        for cue_index, cue in enumerate(cues):
             if not isinstance(cue, dict):
                 continue
             path = Path(str(cue.get("file_name") or "")).expanduser().resolve()
             if not path.is_file():
                 raise MusicBedError(f"配乐文件不存在 / Music file not found: {path}")
-            timeline_in = max(0.0, float(cue.get("timeline_in_sec", 0)))
-            timeline_out = min(program_duration, float(cue.get("timeline_out_sec", program_duration)))
+            timeline_in = max(
+                0.0, mapped_second(cue.get("timeline_in_sec", 0), "nearest")
+            )
+            timeline_out = min(
+                program_duration,
+                mapped_second(
+                    cue.get(
+                        "timeline_out_sec",
+                        frame_edl.get("original_program_duration_sec", program_duration),
+                    ),
+                    "nearest",
+                ),
+            )
             track_in = max(0.0, float(cue.get("track_in_sec", 0)))
             duration = min(
                 timeline_out - timeline_in,
@@ -320,6 +556,19 @@ class MusicBedRenderer:
             )
             if duration <= 0.05:
                 continue
+            source_duration = self._probe_duration(path)
+            if track_in + duration > source_duration + 0.03:
+                raise MusicBedError(
+                    f"Cue {cue.get('cue_id', '?')} 超出源音频时长 / "
+                    f"exceeds source duration: requested {track_in:.3f}-"
+                    f"{track_in + duration:.3f}s, source={source_duration:.3f}s"
+                )
+            source_peak_db = self._measure_window_peak_db(path, track_in, duration)
+            if not math.isfinite(source_peak_db) or source_peak_db <= -55.0:
+                raise MusicBedError(
+                    f"Cue {cue.get('cue_id', '?')} 选中的源区间是静音 / "
+                    f"selected source range is silent ({source_peak_db:.1f} dBFS)."
+                )
             input_index = len(cue_labels) + 1
             inputs.extend(["-i", str(path)])
             target_lufs = float(cue.get("target_lufs", -24) or -24)
@@ -329,8 +578,52 @@ class MusicBedRenderer:
             except (TypeError, ValueError):
                 gain_db = 0.0
             gain_db = min(12.0, max(-12.0, gain_db))
-            fade_in = min(duration / 2, max(0.0, float(cue.get("fade_in_sec", 1.5))))
-            fade_out = min(duration / 2, max(0.0, float(cue.get("fade_out_sec", 2.0))))
+            requested_crossfade = min(
+                duration / 2,
+                max(0.0, float(cue.get("crossfade_sec", 0.0) or 0.0)),
+            )
+            crossfade_in = 0.0
+            crossfade_out = 0.0
+            if cue_index > 0 and isinstance(cues[cue_index - 1], dict):
+                previous = cues[cue_index - 1]
+                previous_out = mapped_second(
+                    previous.get("timeline_out_sec", 0), "nearest"
+                )
+                overlap = max(0.0, previous_out - timeline_in)
+                previous_request = max(
+                    0.0, float(previous.get("crossfade_sec", 0.0) or 0.0)
+                )
+                crossfade_in = min(duration / 2, overlap, previous_request)
+            if cue_index + 1 < len(cues) and isinstance(cues[cue_index + 1], dict):
+                following = cues[cue_index + 1]
+                following_in = mapped_second(
+                    following.get("timeline_in_sec", timeline_in + duration), "nearest"
+                )
+                overlap = max(0.0, timeline_in + duration - following_in)
+                crossfade_out = min(duration / 2, overlap, requested_crossfade)
+                if requested_crossfade > 0 and crossfade_out <= 0:
+                    self.logger.warning(
+                        "Cue %s 请求 %.2fs 交叉淡化，但相邻 cue 没有重叠；不擅自移动导演卡点。"
+                        " / Cue requests a %.2fs crossfade but has no overlap; "
+                        "director timing was not silently moved.",
+                        cue.get("cue_id", cue_index + 1),
+                        requested_crossfade,
+                        requested_crossfade,
+                    )
+            fade_in = min(
+                duration / 2,
+                max(
+                    crossfade_in,
+                    max(0.0, float(cue.get("fade_in_sec", 1.5))),
+                ),
+            )
+            fade_out = min(
+                duration / 2,
+                max(
+                    crossfade_out,
+                    max(0.0, float(cue.get("fade_out_sec", 2.0))),
+                ),
+            )
             chain = [
                 f"[{input_index}:a:0]atrim=start={track_in:.6f}:duration={duration:.6f}",
                 "asetpts=PTS-STARTPTS",
@@ -355,20 +648,44 @@ class MusicBedRenderer:
                 duck_db = -10.0
             for start, end in dialogue_overlaps:
                 chain.append(self._smooth_duck_filter(start, end, duck_db, duration))
-            for start, end in self._overlap_local(silence, timeline_in, timeline_in + duration):
+            silence_overlaps = self._overlap_local(
+                silence, timeline_in, timeline_in + duration
+            )
+            for start, end in silence_overlaps:
                 chain.append(
                     f"volume=0:enable='between(t,{start:.6f},{end:.6f})'"
                 )
+            cue_id = str(cue.get("cue_id") or f"cue{len(cue_labels)}")
+            isolated_graph = ",".join(chain).replace(
+                f"[{input_index}:a:0]", "[0:a:0]", 1
+            )
+            stem_peak = self._render_stem_for_qa(
+                source=path,
+                graph=isolated_graph,
+                duration=duration,
+                cue_id=cue_id,
+                cue_index=cue_index,
+                intentionally_silent=self._intervals_cover_duration(
+                    silence_overlaps, duration
+                ),
+            )
             delay_ms = max(0, int(round(timeline_in * 1000)))
             label = f"cue{len(cue_labels)}"
+            # Do not put an ``atrim=start=0`` after ``adelay``. FFmpeg 8.x can
+            # retain the pre-trim source timestamp on that path and interpret
+            # the second atrim against it. A late cue then becomes digital
+            # silence even though its source range is audible. Each cue already
+            # has an independently reset PTS and the finite base/final ``-t``
+            # provide the exact program bound.
+            # 不要在 adelay 后再用 atrim=start=0；FFmpeg 8.x 可能保留旧时戳，
+            # 从而把后半段 cue 裁成静音。每个 cue 已独立归零 PTS，最终 -t 限长。
             chain.append(
-                f"adelay={delay_ms}|{delay_ms},"
-                f"atrim=start=0:end={program_duration:.6f},asetpts=PTS-STARTPTS[{label}]"
+                f"adelay={delay_ms}|{delay_ms}[{label}]"
             )
             filters.append(",".join(chain))
             cue_labels.append(f"[{label}]")
             audit_cues.append({
-                "cue_id": cue.get("cue_id", label),
+                "cue_id": cue_id,
                 "file_name": str(path),
                 "source_url": cue.get("source_url", ""),
                 "sha256": cue.get("sha256", ""),
@@ -378,8 +695,20 @@ class MusicBedRenderer:
                 "timeline_out_sec": timeline_in + duration,
                 "track_in_sec": track_in,
                 "track_out_sec": track_in + duration,
+                "source_peak_dbfs": round(source_peak_db, 3),
+                "post_filter_stem_peak_dbfs": stem_peak,
                 "applied_gain_db": round(gain_db, 3),
                 "duck_under_dialogue_db": duck_db,
+                "crossfade_requested_sec": round(requested_crossfade, 6),
+                "crossfade_in_executed_sec": round(crossfade_in, 6),
+                "crossfade_out_executed_sec": round(crossfade_out, 6),
+                "crossfade_execution": (
+                    "executed_overlap"
+                    if crossfade_in > 0 or crossfade_out > 0
+                    else "not_executed_no_overlap"
+                    if requested_crossfade > 0 and cue_index + 1 < len(cues)
+                    else "not_requested_or_no_following_cue"
+                ),
             })
         if not cue_labels:
             return None
@@ -390,7 +719,6 @@ class MusicBedRenderer:
             + f"atrim=start=0:end={program_duration:.6f},asetpts=PTS-STARTPTS,"
             + "loudnorm=I=-23:TP=-2:LRA=11,alimiter=limit=0.95[bed]"
         )
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
         partial_path = self.output_path.with_name(
             self.output_path.stem + ".partial" + self.output_path.suffix
         )
@@ -419,6 +747,66 @@ class MusicBedRenderer:
         if completed.returncode != 0 or not partial_path.is_file():
             tail = "\n".join(completed.stderr.splitlines()[-20:])
             raise MusicBedError(f"音乐床 FFmpeg 合成失败 / Music-bed render failed:\n{tail}")
+        rendered_duration = self._probe_duration(partial_path)
+        duration_tolerance = 0.03
+        # ``loudnorm`` may flush one short 192 kHz analysis block early. Do a
+        # lossless PCM-only conform pass for a small discrepancy; never use this
+        # repair to hide a materially truncated render.
+        # loudnorm 可能少刷新一个短分析块；仅对小误差做无损 PCM 等长整形。
+        if (
+            abs(rendered_duration - program_duration) > duration_tolerance
+            and abs(rendered_duration - program_duration) <= 0.25
+        ):
+            duration_path = partial_path.with_name(
+                partial_path.stem + ".duration" + partial_path.suffix
+            )
+            try:
+                duration_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            duration_command = [
+                self.ffmpeg, "-hide_banner", "-y", "-i", str(partial_path),
+                "-af", f"apad,atrim=duration={program_duration:.6f},asetpts=PTS-STARTPTS",
+                "-t", f"{program_duration:.6f}", "-ar", "48000", "-ac", "2",
+                "-c:a", "pcm_s24le", str(duration_path),
+            ]
+            duration_result = subprocess.run(
+                duration_command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if duration_result.returncode != 0 or not duration_path.is_file():
+                tail = "\n".join(duration_result.stderr.splitlines()[-12:])
+                raise MusicBedError(
+                    "音乐床精确时长整形失败 / Exact-duration conform failed:\n" + tail
+                )
+            os.replace(str(duration_path), str(partial_path))
+            rendered_duration = self._probe_duration(partial_path)
+        if abs(rendered_duration - program_duration) > duration_tolerance:
+            try:
+                partial_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise MusicBedError(
+                "音乐床时长验收失败 / Music-bed duration QA failed: "
+                f"expected={program_duration:.3f}s, actual={rendered_duration:.3f}s."
+            )
+        for cue in audit_cues:
+            cue_peak = self._measure_window_peak_db(
+                partial_path,
+                float(cue["timeline_in_sec"]),
+                float(cue["timeline_out_sec"]) - float(cue["timeline_in_sec"]),
+            )
+            cue["mixed_window_peak_dbfs"] = (
+                round(cue_peak, 3) if math.isfinite(cue_peak) else None
+            )
+            # Backward-compatible audit name now refers to the isolated
+            # post-filter stem, never the potentially contaminated mix window.
+            cue["rendered_peak_dbfs"] = cue.get("post_filter_stem_peak_dbfs")
         peak_db = self._measure_peak_db(partial_path)
         integrated_lufs = self._measure_integrated_lufs(partial_path)
         if not math.isfinite(peak_db) or peak_db <= -50.0:
@@ -447,7 +835,12 @@ class MusicBedRenderer:
             "channels": 2,
             "codec": "pcm_s24le",
             "program_duration_sec": round(program_duration, 4),
+            "frame_edl_fingerprint": str(frame_edl["fingerprint"]),
+            "total_record_frames": int(frame_edl["total_record_frames"]),
+            "rendered_duration_sec": round(rendered_duration, 4),
+            "duration_tolerance_sec": duration_tolerance,
             "cue_count": len(cue_labels),
+            "cue_signal_qa_status": "isolated_post_filter_stems_passed",
             "qa_peak_dbfs": round(peak_db, 3),
             "qa_integrated_lufs": round(integrated_lufs, 3),
             "qa_status": "passed",

@@ -8,12 +8,24 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from src.frame_edl import build_frame_edl
 from src.resolve_executor import (
     ClipDecision,
     DaVinciExecutor,
     Decimal,
     ResolveExecutorError,
 )
+
+
+def framed(payload, source_rates=None):
+    """Attach a deterministic canonical frame EDL. / 附加确定性统一帧表。"""
+    for index, clip in enumerate(payload["clips"], start=1):
+        clip.setdefault("clip_id", index)
+    payload["frame_edl"] = build_frame_edl(
+        payload,
+        source_fps_overrides=source_rates or [payload["project_fps"]] * len(payload["clips"]),
+    )
+    return payload
 
 
 class FakeItem:
@@ -55,6 +67,7 @@ class FakeMediaPool:
         self.project = project
         self.folder = FakeFolder()
         self.appended = []
+        self.record_cursor = 0
 
     def GetRootFolder(self):
         return self.folder
@@ -70,7 +83,21 @@ class FakeMediaPool:
 
     def AppendToTimeline(self, clip_infos):
         self.appended.extend(clip_infos)
-        return [{"timeline_item": len(self.appended)}]
+        result = []
+        for clip_info in clip_infos:
+            duration = int(clip_info["endFrame"]) - int(clip_info["startFrame"]) + 1
+            start = int(clip_info.get("recordFrame", self.record_cursor))
+
+            class TimelineItem:
+                def GetStart(self, *_args):
+                    return start
+
+                def GetDuration(self, *_args):
+                    return duration
+
+            result.append(TimelineItem())
+            self.record_cursor = max(self.record_cursor, start + duration)
+        return result
 
 
 class FakeProject:
@@ -234,6 +261,49 @@ class ResolveExecutorTests(unittest.TestCase):
         self.assertEqual(inserted, [])
         self.assertFalse(hasattr(timeline, "inserted_name"))
         self.assertEqual(timeline.timecodes, [])
+
+    def test_approved_preview_never_calls_resolve_title_insertion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            preview = root / "approved.mp4"
+            preview.write_bytes(b"approved")
+            executor = DaVinciExecutor(
+                root / "timeline_cuts.json",
+                approved_preview=preview,
+            )
+            decision = ClipDecision(
+                1, str(root / "source.mp4"), Decimal("0"), Decimal("2"), "test"
+            )
+            project = mock.Mock()
+            project.GetMediaPool.return_value = mock.Mock()
+            timeline = mock.Mock()
+            timeline.GetName.return_value = "CyberEditor Timeline"
+            prepared = [(decision, {"mediaPoolItem": object()})]
+
+            with (
+                mock.patch.object(executor, "load_cut_plan", return_value=(Decimal("25"), [decision])),
+                mock.patch.object(executor, "connect", return_value=object()),
+                mock.patch.object(executor, "ensure_project", return_value=(mock.Mock(), project)),
+                mock.patch.object(executor, "configure_color_pipeline"),
+                mock.patch.object(executor, "ensure_timeline", return_value=timeline),
+                mock.patch.object(executor, "get_active_fps", return_value=Decimal("25")),
+                mock.patch.object(executor, "compare_fps"),
+                mock.patch.object(executor, "prepare_clips", return_value=prepared),
+                mock.patch.object(executor, "append_clips", return_value=[object()]),
+                mock.patch.object(executor, "append_graphics_clips") as overlay,
+                mock.patch.object(executor, "append_graphics_titles") as titles,
+                mock.patch.object(executor, "append_program_audio"),
+                mock.patch.object(executor, "append_music_bed"),
+                mock.patch.object(executor, "apply_timeline_audio_preset"),
+                mock.patch.object(executor, "run_macro_fallback"),
+                mock.patch.object(executor, "create_reviewed_delivery_timeline", return_value=timeline) as delivery,
+                mock.patch.object(executor, "save_project"),
+            ):
+                executor.run()
+
+            titles.assert_not_called()
+            overlay.assert_called_once()
+            delivery.assert_not_called()
 
     def test_transient_untitled_project_is_replaced_with_named_project(self):
         transient = FakeProject()
@@ -418,7 +488,7 @@ class ResolveExecutorTests(unittest.TestCase):
 
         executor._configure_media_input_transform(MediaItem(), decision)
 
-    def test_preconformed_music_bed_allows_bounded_frame_rounding_without_loop(self):
+    def test_preconformed_music_bed_uses_exact_frame_edl_without_loop(self):
         with tempfile.TemporaryDirectory() as temporary:
             bed = Path(temporary) / "music_bed.wav"
             bed.write_bytes(b"wav")
@@ -443,7 +513,19 @@ class ResolveExecutorTests(unittest.TestCase):
 
                 def AppendToTimeline(self, clip_infos):
                     self.appended.extend(clip_infos)
-                    return [object()]
+                    # Historical no-argument timing methods exercise the
+                    # Resolve 21 ``False`` argument compatibility fallback.
+                    class AudioItem:
+                        def GetTrackTypeAndIndex(self):
+                            return ["audio", 2]
+
+                        def GetStart(self):
+                            return 0
+
+                        def GetDuration(self):
+                            return 3
+
+                    return [AudioItem()]
 
             prepared = [
                 (
@@ -459,19 +541,161 @@ class ResolveExecutorTests(unittest.TestCase):
                 for index in range(3)
             ]
             executor = DaVinciExecutor("timeline_cuts.json")
-            executor.music_plan = {"bed_file": str(bed)}
+            payload = framed(
+                {
+                    "project_fps": 25,
+                    "clips": [
+                        {
+                            "clip_id": index,
+                            "file_name": f"source-{index}.mp4",
+                            "cut_in_sec": 0,
+                            "cut_out_sec": 0.02,
+                        }
+                        for index in range(3)
+                    ],
+                },
+                [25, 25, 25],
+            )
+            executor.frame_edl = payload["frame_edl"]
+            executor.music_plan = {
+                "bed_file": str(bed),
+                "bed_render": {
+                    "frame_edl_fingerprint": payload["frame_edl"]["fingerprint"]
+                },
+            }
             executor.timeline = Timeline()
             executor.media_pool = MediaPool()
+            executor.picture_record_start = 0
 
             with (
                 mock.patch.object(executor, "_import_media", return_value=[object()]),
-                mock.patch.object(executor, "_probe_media_duration", return_value=0.06),
+                mock.patch.object(executor, "_probe_media_duration", return_value=0.12),
             ):
                 executor.append_music_bed(Decimal("25"), prepared)
 
             self.assertEqual(len(executor.media_pool.appended), 1)
             self.assertEqual(executor.media_pool.appended[0]["startFrame"], 0)
-            self.assertEqual(executor.media_pool.appended[0]["endFrame"], 1)
+            self.assertEqual(executor.media_pool.appended[0]["endFrame"], 2)
+
+    def test_audio_item_verification_rejects_wrong_track_start_or_duration(self):
+        executor = DaVinciExecutor("timeline_cuts.json")
+
+        class AudioItem:
+            def __init__(self, track, start, duration):
+                self.track = track
+                self.start = start
+                self.duration = duration
+
+            def GetTrackTypeAndIndex(self):
+                return ["audio", self.track]
+
+            def GetStart(self, _use_subframes=False):
+                return self.start
+
+            def GetDuration(self, _use_subframes=False):
+                return self.duration
+
+        for item in (
+            AudioItem(2, 100, 50),
+            AudioItem(1, 101, 50),
+            AudioItem(1, 100, 49),
+        ):
+            with self.subTest(
+                track=item.track,
+                start=item.start,
+                duration=item.duration,
+            ):
+                with self.assertRaises(ResolveExecutorError):
+                    executor._verify_audio_timeline_item(
+                        item,
+                        track_index=1,
+                        expected_start=100,
+                        expected_duration=50,
+                        context="现场声 / production audio",
+                    )
+
+    def test_preconformed_music_bed_fails_closed_on_wrong_resolve_track(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bed = Path(temporary) / "music_bed.wav"
+            bed.write_bytes(b"wav")
+            executor = DaVinciExecutor("timeline_cuts.json")
+            executor.frame_edl = {
+                "total_record_frames": 50,
+                "fingerprint": "frame-edl-test",
+            }
+            executor.music_plan = {
+                "bed_file": str(bed),
+                "bed_render": {"frame_edl_fingerprint": "frame-edl-test"},
+            }
+            executor.picture_record_start = 100
+            executor.timeline = mock.Mock()
+            executor.timeline.GetTrackCount.return_value = 2
+
+            class WrongTrackItem:
+                def GetTrackTypeAndIndex(self):
+                    return ["audio", 1]
+
+                def GetStart(self, _use_subframes=False):
+                    return 100
+
+                def GetDuration(self, _use_subframes=False):
+                    return 50
+
+            executor.media_pool = mock.Mock()
+            executor.media_pool.AppendToTimeline.return_value = [WrongTrackItem()]
+            with (
+                mock.patch.object(executor, "_import_media", return_value=[object()]),
+                mock.patch.object(executor, "_probe_media_duration", return_value=2.0),
+                self.assertRaisesRegex(ResolveExecutorError, "placement verification failed"),
+            ):
+                executor.append_music_bed(Decimal("25"), [])
+
+    def test_legacy_music_validates_each_loop_segment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            music = Path(temporary) / "legacy.wav"
+            music.write_bytes(b"wav")
+            executor = DaVinciExecutor("timeline_cuts.json")
+            executor.frame_edl = {"total_record_frames": 125, "fingerprint": "unused"}
+            executor.music_plan = {"file_name": str(music), "target_level_db": -20}
+            executor.picture_record_start = 100
+            executor.timeline = mock.Mock()
+            executor.timeline.GetTrackCount.return_value = 2
+
+            class AudioItem:
+                def __init__(self, start, duration):
+                    self.start = start
+                    self.duration = duration
+
+                def GetTrackTypeAndIndex(self):
+                    return ("audio", 2)
+
+                def GetStart(self, _use_subframes=False):
+                    return self.start
+
+                def GetDuration(self, _use_subframes=False):
+                    return self.duration
+
+            append_count = 0
+
+            def append(clip_infos):
+                nonlocal append_count
+                append_count += 1
+                info = clip_infos[0]
+                duration = info["endFrame"] - info["startFrame"] + 1
+                # The first loop is correct; Resolve misplaces the second.
+                start = info["recordFrame"] + (1 if append_count == 2 else 0)
+                return [AudioItem(start, duration)]
+
+            executor.media_pool = mock.Mock()
+            executor.media_pool.AppendToTimeline.side_effect = append
+            with (
+                mock.patch.object(executor, "_import_media", return_value=[object()]),
+                mock.patch.object(executor, "_probe_media_duration", return_value=2.0),
+                self.assertRaisesRegex(ResolveExecutorError, "placement verification failed"),
+            ):
+                executor.append_music_bed(Decimal("25"), [])
+
+            self.assertEqual(append_count, 2)
 
     def test_resolve_process_detection_ignores_windows_code_page(self):
         completed = SimpleNamespace(
@@ -721,7 +945,7 @@ class ResolveExecutorTests(unittest.TestCase):
             plan = root / "timeline_cuts.json"
             plan.write_text(
                 json.dumps(
-                    {
+                    framed({
                         "project_fps": 25,
                         "clips": [
                             {
@@ -732,7 +956,7 @@ class ResolveExecutorTests(unittest.TestCase):
                                 "reason_for_cut": "test",
                             }
                         ],
-                    }
+                    }, [25])
                 ),
                 encoding="utf-8",
             )
@@ -952,7 +1176,24 @@ class ResolveExecutorTests(unittest.TestCase):
             source.write_bytes(b"video")
             program.write_bytes(b"audio")
             executor = DaVinciExecutor(root / "timeline_cuts.json")
-            executor.audio_program = {"bed_file": str(program)}
+            payload = framed(
+                {
+                    "project_fps": 25,
+                    "clips": [{
+                        "clip_id": 1,
+                        "file_name": str(source),
+                        "cut_in_sec": 0,
+                        "cut_out_sec": 2,
+                    }],
+                },
+                [25],
+            )
+            executor.frame_edl = payload["frame_edl"]
+            executor.audio_program = {
+                "bed_file": str(program),
+                "frame_edl_fingerprint": payload["frame_edl"]["fingerprint"],
+            }
+            executor.picture_record_start = 0
 
             class Item:
                 def GetClipProperty(self, name=None):
@@ -963,7 +1204,21 @@ class ResolveExecutorTests(unittest.TestCase):
             executor.timeline = mock.Mock()
             executor.timeline.GetTrackCount.return_value = 1
             executor.timeline.GetStartFrame.return_value = 0
-            executor.media_pool.AppendToTimeline.return_value = [object()]
+
+            class ProgramAudioItem:
+                def GetTrackTypeAndIndex(self):
+                    return {"trackType": "audio", "trackIndex": 1}
+
+                def GetStart(self, use_subframes):
+                    self.use_start_subframes = use_subframes
+                    return 0
+
+                def GetDuration(self, use_subframes):
+                    self.use_duration_subframes = use_subframes
+                    return 50
+
+            program_audio_item = ProgramAudioItem()
+            executor.media_pool.AppendToTimeline.return_value = [program_audio_item]
             decision = ClipDecision(1, str(source), Decimal("0"), Decimal("2"), "test")
             with (
                 mock.patch.object(executor, "_index_media_pool", return_value=[]),
@@ -981,6 +1236,8 @@ class ResolveExecutorTests(unittest.TestCase):
             self.assertEqual(audio_info["mediaType"], 2)
             self.assertEqual(audio_info["trackIndex"], 1)
             self.assertEqual(audio_info["recordFrame"], 0)
+            self.assertFalse(program_audio_item.use_start_subframes)
+            self.assertFalse(program_audio_item.use_duration_subframes)
 
 
 if __name__ == "__main__":

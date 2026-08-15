@@ -457,6 +457,69 @@ def detect_torch_runtime() -> Dict[str, object]:
     }
 
 
+DIRECTOR_64GB_CONTEXT_LIMIT = 8192
+_DIRECTOR_70B_TAG = re.compile(r"(?<!\d)(?:70|72)b(?!\d)", re.IGNORECASE)
+
+
+def director_context_contract(
+    requested_num_ctx: int, director_model: str
+) -> Tuple[int, int, bool]:
+    """
+    Return requested/effective context values for the current director contract.
+    返回当前导演契约的请求值、实际值与 70B/72B 安全档标记。
+
+    Parameters / 参数:
+        requested_num_ctx: Value entered in the UI and passed unchanged to
+            ``main.py``. / 用户在界面填写并原样传给 ``main.py`` 的值。
+        director_model: Exact global-director model tag. / 全局导演完整模型标签。
+
+    A 70B/72B tag is capped inside ``AIDirector`` at 8192 on the 64-GB safety
+    contract. The UI reports that fact but must not rewrite the requested CLI
+    argument. Other models retain the requested value without a redundant warning.
+
+    70B/72B 标签在 ``AIDirector`` 的 64GB 安全契约中最高使用 8192。界面只诚实
+    展示，不得篡改传给命令行的请求值；其他模型保持请求值且不显示多余警告。
+    """
+    requested = int(requested_num_ctx)
+    is_70b_class = bool(_DIRECTOR_70B_TAG.search(str(director_model or "")))
+    effective = (
+        min(requested, DIRECTOR_64GB_CONTEXT_LIMIT)
+        if is_70b_class
+        else requested
+    )
+    return requested, effective, is_70b_class
+
+
+def format_director_context_status(
+    requested_num_ctx: int, director_model: str, language: str = "en"
+) -> str:
+    """
+    Format an honest localized UI summary of requested and effective context.
+    格式化诚实、本地化的请求与实际 Context 摘要。
+    """
+    requested, effective, is_70b_class = director_context_contract(
+        requested_num_ctx, director_model
+    )
+    if not is_70b_class:
+        return f"Context={requested}"
+    if language == "zh":
+        return (
+            f"Context 请求={requested} · 实际={effective}；"
+            "70B/72B 的 64GB 安全上限为 8192，提高界面值不会绕过"
+        )
+    if language == "bilingual":
+        return (
+            f"Context requested={requested}, effective={effective} / "
+            f"请求={requested}，实际={effective}；70B/72B 64GB 安全上限为 8192，"
+            "提高 UI 值不会绕过"
+        )
+    return (
+        f"Context requested={requested} · effective={effective}; "
+        "the 70B/72B 64-GB safety ceiling is 8192 and raising the UI value "
+        "does not bypass it"
+    )
+
+
 def recommend_automatic_settings(
     hardware: Dict[str, object],
     ollama_models: Sequence[Dict[str, object]],
@@ -499,10 +562,12 @@ def recommend_automatic_settings(
         # slower but produce better edit decisions for hour-long footage.
         # 更短的分块能保留局部叙事细节；调用次数更多但长视频剪辑决策更细致。
         chunk_minutes = 10.0
-        # A 32K window lets the final Qwen director compare the complete compact
-        # candidate ledger on a 64GB-class workstation in most projects. Larger
-        # projects automatically fall back to context-safe director review pages.
-        # 32K 可让 64GB 级工作站在多数项目中一次比较完整候选表；更大项目自动分页。
+        # This is the requested UI value. A 27B director can retain it; a 70B/72B
+        # tag is still limited to an effective 8192 by the director's 64-GB safety
+        # contract and uses context-safe review pages. Never disguise that limit by
+        # silently rewriting the requested field.
+        # 这是 UI 请求值。27B 可保持该值；70B/72B 仍受导演层 64GB 安全契约的
+        # 实际 8192 上限约束，并使用 Context 安全分页。不得静默改写请求字段。
         num_ctx = 32768
         profile = "performance"
     elif ram_gb >= 24 or vram_gb >= 6:
@@ -558,26 +623,69 @@ def recommend_automatic_settings(
         if size_gb <= model_budget_gb:
             candidates.append((name, size_gb, quality_score))
     selected_pool = candidates or all_models
-    selected_model = (
-        max(selected_pool, key=lambda item: (item[2], item[1]))[0]
-        if selected_pool
-        else ""
-    )
-    text_director_candidates = [
-        item for item in all_models
+
+    def vision_role_score(item: Tuple[str, float, float]) -> Tuple[float, float]:
+        """Prefer an installed, memory-efficient native VLM for dense review. / 优先已安装的高效原生视觉模型。"""
+        name, size_gb, quality = item
+        normalized = name.casefold()
+        role_bonus = 0.0
+        if "qwen3.6:27b" in normalized:
+            # On a 16 GiB GPU, Q4_K_M minimizes PCIe/RAM churn while every
+            # half-second frame is inspected. MTP Q8 is reserved for the later
+            # text-only global assembly when both installed tags are present.
+            # 16 GiB 显卡高密度审片优先 Q4；MTP Q8 留给后续文字总导演。
+            if "q4_k_m" in normalized and "mtp" not in normalized:
+                role_bonus = 320.0
+            elif "q4_k_m" in normalized:
+                role_bonus = 250.0
+            elif "q8_0" in normalized:
+                role_bonus = 120.0
+            else:
+                role_bonus = 180.0
+        elif any(
+            marker in normalized
+            for marker in ("qwen3.5", "qwen2.5-vl", "gemma3", "llava", "minicpm-v")
+        ):
+            role_bonus = 80.0
+        return quality + role_bonus, -size_gb
+
+    known_vision_pool = [
+        item for item in selected_pool
         if any(
             marker in item[0].casefold()
             for marker in (
-                "qwen3.6:27b",
-                "qwen3.6:35b-a3b",
-                "qwen2.5:72b",
-                "qwen2.5:70b",
+                "qwen3.6", "qwen3.5", "qwen2.5-vl", "gemma3", "llava", "minicpm-v",
             )
         )
     ]
+    vision_pool = known_vision_pool or selected_pool
+    selected_model = (
+        max(vision_pool, key=vision_role_score)[0] if vision_pool else ""
+    )
+
+    def director_role_score(item: Tuple[str, float, float]) -> Tuple[float, float]:
+        """Prefer fidelity and reasoning for the serial text-only director. / 文字总导演优先权重精度与推理能力。"""
+        name, size_gb, quality = item
+        normalized = name.casefold()
+        role_bonus = 0.0
+        if "qwen3.6:27b" in normalized:
+            if "mtp" in normalized:
+                role_bonus += 120.0
+            if "q8_0" in normalized:
+                role_bonus += 180.0
+            elif "q6_k" in normalized:
+                role_bonus += 110.0
+            elif "q4_k_m" in normalized:
+                role_bonus += 40.0
+        return quality + role_bonus, size_gb
+
+    director_pool = selected_pool
     director_model = (
-        max(text_director_candidates, key=lambda item: (item[2], item[1]))[0]
-        if text_director_candidates else selected_model
+        max(director_pool, key=director_role_score)[0]
+        if director_pool else selected_model
+    )
+    requested_num_ctx, effective_num_ctx, context_is_70b_class = (
+        director_context_contract(num_ctx, director_model)
     )
     return {
         "profile": profile,
@@ -585,6 +693,9 @@ def recommend_automatic_settings(
         "whisper_device": "auto",
         "chunk_minutes": chunk_minutes,
         "num_ctx": num_ctx,
+        "requested_num_ctx": requested_num_ctx,
+        "effective_num_ctx": effective_num_ctx,
+        "context_is_70b_class": context_is_70b_class,
         "ollama_model": selected_model,
         "director_model": director_model,
         "model_budget_gb": round(model_budget_gb, 1),
@@ -772,8 +883,10 @@ class WorkflowOptions:
     whisper_model: str = "small"
     whisper_device: str = "auto"
     language: str = ""
-    ollama_model: str = "qwen3.6:27b-mtp-q8_0"
-    director_model: str = ""
+    sample_interval: float = 0.5
+    max_keyframes: int = 14400
+    ollama_model: str = "qwen3.6:27b"
+    director_model: str = "qwen3.6:27b-mtp-q8_0"
     ollama_url: str = "http://localhost:11434"
     chunk_minutes: float = 12.0
     project_fps: float = 25.0
@@ -861,6 +974,10 @@ class WorkflowOptions:
             )
         if self.flow != "resolve" and not self.ollama_model.strip():
             raise ValueError("请选择 Ollama 模型 / Please select an Ollama model.")
+        if float(self.sample_interval) <= 0:
+            raise ValueError("视觉采样间隔必须大于 0 / Visual sampling interval must be positive.")
+        if int(self.max_keyframes) <= 0:
+            raise ValueError("视觉帧上限必须大于 0 / Visual frame cap must be positive.")
         if not 10.0 <= float(self.chunk_minutes) <= 15.0:
             raise ValueError("分块时长必须为 10–15 分钟 / Chunk size must be 10–15 minutes.")
         if float(self.project_fps) <= 0:
@@ -930,6 +1047,10 @@ class WorkflowOptions:
             self.whisper_model,
             "--whisper-device",
             self.whisper_device,
+            "--sample-interval",
+            str(self.sample_interval),
+            "--max-keyframes",
+            str(self.max_keyframes),
             "--ollama-model",
             self.ollama_model,
             "--director-model",
@@ -1229,7 +1350,8 @@ class CyberEditorApp:
         self.whisper_var = tk.StringVar(value="small")
         self.device_var = tk.StringVar(value="auto")
         self.language_var = tk.StringVar()
-        self.ollama_model_var = tk.StringVar(value="qwen3.6:27b-mtp-q8_0")
+        self.ollama_model_var = tk.StringVar(value="qwen3.6:27b")
+        self.director_model_var = tk.StringVar(value="qwen3.6:27b-mtp-q8_0")
         self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
         self.chunk_var = tk.DoubleVar(value=12.0)
         self.fps_var = tk.DoubleVar(value=25.0)
@@ -1438,10 +1560,13 @@ class CyberEditorApp:
             grid,
             2,
             1,
-            "Ollama 模型",
+            "全片视觉审片（2fps + 短动作最高4fps） / "
+            "Whole-footage vision review (2 fps + short actions up to 4 fps)",
             ttk.Combobox,
             textvariable=self.ollama_model_var,
             values=(
+                "qwen3.6:27b",
+                "qwen3.6:27b-q4_K_M",
                 "qwen3.6:27b-mtp-q8_0",
                 "qwen3.6:27b-mtp-q4_K_M",
                 "qwen3.6:35b-a3b-mtp-q4_K_M",
@@ -1501,6 +1626,18 @@ class CyberEditorApp:
             "Resolve 工程 / Project",
             ttk.Entry,
             textvariable=self.project_var,
+        )
+        self.director_combo = self._field(
+            grid,
+            6,
+            0,
+            "全局文字导演（视觉卸载后）/ Text director",
+            ttk.Combobox,
+            textvariable=self.director_model_var,
+            values=(
+                "qwen3.6:27b-mtp-q8_0",
+                "qwen3.6:27b-q4_K_M",
+            ),
         )
 
         ttk.Label(
@@ -1743,6 +1880,7 @@ class CyberEditorApp:
             whisper_device=self.device_var.get().strip(),
             language=self.language_var.get().strip(),
             ollama_model=self.ollama_model_var.get().strip(),
+            director_model=self.director_model_var.get().strip(),
             ollama_url=self.ollama_url_var.get().strip(),
             chunk_minutes=float(self.chunk_var.get()),
             project_fps=project_fps,
@@ -1784,7 +1922,10 @@ class CyberEditorApp:
         """
         if profile == "custom":
             self.hardware_summary_var.set(
-                self._hardware_description("自定义参数 / Custom settings")
+                self._hardware_description(
+                    "自定义参数 / Custom settings • "
+                    + self._director_context_status()
+                )
             )
             return
         if profile == "auto":
@@ -1826,13 +1967,33 @@ class CyberEditorApp:
         recommended_model = str(settings.get("ollama_model", "")).strip()
         if recommended_model:
             self.ollama_model_var.set(recommended_model)
+        recommended_director = str(settings.get("director_model", "")).strip()
+        if recommended_director:
+            self.director_model_var.set(recommended_director)
         details = (
             f"{label}: Whisper {self.whisper_var.get()} • "
-            f"Context {self.ctx_var.get()} • Chunk {self.chunk_var.get():g}m"
+            f"{self._director_context_status()} • Chunk {self.chunk_var.get():g}m"
         )
         if recommended_model:
-            details += f" • {recommended_model}"
+            details += f" • Vision {recommended_model}"
+        if recommended_director:
+            details += f" • Director {recommended_director}"
         self.hardware_summary_var.set(self._hardware_description(details))
+
+    def _director_context_status(self) -> str:
+        """
+        Describe requested/effective director context without changing arguments.
+        显示导演 Context 请求值与实际值，但不修改命令行参数。
+        """
+        try:
+            requested = int(self.ctx_var.get())
+        except (TypeError, ValueError):
+            requested = 0
+        return format_director_context_status(
+            requested,
+            self.director_model_var.get(),
+            "bilingual",
+        )
 
     def _hardware_description(self, suffix: str = "") -> str:
         """Format the detected hardware in one compact line. / 将检测硬件格式化为紧凑单行。"""
@@ -2252,9 +2413,20 @@ class CyberEditorApp:
         model_names = [str(item["name"]) for item in models]
         if model_names:
             self.ollama_combo.configure(values=tuple(model_names))
+            self.director_combo.configure(values=tuple(model_names))
             current = self.ollama_model_var.get()
             if current not in model_names:
                 self.ollama_model_var.set(model_names[0])
+            current_director = self.director_model_var.get()
+            if current_director not in model_names:
+                recommended_director = str(
+                    recommendation.get("director_model") or ""
+                )
+                self.director_model_var.set(
+                    recommended_director
+                    if recommended_director in model_names
+                    else self.ollama_model_var.get()
+                )
         profile = PROFILE_LABELS.get(self.profile_var.get(), "auto")
         self._apply_hardware_profile(profile)
         summary = "，".join(
@@ -2263,15 +2435,18 @@ class CyberEditorApp:
         )
         self._append_log("环境检测 / Environment: " + summary + "\n", "info")
         self._append_log(
-            "硬件检测 / Hardware: " + self._hardware_description() + "\n",
+            "硬件检测 / Hardware: "
+            + self._hardware_description(self._director_context_status())
+            + "\n",
             "info",
         )
         if profile == "auto":
             self._append_log(
                 "已应用自动配置 / Auto settings applied: "
                 f"Whisper={self.whisper_var.get()}, "
-                f"Ollama={self.ollama_model_var.get()}, "
-                f"Context={self.ctx_var.get()}, "
+                f"Vision={self.ollama_model_var.get()}, "
+                f"Director={self.director_model_var.get()}, "
+                f"{self._director_context_status()}, "
                 f"Chunk={self.chunk_var.get():g}m\n",
                 "success",
             )
@@ -2365,6 +2540,7 @@ class CyberEditorApp:
             "whisper_device": self.device_var,
             "language": self.language_var,
             "ollama_model": self.ollama_model_var,
+            "director_model": self.director_model_var,
             "ollama_url": self.ollama_url_var,
             "chunk_minutes": self.chunk_var,
             "project_fps": self.fps_var,

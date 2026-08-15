@@ -40,6 +40,7 @@ from .gui import (
     detect_media_fps,
     detect_system_theme,
     detect_torch_runtime,
+    format_director_context_status,
     enable_windows_high_dpi,
     ensure_ollama_service,
     find_resolve_executable,
@@ -507,10 +508,10 @@ class ModernCyberEditorApp:
             value=str(data.get("language", ""))
         )
         self.ollama_model_var = tk.StringVar(
-            value=str(data.get("ollama_model", "qwen3.6:27b-mtp-q8_0"))
+            value=str(data.get("ollama_model", "qwen3.6:27b"))
         )
         self.director_model_var = tk.StringVar(
-            value=str(data.get("director_model", ""))
+            value=str(data.get("director_model", "qwen3.6:27b-mtp-q8_0"))
         )
         self.ollama_url_var = tk.StringVar(
             value=str(data.get("ollama_url", "http://localhost:11434"))
@@ -1445,7 +1446,9 @@ class ModernCyberEditorApp:
         """
         if profile == "custom":
             self._set_hardware_text(
-                self._hardware_description(self.t("custom_settings"))
+                self._hardware_description(
+                    f"{self.t('custom_settings')}  ·  {self._director_context_status()}"
+                )
             )
             return
         if profile == "auto":
@@ -1491,11 +1494,28 @@ class ModernCyberEditorApp:
             self.director_model_menu.set(director_model)
         details = (
             f"{label}: Whisper {self.whisper_var.get()}  ·  "
-            f"Context {self.ctx_var.get()}  ·  Chunk {self.chunk_var.get()}m"
+            f"{self._director_context_status()}  ·  Chunk {self.chunk_var.get()}m"
         )
         if model:
-            details += f"  ·  {model}"
+            details += f"  ·  Vision {model}"
+        if director_model:
+            details += f"  ·  Director {director_model}"
         self._set_hardware_text(self._hardware_description(details))
+
+    def _director_context_status(self) -> str:
+        """
+        Describe requested/effective director context without changing UI state.
+        显示导演 Context 请求值与实际值，但绝不改写界面或命令参数。
+        """
+        try:
+            requested = int(self.ctx_var.get())
+        except (TypeError, ValueError):
+            requested = 0
+        return format_director_context_status(
+            requested,
+            self.director_model_var.get(),
+            self.active_language,
+        )
 
     def _hardware_description(self, suffix: str = "") -> str:
         """Format hardware and genuine PyTorch CUDA status. / 格式化硬件与真实 PyTorch CUDA 状态。"""
@@ -1795,7 +1815,8 @@ class ModernCyberEditorApp:
         )
         self._append_log(f"{self.t('environment_log')}: {summary}\n")
         self._append_log(
-            f"{self.t('hardware_log')}: {self._hardware_description()}\n"
+            f"{self.t('hardware_log')}: "
+            f"{self._hardware_description(self._director_context_status())}\n"
         )
         if bool(hardware.get("torch_probe_failed")):
             probe_error = " ".join(
@@ -1808,8 +1829,9 @@ class ModernCyberEditorApp:
             self._append_log(
                 f"{self.t('settings_applied')}: "
                 f"Whisper={self.whisper_var.get()}, "
-                f"Ollama={self.ollama_model_var.get()}, "
-                f"Context={self.ctx_var.get()}, "
+                f"Vision={self.ollama_model_var.get()}, "
+                f"Director={self.director_model_var.get()}, "
+                f"{self._director_context_status()}, "
                 f"Chunk={self.chunk_var.get()}m\n"
             )
         # Persist migrations such as the new automatic FPS mode after the

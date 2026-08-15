@@ -30,6 +30,11 @@ import tempfile
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from .color_pipeline import ensure_sony_pp8_display_lut
+from .frame_edl import (
+    FrameEDLError,
+    map_original_time_to_record_frame,
+    validate_frame_edl,
+)
 
 
 LOGGER_NAME = "cybereditor.review"
@@ -54,6 +59,8 @@ class RenderClip(NamedTuple):
     source_color: Optional[Dict[str, Any]] = None
     color_match: Optional[Dict[str, Any]] = None
     creative_grade: Optional[Dict[str, Any]] = None
+    source_duration_sec: float = 0.0
+    record_duration_sec: float = 0.0
 
 
 class ReviewRenderer:
@@ -88,6 +95,7 @@ class ReviewRenderer:
         self.logger = logger or logging.getLogger(LOGGER_NAME)
         self.color_pipeline: Dict[str, Any] = {}
         self.music_plan: Dict[str, Any] = {}
+        self.audio_program: Dict[str, Any] = {}
         self.graphics_plan: Dict[str, Any] = {}
         self.technical_lut_path: Optional[Path] = None
         if self.width < 320 or self.height < 180:
@@ -184,11 +192,43 @@ class ReviewRenderer:
         self.color_pipeline = pipeline if isinstance(pipeline, dict) else {}
         music = payload.get("music_plan")
         self.music_plan = music if isinstance(music, dict) else {}
+        audio_program = payload.get("audio_program")
+        self.audio_program = audio_program if isinstance(audio_program, dict) else {}
+        try:
+            frame_edl = validate_frame_edl(payload)
+        except FrameEDLError as exc:
+            raise ReviewRenderError(
+                f"审片需要统一帧时间表 / Review render requires frame_edl: {exc}"
+            ) from exc
+        schedule_entries = frame_edl["clips"]
         graphics = payload.get("graphics_plan")
-        self.graphics_plan = graphics if isinstance(graphics, dict) else {}
+        self.graphics_plan = dict(graphics) if isinstance(graphics, dict) else {}
+        raw_graphics = self.graphics_plan.get("items")
+        if isinstance(raw_graphics, list):
+            mapped_graphics: List[Dict[str, Any]] = []
+            for graphic in raw_graphics:
+                if not isinstance(graphic, dict):
+                    continue
+                mapped = dict(graphic)
+                mapped["timeline_in_sec"] = (
+                    map_original_time_to_record_frame(
+                        frame_edl, graphic.get("timeline_in_sec", 0), rounding="floor"
+                    )
+                    / fps
+                )
+                mapped["timeline_out_sec"] = (
+                    map_original_time_to_record_frame(
+                        frame_edl,
+                        graphic.get("timeline_out_sec", 0),
+                        rounding="ceil",
+                    )
+                    / fps
+                )
+                mapped_graphics.append(mapped)
+            self.graphics_plan["items"] = mapped_graphics
 
         result: List[RenderClip] = []
-        for index, item in enumerate(raw_clips):
+        for index, (item, frame_entry) in enumerate(zip(raw_clips, schedule_entries)):
             if not isinstance(item, dict):
                 raise ReviewRenderError(f"clips[{index}] 必须是对象 / must be an object.")
             path = Path(str(item.get("file_name", ""))).expanduser()
@@ -199,8 +239,15 @@ class ReviewRenderer:
                 raise ReviewRenderError(
                     f"找不到入选素材 / Selected media not found: {path}"
                 )
-            start = self._finite(item.get("cut_in_sec"), f"clips[{index}].cut_in_sec")
-            end = self._finite(item.get("cut_out_sec"), f"clips[{index}].cut_out_sec")
+            source_fps = self._finite(
+                frame_entry.get("source_fps"), f"frame_edl.clips[{index}].source_fps"
+            )
+            source_in_frame = int(frame_entry["source_frame_in"])
+            source_out_frame = int(frame_entry["source_frame_out_exclusive"])
+            record_frames = int(frame_entry["record_frame_count"])
+            start = source_in_frame / source_fps
+            end = source_out_frame / source_fps
+            record_duration = record_frames / fps
             if start < 0 or end - start < 0.2:
                 raise ReviewRenderError(
                     f"clips[{index}] 时间范围无效 / invalid time range."
@@ -262,6 +309,8 @@ class ReviewRenderer:
                         dict(item["creative_grade"])
                         if isinstance(item.get("creative_grade"), dict) else None
                     ),
+                    source_duration_sec=end - start,
+                    record_duration_sec=record_duration,
                 )
             )
         if not result:
@@ -283,48 +332,64 @@ class ReviewRenderer:
         filters: List[str] = []
         video_labels: List[str] = []
         audio_labels: List[str] = []
-        durations = [clip.cut_out_sec - clip.cut_in_sec for clip in clips]
+        durations = [
+            clip.record_duration_sec or (clip.cut_out_sec - clip.cut_in_sec)
+            for clip in clips
+        ]
+        program_audio_text = str(self.audio_program.get("bed_file") or "").strip()
+        program_audio_path = (
+            Path(program_audio_text).expanduser().resolve()
+            if program_audio_text else None
+        )
+        if program_audio_path is not None and not program_audio_path.is_file():
+            raise ReviewRenderError(
+                f"找不到预混现场声 / Conformed program audio not found: {program_audio_path}"
+            )
+        use_program_audio = program_audio_path is not None
 
         input_index = 0
         for index, (clip, duration) in enumerate(zip(clips, durations)):
+            source_duration = clip.source_duration_sec or (
+                clip.cut_out_sec - clip.cut_in_sec
+            )
             command.extend(
                 [
                     "-ss",
                     self._number(clip.cut_in_sec),
                     "-t",
-                    self._number(duration),
+                    self._number(source_duration),
                     "-i",
                     clip.file_name,
                 ]
             )
             video_input = input_index
             input_index += 1
-            if self._has_audio(ffprobe, Path(clip.file_name)):
-                audio_input = video_input
-            else:
-                command.extend(
-                    [
-                        "-f",
-                        "lavfi",
-                        "-t",
-                        self._number(duration),
-                        "-i",
-                        "anullsrc=r=48000:cl=stereo",
-                    ]
-                )
-                audio_input = input_index
-                input_index += 1
+            audio_input: Optional[int] = None
+            if not use_program_audio:
+                if self._has_audio(ffprobe, Path(clip.file_name)):
+                    audio_input = video_input
+                else:
+                    command.extend(
+                        [
+                            "-f",
+                            "lavfi",
+                            "-t",
+                            self._number(duration),
+                            "-i",
+                            "anullsrc=r=48000:cl=stereo",
+                        ]
+                    )
+                    audio_input = input_index
+                    input_index += 1
 
+            timing_factor = duration / source_duration
             video_chain = (
-                f"[{video_input}:v:0]setpts=PTS-STARTPTS,"
+                f"[{video_input}:v:0]setpts=(PTS-STARTPTS)*{self._number(timing_factor)},"
                 f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
                 f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2,"
                 # ``concat`` emits AVTB (microsecond) timestamps. Normalize every
-                # source to that same time base before a later xfade combines a
-                # hard-cut aggregate with the next source. Without this, mixed
-                # cut/xfade timelines fail at the first xfade on NTSC footage.
-                # ``concat`` 会输出 AVTB（微秒）时间基；在后续 xfade 前统一每段
-                # 素材的时间基，避免 NTSC 素材“先硬切、后转场”时初始化失败。
+                # source to the same time base before joining mixed-FPS footage.
+                # ``concat`` 输出 AVTB（微秒）时间基；混合帧率素材拼接前统一时间基。
                 f"fps={self._number(fps)},settb=AVTB,format=yuv420p"
                 f"{self._technical_color_filter(clip)}"
                 f"{self._color_match_filter(clip)}"
@@ -332,62 +397,46 @@ class ReviewRenderer:
                 f"{self._creative_grade_filter(clip)}"
                 f"{self._motion_filter(clip.motion, fps)}[v{index}]"
             )
-            audio_chain = (
-                f"[{audio_input}:a:0]atrim=0:{self._number(duration)},"
-                "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo"
-                f"{self._audio_filter(clip.audio_cleanup)}"
-                f",volume={self._number(clip.volume_db)}dB[a{index}]"
-            )
-            filters.extend((video_chain, audio_chain))
+            filters.append(video_chain)
             video_labels.append(f"v{index}")
-            audio_labels.append(f"a{index}")
+            if audio_input is not None:
+                audio_chain = (
+                    f"[{audio_input}:a:0]atrim=0:{self._number(duration)},"
+                    "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo"
+                    f"{self._audio_filter(clip.audio_cleanup)}"
+                    f",volume={self._number(clip.volume_db)}dB[a{index}]"
+                )
+                filters.append(audio_chain)
+                audio_labels.append(f"a{index}")
 
         current_video = video_labels[0]
-        current_audio = audio_labels[0]
+        current_audio = audio_labels[0] if audio_labels else ""
         current_duration = durations[0]
+        deferred_transitions = any(
+            clip.transition_to_next != "cut" for clip in clips[:-1]
+        )
+        if deferred_transitions:
+            self.logger.warning(
+                "Resolve 交付尚无经验证的逐帧转场 API；预览按统一硬切渲染，避免转场后音画错位。"
+                " / Planned transitions are deferred until a frame-accurate Resolve "
+                "transition path is available; review uses canonical hard cuts."
+            )
         for index in range(1, len(clips)):
-            previous = clips[index - 1]
             next_video = f"vx{index}"
             next_audio = f"ax{index}"
-            if previous.transition_to_next == "cut":
-                filters.append(
-                    f"[{current_video}][{video_labels[index]}]"
-                    f"concat=n=2:v=1:a=0[{next_video}]"
-                )
+            filters.append(
+                f"[{current_video}][{video_labels[index]}]"
+                f"concat=n=2:v=1:a=0[{next_video}]"
+            )
+            if not use_program_audio:
                 filters.append(
                     f"[{current_audio}][{audio_labels[index]}]"
                     f"concat=n=2:v=0:a=1[{next_audio}]"
                 )
-                current_video = next_video
-                current_audio = next_audio
-                current_duration += durations[index]
-                continue
-            minimum = max(1.0 / fps, 0.04)
-            requested = previous.transition_duration_sec
-            transition_duration = min(
-                max(minimum, requested),
-                durations[index - 1] * 0.45,
-                durations[index] * 0.45,
-                2.0,
-            )
-            offset = max(0.0, current_duration - transition_duration)
-            transition = {
-                "cut": "fade",
-                "cross_dissolve": "fade",
-                "fade_black": "fadeblack",
-            }[previous.transition_to_next]
-            filters.append(
-                f"[{current_video}][{video_labels[index]}]"
-                f"xfade=transition={transition}:duration={self._number(transition_duration)}:"
-                f"offset={self._number(offset)}[{next_video}]"
-            )
-            filters.append(
-                f"[{current_audio}][{audio_labels[index]}]"
-                f"acrossfade=d={self._number(transition_duration)}:c1=tri:c2=tri[{next_audio}]"
-            )
             current_video = next_video
-            current_audio = next_audio
-            current_duration += durations[index] - transition_duration
+            if not use_program_audio:
+                current_audio = next_audio
+            current_duration += durations[index]
 
         graphics_items = (
             self.graphics_plan.get("items", [])
@@ -404,7 +453,17 @@ class ReviewRenderer:
                 filters.append(graphic_filter)
                 current_video = f"vg{graphic_index}"
 
-        final_audio = current_audio
+        if use_program_audio:
+            command.extend(["-i", str(program_audio_path)])
+            program_input = input_index
+            input_index += 1
+            filters.append(
+                f"[{program_input}:a:0]atrim=0:{self._number(current_duration)},"
+                "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[programbed]"
+            )
+            final_audio = "programbed"
+        else:
+            final_audio = current_audio
         bed_path_text = str(self.music_plan.get("bed_file") or "").strip()
         music_path_text = bed_path_text or str(self.music_plan.get("file_name") or "").strip()
         if music_path_text:
@@ -424,7 +483,7 @@ class ReviewRenderer:
                     "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[musicbed]"
                 )
                 filters.append(
-                    f"[{current_audio}][musicbed]amix=inputs=2:duration=first:normalize=0,"
+                    f"[{final_audio}][musicbed]amix=inputs=2:duration=first:normalize=0,"
                     "alimiter=limit=0.95[programaudio]"
                 )
                 final_audio = "programaudio"
@@ -449,7 +508,7 @@ class ReviewRenderer:
                     f"afade=t=out:st={self._number(fade_out_start)}:d={self._number(fade_out)}[musicbed]"
                 )
                 filters.append(
-                    f"[{current_audio}][musicbed]amix=inputs=2:duration=first:normalize=0,"
+                    f"[{final_audio}][musicbed]amix=inputs=2:duration=first:normalize=0,"
                     "alimiter=limit=0.95[programaudio]"
                 )
                 final_audio = "programaudio"
@@ -656,7 +715,12 @@ class ReviewRenderer:
         )
 
     def _graphics_filter(
-        self, graphic: Dict[str, Any], input_label: str, output_label: str
+        self,
+        graphic: Dict[str, Any],
+        input_label: str,
+        output_label: str,
+        *,
+        transparent_canvas: bool = False,
     ) -> str:
         """
         Build one story-motivated title/chapter overlay for the review render.
@@ -696,19 +760,29 @@ class ReviewRenderer:
             f"( {self._number(end)}-t)/{self._number(fade)}))"
         ).replace(" ", "")
         centered = kind in {"title_card", "end_card"}
-        main_size = 72 if centered else 48
-        sub_size = 32 if centered else 26
-        main_x = "(w-text_w)/2" if centered else "100"
+        layout_scale = max(0.5, float(self.height) / 1080.0)
+        main_size = int(round((72 if centered else 48) * layout_scale))
+        sub_size = int(round((32 if centered else 26) * layout_scale))
+        left_main = int(round(100 * layout_scale))
+        left_sub = int(round(104 * layout_scale))
+        lower_main = int(round(220 * layout_scale))
+        lower_sub = int(round(152 * layout_scale))
+        lower_box = int(round(270 * layout_scale))
+        lower_box_height = int(round(190 * layout_scale))
+        main_x = "(w-text_w)/2" if centered else str(left_main)
         main_y = "h*0.40" if centered else "h-220"
-        sub_x = "(w-text_w)/2" if centered else "104"
-        sub_y = "h*0.56" if centered else "h-152"
-        box_y = "ih*0.30" if centered else "ih-270"
-        box_h = "ih*0.38" if centered else "190"
+        if not centered:
+            main_y = f"h-{lower_main}"
+        sub_x = "(w-text_w)/2" if centered else str(left_sub)
+        sub_y = "h*0.56" if centered else f"h-{lower_sub}"
+        box_y = "ih*0.30" if centered else f"ih-{lower_box}"
+        box_h = "ih*0.38" if centered else str(lower_box_height)
         box_alpha = "0.42" if style in {"bold_cinematic", "kinetic"} else "0.28"
         accent = "0x35d0ba" if style == "kinetic" else "white"
+        replace = ":replace=1" if transparent_canvas else ""
         chain = (
             f"[{input_label}]drawbox=x=0:y={box_y}:w=iw:h={box_h}:"
-            f"color=black@{box_alpha}:t=fill:enable='{enable}',"
+            f"color=black@{box_alpha}:t=fill{replace}:enable='{enable}',"
             f"drawtext={font_option}:text='{self._escape_drawtext(text)}':"
             f"fontcolor={accent}:fontsize={main_size}:x={main_x}:y={main_y}:"
             f"borderw=1:bordercolor=black@0.7:alpha='{alpha}':enable='{enable}'"

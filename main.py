@@ -274,7 +274,7 @@ class WorkflowOrchestrator:
 
         Legacy extraction stored only occasional scene thumbnails. It remains
         a valid archive, but is insufficient for the current director, which
-        reviews every one-second temporal sample in sequence.
+        reviews every half-second temporal sample in sequence.
         """
         try:
             payload = json.loads(raw_data.read_text(encoding="utf-8-sig"))
@@ -292,6 +292,10 @@ class WorkflowOrchestrator:
                 return False
             try:
                 interval = float(sampling.get("requested_interval_sec"))
+                effective_gap = float(
+                    sampling.get("effective_min_gap_sec", interval)
+                )
+                hard_cap = int(sampling.get("hard_cap", 0))
                 saved = int(sampling.get("saved_frame_count"))
             except (TypeError, ValueError):
                 return False
@@ -299,7 +303,10 @@ class WorkflowOrchestrator:
                 sampling.get("mode") != "continuous_temporal_coverage"
                 or sampling.get("complete_source_span") is not True
                 or interval <= 0
-                or interval > 1.05
+                or interval > 0.55
+                or effective_gap <= 0
+                or effective_gap > 0.55
+                or hard_cap < 14400
                 or saved <= 0
                 or saved != len(keyframes)
             ):
@@ -307,13 +314,19 @@ class WorkflowOrchestrator:
         return True
 
     @staticmethod
-    def _has_reusable_candidate_audit(timeline_cuts: Path) -> bool:
+    def _has_reusable_candidate_audit(
+        timeline_cuts: Path,
+        raw_data: Path,
+        vision_model: str,
+    ) -> bool:
         """
         Return whether a prior full visual pass can be safely reused.
         判断既有计划是否包含可复用的完整视觉候选审计。
 
         Parameters / 参数:
             timeline_cuts: Existing final director handoff. / 既有最终导演交接文件。
+            raw_data: Current full extraction evidence. / 当前完整提取证据。
+            vision_model: Installed vision model selected for review. / 审片视觉模型。
         """
         try:
             payload = json.loads(timeline_cuts.read_text(encoding="utf-8-sig"))
@@ -321,14 +334,32 @@ class WorkflowOrchestrator:
             return False
         audit = payload.get("candidate_audit") if isinstance(payload, dict) else None
         review = payload.get("visual_review") if isinstance(payload, dict) else None
-        return (
+        if not (
             isinstance(audit, list)
             and bool(audit)
             and isinstance(review, dict)
-            and review.get("mode") == "continuous_all_saved_samples"
+            and review.get("mode") == "neutral_complete_temporal_coverage"
             and review.get("candidate_audit_complete") is True
-            and int(review.get("candidate_audit_version", 0) or 0) >= 2
-        )
+            and int(review.get("candidate_audit_version", 0) or 0) >= 3
+        ):
+            return False
+        recorded_fingerprint = str(
+            review.get("evidence_fingerprint") or ""
+        ).strip()
+        if not recorded_fingerprint:
+            return False
+        try:
+            # Imported only for the lightweight cache check. director.py itself
+            # uses the standard library and does not load Ollama or any ML stack.
+            # 仅在缓存校验时延迟导入；不会加载 Ollama 或 ML 运行时。
+            from src.director import build_evidence_fingerprint
+
+            current_fingerprint = build_evidence_fingerprint(
+                raw_data, vision_model
+            )
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return recorded_fingerprint == current_fingerprint
 
     def run(self, args: argparse.Namespace) -> None:
         """
@@ -351,9 +382,10 @@ class WorkflowOrchestrator:
                 )
                 if not has_sources:
                     raise WorkflowError(
-                        "现有 raw_data.json 来自旧版稀疏审片，且没有提供源素材，无法自动升级。"
-                        "请重新选择素材并运行完整流程。 / Existing extraction uses legacy sparse "
-                        "review data and no source media was supplied; select the media and run again."
+                        "现有 raw_data.json 来自旧版或低于 2fps 的审片，且没有提供源素材，无法自动升级。"
+                        "请重新选择素材并运行完整流程。 / Existing extraction is legacy or below "
+                        "the required 2-fps review density, and no source media was supplied; "
+                        "select the media and run again."
                     )
                 args.skip_extraction = False
                 self.logger.warning(
@@ -386,7 +418,9 @@ class WorkflowOrchestrator:
         reuse_visual_audit = bool(
             args.skip_extraction
             and not args.skip_director
-            and self._has_reusable_candidate_audit(timeline_cuts)
+            and self._has_reusable_candidate_audit(
+                timeline_cuts, raw_data, args.ollama_model
+            )
         )
 
         with WorkflowLock(lock_path), WindowsSleepInhibitor(self.logger):
@@ -546,6 +580,13 @@ class WorkflowOrchestrator:
                     )
                 finally:
                     self._force_ollama_unload(args.ollama_model, args.ollama_url)
+                    if (
+                        str(args.director_model or args.ollama_model).casefold()
+                        != str(args.ollama_model).casefold()
+                    ):
+                        self._force_ollama_unload(
+                            args.director_model, args.ollama_url
+                        )
                 self._require_file(treatment_path, "导演初审未生成 director_treatment.json")
                 self._require_file(music_brief, "导演初审未生成 music_brief.json")
                 self._release_barrier("Ollama music-director first pass")
@@ -567,6 +608,13 @@ class WorkflowOrchestrator:
                         str(args.creative_brief or "documentary cinematic"),
                         "--limit",
                         str(getattr(args, "music_candidate_limit", 8)),
+                        # Phase 2 is documented as CPU/network-only.  Whisper's
+                        # vocal audit defaults to ``auto`` and would otherwise
+                        # silently claim CUDA while the orchestration contract
+                        # says VRAM is free. / 阶段二必须保持 0 VRAM；显式禁止
+                        # 人声审计的 auto 设备选择偷偷加载 CUDA。
+                        "--vocal-audit-device",
+                        "cpu",
                         "--log-level",
                         args.log_level,
                     ]
@@ -668,18 +716,41 @@ class WorkflowOrchestrator:
                         "--log-level",
                         args.log_level,
                     ]
-                    self._run_stage(
-                        "音乐床合成与对白 Ducking / Music-bed conform and dialogue ducking",
-                        bed_command,
-                    )
-                    # A valid no-music creative decision intentionally produces no WAV.
-                    self._release_barrier("FFmpeg CPU music-bed conform")
 
             needs_program_audio = not (
                 bool(args.skip_director)
                 and bool(args.skip_resolve)
                 and bool(getattr(args, "skip_preview", True))
             )
+            if not args.skip_director or needs_program_audio or bed_command is not None:
+                self._require_file(
+                    timeline_cuts, "统一帧时间表需要现有 timeline_cuts.json"
+                )
+                frame_edl_command = [
+                    self.python_executable,
+                    "-m",
+                    "src.frame_edl",
+                    "--timeline",
+                    str(timeline_cuts),
+                    "--log-level",
+                    args.log_level,
+                ]
+                self._run_stage(
+                    "统一源帧/记录帧时间表 / Canonical source-record frame EDL",
+                    frame_edl_command,
+                )
+                self._release_barrier("FFprobe frame-EDL conform")
+            else:
+                frame_edl_command = []
+
+            if bed_command is not None:
+                self._run_stage(
+                    "音乐床合成与对白 Ducking / Music-bed conform and dialogue ducking",
+                    bed_command,
+                )
+                # A valid no-music creative decision intentionally produces no WAV.
+                self._release_barrier("FFmpeg CPU music-bed conform")
+
             if needs_program_audio:
                 self._require_file(
                     timeline_cuts, "现场声合成需要现有 timeline_cuts.json"
@@ -795,17 +866,13 @@ class WorkflowOrchestrator:
                                 blind.get("reason")
                                 if isinstance(blind, dict) else "blind review failed"
                             )
-                            self.logger.warning(
-                                "低清成片已耗尽 %d 次导演重剪但盲审仍未通过；将保留当前最佳完整"
-                                "成片并继续 Resolve。审片报告：%s。原因：%s / Rendered rough "
-                                "cut exhausted %d director recuts without passing blind review; "
-                                "preserving the best complete cut and continuing to Resolve.",
-                                max_feedback_recuts,
-                                review_path,
-                                reason,
-                                max_feedback_recuts,
+                            raise WorkflowError(
+                                "低清成片已耗尽 "
+                                f"{max_feedback_recuts} 次导演重剪但仍未通过陌生观众盲审；"
+                                f"已阻止 Resolve。审片报告：{review_path}。原因：{reason} / "
+                                "Rendered rough cut exhausted all director recuts without passing "
+                                "the blind-viewer gate; Resolve was not started."
                             )
-                            break
 
                         self.logger.warning(
                             "低清成片盲审未通过，正在把真实成片反馈交回导演重剪 %d/%d / "
@@ -833,6 +900,11 @@ class WorkflowOrchestrator:
                             timeline_cuts, "成片反馈重剪未生成 timeline_cuts.json"
                         )
                         self._release_barrier("Ollama rough-cut feedback recut")
+                        self._run_stage(
+                            "重剪统一帧时间表 / Recut canonical frame EDL",
+                            frame_edl_command,
+                        )
+                        self._release_barrier("FFprobe recut frame-EDL conform")
                         if bed_command is not None:
                             self._run_stage(
                                 "重剪音乐床合成 / Recut music-bed conform",
@@ -901,6 +973,12 @@ class WorkflowOrchestrator:
                             ),
                         ]
                     )
+                final_dir: Optional[Path] = None
+                render_name = str(
+                    getattr(args, "render_name", "CyberEditor_final")
+                    or "CyberEditor_final"
+                )
+                render_before: Dict[str, tuple[int, int]] = {}
                 if bool(getattr(args, "render_final", False)):
                     command.append("--render")
                     render_dir = str(
@@ -908,14 +986,26 @@ class WorkflowOrchestrator:
                     ).strip()
                     if render_dir:
                         command.extend(["--render-dir", render_dir])
+                    final_dir = (
+                        Path(render_dir).expanduser().resolve()
+                        if render_dir
+                        else (self.data_dir / "final").resolve()
+                    )
+                    for existing in final_dir.glob(f"{render_name}.*"):
+                        if not existing.is_file():
+                            continue
+                        try:
+                            stat = existing.stat()
+                        except OSError:
+                            continue
+                        render_before[str(existing.resolve()).casefold()] = (
+                            stat.st_size,
+                            stat.st_mtime_ns,
+                        )
                     command.extend(
                         [
                             "--render-name",
-                            str(
-                                getattr(
-                                    args, "render_name", "CyberEditor_final"
-                                )
-                            ),
+                            render_name,
                         ]
                     )
                     render_preset = str(
@@ -930,59 +1020,66 @@ class WorkflowOrchestrator:
                         ]
                     )
                 self._run_stage("执行 / Resolve", command)
-                if (
-                    bool(getattr(args, "render_final", False))
-                    and preview_path is not None
-                    and preview_path.is_file()
-                ):
-                    configured_render_dir = str(
-                        getattr(args, "render_dir", "") or ""
-                    ).strip()
-                    final_dir = (
-                        Path(configured_render_dir).expanduser().resolve()
-                        if configured_render_dir
-                        else (self.data_dir / "final").resolve()
-                    )
-                    render_name = str(
-                        getattr(args, "render_name", "CyberEditor_final")
-                        or "CyberEditor_final"
-                    )
+                if bool(getattr(args, "render_final", False)):
+                    if final_dir is None:
+                        raise WorkflowError(
+                            "Resolve 渲染目录未初始化 / Resolve render directory was not initialized."
+                        )
                     rendered_candidates = [
                         path
                         for path in final_dir.glob(f"{render_name}.*")
                         if path.is_file()
                         and path.suffix.casefold()
                         in {".mov", ".mp4", ".mxf", ".avi", ".mkv"}
+                        and (
+                            str(path.resolve()).casefold() not in render_before
+                            or (
+                                path.stat().st_size,
+                                path.stat().st_mtime_ns,
+                            )
+                            != render_before[str(path.resolve()).casefold()]
+                        )
                     ]
                     if not rendered_candidates:
                         raise WorkflowError(
-                            f"Resolve reported success but no final media file was found in {final_dir}."
+                            "Resolve reported success but produced no new or updated final media "
+                            f"file in {final_dir}; an older same-name render is not accepted."
                         )
                     final_export = max(
                         rendered_candidates,
                         key=lambda path: path.stat().st_mtime_ns,
                     )
-                    final_qa_path = self.data_dir / "review" / "final_output_qa.json"
-                    self._run_stage(
-                        "最终导出一致性验收 / Final export consistency QA",
-                        [
-                            self.python_executable,
-                            "-m",
-                            "src.final_output_qa",
-                            "--final",
-                            str(final_export),
-                            "--approved",
-                            str(preview_path),
-                            "--output",
-                            str(final_qa_path),
-                            "--log-level",
-                            args.log_level,
-                        ],
-                    )
-                    self._require_file(
-                        final_qa_path,
-                        "Resolve 最终导出未生成一致性 QA 报告",
-                    )
+                    if preview_path is not None and preview_path.is_file():
+                        final_qa_path = (
+                            self.data_dir / "review" / "final_output_qa.json"
+                        )
+                        self._run_stage(
+                            "最终导出一致性验收 / Final export consistency QA",
+                            [
+                                self.python_executable,
+                                "-m",
+                                "src.final_output_qa",
+                                "--final",
+                                str(final_export),
+                                "--approved",
+                                str(preview_path),
+                                "--output",
+                                str(final_qa_path),
+                                "--log-level",
+                                args.log_level,
+                            ],
+                        )
+                        self._require_file(
+                            final_qa_path,
+                            "Resolve 最终导出未生成一致性 QA 报告",
+                        )
+                        self._require_passing_qa(final_qa_path)
+                    else:
+                        self.logger.warning(
+                            "未生成审核预览；已确认 Resolve 产物存在，但无法执行音画一致性对照。"
+                            " / No approved preview exists; the Resolve artifact is present, "
+                            "but picture/audio consistency comparison is unavailable."
+                        )
 
             self.logger.info(
                 "全部所选阶段完成 / All selected stages completed"
@@ -1134,13 +1231,79 @@ class WorkflowOrchestrator:
                 model,
                 model,
             )
-        else:
-            self.logger.warning(
-                "无法确认 %s 已卸载；启动 Resolve 前请运行 ollama stop %s。"
-                " / Could not confirm unload; stop the model before Resolve.",
-                model,
-                model,
+        canonical_model = str(model or "").strip().casefold()
+        if ":" not in canonical_model:
+            canonical_model += ":latest"
+
+        def canonical(value: object) -> str:
+            text = str(value or "").strip().casefold()
+            return text if ":" in text else text + ":latest"
+
+        verified_unloaded = False
+        deadline = time.monotonic() + 30.0
+        last_error = ""
+        while time.monotonic() < deadline:
+            try:
+                with urllib_request.urlopen(
+                    base_url.rstrip("/") + "/api/ps", timeout=5
+                ) as response:
+                    resident_payload = json.loads(response.read().decode("utf-8"))
+                resident_rows = (
+                    resident_payload.get("models", [])
+                    if isinstance(resident_payload, dict)
+                    else []
+                )
+                resident = {
+                    canonical(
+                        item.get("name") or item.get("model")
+                    )
+                    for item in resident_rows
+                    if isinstance(item, dict)
+                }
+                if canonical_model not in resident:
+                    verified_unloaded = True
+                    break
+                last_error = f"still resident: {sorted(resident)}"
+            except (
+                urllib_error.URLError,
+                TimeoutError,
+                OSError,
+                ValueError,
+            ) as exc:
+                last_error = str(exc)
+                if ollama_command:
+                    try:
+                        ps = subprocess.run(
+                            [ollama_command, "ps"],
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                            check=False,
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        ps = None
+                    if ps is not None and ps.returncode == 0:
+                        resident_lines = {
+                            canonical(line.split()[0])
+                            for line in ps.stdout.splitlines()[1:]
+                            if line.split()
+                        }
+                        if canonical_model not in resident_lines:
+                            verified_unloaded = True
+                            break
+            time.sleep(0.5)
+        if not verified_unloaded:
+            raise WorkflowError(
+                f"无法确认 Ollama 模型 {model!r} 已完全卸载（{last_error}）；"
+                "为避免与下一重型阶段并发占用显存，工作流已停止。 / Could not "
+                "verify exact-tag Ollama unload; the serial workflow stopped before "
+                "starting the next VRAM-heavy stage."
             )
+        self.logger.info(
+            "已通过 /api/ps 确认 %s 不再驻留 / Verified exact model is no longer resident: %s",
+            model,
+            model,
+        )
 
     def _require_vision_model(self, model: str, base_url: str) -> None:
         """
@@ -1182,8 +1345,8 @@ class WorkflowOrchestrator:
             raise WorkflowError(
                 f"模型 {model!r} 不支持图像输入，不能审阅视频画面。"
                 "请先安装并选择视觉模型，例如：\n"
+                "  ollama pull qwen3.6:27b\n"
                 "  ollama pull qwen3.6:27b-mtp-q8_0\n"
-                "  ollama pull qwen3.6:27b-mtp-q4_K_M\n"
                 "The selected model is text-only; a vision model is required."
             )
 
@@ -1210,6 +1373,29 @@ class WorkflowOrchestrator:
         """Require a non-empty stage handoff artifact. / 要求阶段交接产物存在且非空。"""
         if not path.is_file() or path.stat().st_size == 0:
             raise WorkflowError(f"{context}: {path}")
+
+    @staticmethod
+    def _require_passing_qa(path: Path) -> None:
+        """
+        Require an explicit true hard-gate result from final-output QA.
+        要求最终导出 QA 明确返回 true，禁止技术失败被标记为成功。
+
+        Parameters / 参数:
+            path: Existing final-output QA JSON report. / 已存在的最终导出 QA 报告。
+        """
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkflowError(
+                f"最终导出 QA 报告无法读取 / Invalid final-output QA report: {path}: {exc}"
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("passes") is not True:
+            failures = payload.get("failures", []) if isinstance(payload, dict) else []
+            detail = "; ".join(str(item) for item in failures) or "passes was not true"
+            raise WorkflowError(
+                "Resolve 最终导出未通过技术验收 / "
+                f"Final Resolve export did not pass technical QA: {detail}"
+            )
 
 
 def configure_logging(level: str, log_file: Path) -> logging.Logger:
@@ -1276,18 +1462,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--language")
     parser.add_argument("--scene-threshold", type=float, default=0.28)
     parser.add_argument(
-        "--sample-interval", type=float, default=1.0,
-        help="连续视觉审片采样间隔；默认每秒一帧 / full-review sampling interval",
+        "--sample-interval", type=float, default=0.5,
+        help="连续视觉审片采样间隔；默认每秒两帧 / full-review sampling interval",
     )
     parser.add_argument(
-        "--max-keyframes", type=int, default=7200,
+        "--max-keyframes", type=int, default=14400,
         help="每个素材的视觉证据硬上限 / per-source visual evidence cap",
     )
-    parser.add_argument("--ollama-model", default="qwen3.6:27b-mtp-q8_0")
+    parser.add_argument("--ollama-model", default="qwen3.6:27b")
     parser.add_argument(
         "--director-model",
-        default="",
-        help="视觉阶段卸载后加载的全局文字导演；空值沿用视觉模型 / global text director",
+        default="qwen3.6:27b-mtp-q8_0",
+        help="视觉阶段卸载后加载的全局文字导演 / global text director",
     )
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--chunk-minutes", type=float, default=12.0)

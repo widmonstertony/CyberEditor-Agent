@@ -5,8 +5,17 @@ import logging
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from src.director import AIDirector, CANDIDATE_SCHEMA, DirectorError
+from src.director import (
+    AIDirector,
+    ATOM_REFINEMENT_SCHEMA,
+    CANDIDATE_SCHEMA,
+    DirectorError,
+    EditorialQualityError,
+    EVIDENCE_ATOM_SCHEMA,
+    build_evidence_fingerprint,
+)
 
 
 class FakeResponse:
@@ -76,7 +85,47 @@ class VisionSession(FakeSession):
         if json.get("keep_alive") == 0:
             return FakeResponse({"done": True, "response": ""})
         prompt = json.get("prompt", "")
-        if "Create the director treatment" in prompt:
+        if "STORY CONCEPT TOURNAMENT" in prompt:
+            generated = {
+                "concepts": [
+                    {
+                        "concept_id": "concept-a", "title": "Focused action",
+                        "form": "character_vignette", "premise": "One action reveals preparation.",
+                        "viewer_takeaway": "Preparation creates focus.",
+                        "opening": "Enter the action.", "development": "Preparation becomes intent.",
+                        "payoff": "The action reaches its apex.", "ending": "Hold the completed state.",
+                        "proof_candidate_ids": ["C0001", "C0002"], "ending_candidate_id": "C0002",
+                        "music_direction": "Restrained pulse.", "color_direction": "Warm controlled night.",
+                        "feasibility_score": 9, "biggest_risk": "Only one observed atom.",
+                        "recommended_duration_sec": 12,
+                    },
+                    {
+                        "concept_id": "concept-b", "title": "Motion study",
+                        "form": "kinetic_style_film", "premise": "A visual action becomes rhythm.",
+                        "viewer_takeaway": "Movement has graphic force.",
+                        "opening": "Begin on motion.", "development": "Repeat visual rhythm.",
+                        "payoff": "Land on the action apex.", "ending": "Release on the exit state.",
+                        "proof_candidate_ids": ["C0001", "C0002"], "ending_candidate_id": "C0002",
+                        "music_direction": "Percussive instrumental.", "color_direction": "Clean contrast.",
+                        "feasibility_score": 7, "biggest_risk": "Limited visual variety.",
+                        "recommended_duration_sec": 10,
+                    },
+                    {
+                        "concept_id": "concept-c", "title": "Quiet observation",
+                        "form": "atmospheric_poem", "premise": "A small action carries atmosphere.",
+                        "viewer_takeaway": "Attention transforms a simple moment.",
+                        "opening": "Observe the entry.", "development": "Stay with the gesture.",
+                        "payoff": "Reveal the apex.", "ending": "End on stillness.",
+                        "proof_candidate_ids": ["C0001", "C0002"], "ending_candidate_id": "C0002",
+                        "music_direction": "Sparse instrumental texture.", "color_direction": "Natural low-key tone.",
+                        "feasibility_score": 6, "biggest_risk": "May feel too slight.",
+                        "recommended_duration_sec": 10,
+                    },
+                ],
+                "selected_concept_id": "concept-a",
+                "selection_reason": "It communicates the clearest observed action.",
+            }
+        elif "Turn the winning evidence-backed concept" in prompt:
             generated = {
                 "title": "Preparation to payoff",
                 "logline": "A crew turns preparation into one precise action.",
@@ -368,7 +417,9 @@ class AIDirectorTests(unittest.TestCase):
 
     def test_full_review_request_sends_every_extracted_frame(self):
         session = VisionSession()
-        director = self.make_director(model="qwen3.5:test", session=session)
+        director = self.make_director(
+            model="qwen3.5:test", session=session, num_ctx=32768
+        )
         with tempfile.TemporaryDirectory() as temporary:
             frame = Path(temporary) / "frame.jpg"
             frame.write_bytes(b"jpeg")
@@ -402,6 +453,543 @@ class AIDirectorTests(unittest.TestCase):
         request = next(item for item in session.posts if item.get("images"))
         self.assertEqual(len(request["images"]), 16)
         self.assertIn("CONTINUITY FROM PREVIOUS BATCH", request["prompt"])
+
+    def test_neutral_visual_prompt_precedes_any_treatment(self):
+        director = self.make_director()
+        prompt = director.build_prompt(
+            {
+                "start_sec": 0.0, "end_sec": 10.0,
+                "core_start_sec": 0.0, "core_end_sec": 10.0,
+                "source_order": 0, "continuity_context": "source begins",
+                "transcript": [], "keyframes": [],
+            },
+            "source.mp4",
+            EVIDENCE_ATOM_SCHEMA,
+            treatment=None,
+        )
+
+        self.assertIn("NEUTRAL EVIDENCE PASS", prompt)
+        self.assertIn("entry_state", prompt)
+        self.assertNotIn("Follow the DIRECTOR TREATMENT", prompt)
+        self.assertNotIn("Suggest restrained effects", prompt)
+
+    def test_neutral_schema_and_validator_cannot_make_creative_decisions(self):
+        properties = EVIDENCE_ATOM_SCHEMA["properties"]["decisions"]["items"][
+            "properties"
+        ]
+        for forbidden in (
+            "reason_for_cut", "story_role", "transition_to_next", "color_look",
+            "drx_preset", "stabilization", "tracking", "rhythmic_potential",
+        ):
+            self.assertNotIn(forbidden, properties)
+
+        payload = {
+            "continuity_summary": "A rider enters and raises one glove.",
+            "decisions": [
+                {
+                    "cut_in_sec": 1.0,
+                    "cut_out_sec": 9.8,
+                    "visual_summary": "A rider enters, stops, and raises a glove.",
+                    "subject_action": "The rider raises a glove after stopping.",
+                    "observable_emotion": "focused",
+                    "entry_state": "Rider enters frame.",
+                    "action_apex": "Glove reaches shoulder height.",
+                    "exit_state": "Rider holds the raised glove.",
+                    "screen_direction": "right",
+                    "identity_tags": ["rider-red-helmet"],
+                    "temporal_phase": "development",
+                    "shot_scale": "medium",
+                    "camera_motion": "tracking",
+                    "continuity_tags": ["continuous gesture"],
+                    "technical_readability": "clear",
+                    "confidence": 0.93,
+                }
+            ],
+        }
+        result = self.make_director().validate_chunk_decisions(
+            payload,
+            {
+                "start_sec": 0.0,
+                "end_sec": 10.0,
+                "core_start_sec": 0.0,
+                "core_end_sec": 10.0,
+            },
+            "source.mp4",
+            neutral_evidence=True,
+        )
+
+        self.assertEqual(result[0]["cut_out_sec"], 9.8)
+        self.assertEqual(result[0]["evidence_type"], "visual_atom")
+        self.assertNotIn("story_role", result[0])
+        self.assertNotIn("transition_to_next", result[0])
+        self.assertNotIn("reason_for_cut", result[0])
+
+    def test_long_transcript_segment_survives_visual_transport_windows(self):
+        director = self.make_director()
+        visual = [
+            {
+                "asset_id": "asset-1", "source_order": 0,
+                "file_name": "source.mp4", "cut_in_sec": 8.0,
+                "cut_out_sec": 12.0, "evidence_type": "visual_atom",
+                "visual_summary": "speaker gestures", "subject_action": "gestures",
+                "identity_tags": ["speaker-a"],
+            }
+        ]
+        assets = [
+            {
+                "asset_id": "asset-1", "source_video": "source.mp4",
+                "duration_sec": 60.0,
+                "transcript": [
+                    {
+                        "start_sec": 5.0, "end_sec": 30.0,
+                        "text": "One complete thought that crosses three transport windows.",
+                    },
+                    {
+                        "start_sec": 40.0, "end_sec": 44.0,
+                        "text": "A later speaker is heard outside the sampled visual atom.",
+                    },
+                ],
+            }
+        ]
+
+        result = director._attach_complete_transcript_atoms(visual, assets)
+
+        transcript = next(
+            item for item in result if item.get("evidence_type") == "transcript_atom"
+        )
+        self.assertEqual((transcript["cut_in_sec"], transcript["cut_out_sec"]), (5.0, 30.0))
+        self.assertTrue(transcript["has_dialogue"])
+        later = next(
+            item for item in result
+            if item.get("evidence_type") == "transcript_atom"
+            and item.get("cut_in_sec") == 40.0
+        )
+        self.assertEqual(later["identity_tags"], [])
+        self.assertNotEqual(later["visual_summary"], "speaker gestures")
+
+    def test_evidence_fingerprint_invalidates_source_or_model_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw_path = Path(temporary) / "raw_data.json"
+            raw_path.write_text('{"visual_sampling":{"requested_interval_sec":0.5}}', encoding="utf-8")
+            first = build_evidence_fingerprint(raw_path, "vision:q4")
+            self.assertEqual(first, build_evidence_fingerprint(raw_path, "vision:q4"))
+            self.assertNotEqual(first, build_evidence_fingerprint(raw_path, "vision:q8"))
+            raw_path.write_text('{"visual_sampling":{"requested_interval_sec":1.0}}', encoding="utf-8")
+            self.assertNotEqual(first, build_evidence_fingerprint(raw_path, "vision:q4"))
+
+    def test_evidence_fingerprint_tracks_source_proxy_and_jpeg_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            proxy = root / "proxy.mp4"
+            frame = root / "frame.jpg"
+            source.write_bytes(b"source-a")
+            proxy.write_bytes(b"proxy-a")
+            frame.write_bytes(b"jpeg-a")
+            raw_path = root / "raw_data.json"
+            raw_path.write_text(
+                json.dumps(
+                    {
+                        "assets": [
+                            {
+                                "asset_id": "asset-1",
+                                "source_video": str(source),
+                                "proxy_file_name": str(proxy),
+                                "keyframes": [{"image_path": str(frame)}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            previous = build_evidence_fingerprint(raw_path, "vision:q4")
+            for evidence_file, suffix in (
+                (source, b"-replaced"),
+                (proxy, b"-replaced"),
+                (frame, b"-replaced"),
+            ):
+                evidence_file.write_bytes(evidence_file.read_bytes() + suffix)
+                current = build_evidence_fingerprint(raw_path, "vision:q4")
+                self.assertNotEqual(previous, current)
+                previous = current
+
+            frame.unlink()
+            with self.assertRaisesRegex(DirectorError, "Missing or unreadable"):
+                build_evidence_fingerprint(raw_path, "vision:q4")
+
+    def test_compact_treatment_excludes_hierarchical_evidence_pages(self):
+        sentinel = "FULL_LEDGER_PAGE_SHOULD_NOT_REENTER_PROMPTS"
+        treatment = {
+            "title": "A focused film",
+            "central_theme": "Preparation becomes motion",
+            "selected_concept_id": "concept-b",
+            "concept_tournament": {
+                "selected_concept_id": "concept-b",
+                "selection_reason": "The ending is directly observable.",
+                "concepts": [
+                    {"concept_id": "concept-a", "premise": "Unused"},
+                    {
+                        "concept_id": "concept-b",
+                        "premise": "A rider prepares and leaves.",
+                        "proof_candidate_ids": ["C0001", "C0008"],
+                    },
+                ],
+                "evidence_review": {
+                    "pages": [{"page_summary": sentinel * 1000}]
+                },
+            },
+            "story_anchors": [],
+            "footage_ledger": "C:/private/footage_ledger.json",
+            "evidence_fingerprint": "durable-only",
+        }
+
+        compact = AIDirector._compact_treatment_for_prompt(treatment)
+        encoded = json.dumps(compact, ensure_ascii=False)
+
+        self.assertNotIn(sentinel, encoded)
+        self.assertNotIn("evidence_review", encoded)
+        self.assertNotIn("footage_ledger", compact)
+        self.assertNotIn("evidence_fingerprint", compact)
+        self.assertEqual(
+            compact["concept_tournament"]["selected_concept"]["concept_id"],
+            "concept-b",
+        )
+
+    def test_treatment_fingerprint_is_required_and_must_match(self):
+        expected = "current-evidence"
+        with self.assertRaisesRegex(DirectorError, "evidence fingerprint"):
+            AIDirector._require_treatment_evidence_fingerprint({}, expected)
+        with self.assertRaisesRegex(DirectorError, "evidence fingerprint"):
+            AIDirector._require_treatment_evidence_fingerprint(
+                {"evidence_fingerprint": "stale-evidence"}, expected
+            )
+        AIDirector._require_treatment_evidence_fingerprint(
+            {"evidence_fingerprint": expected}, expected
+        )
+
+    def test_check_ollama_rejects_resident_variant_with_same_base_name(self):
+        class SameBaseVariantSession(FakeSession):
+            def get(self, url, timeout=None):
+                if url.endswith("/api/ps"):
+                    return FakeResponse(
+                        {"models": [{"name": "test-model:other-quant"}]}
+                    )
+                return super().get(url, timeout=timeout)
+
+        director = self.make_director(session=SameBaseVariantSession())
+        with self.assertRaisesRegex(DirectorError, "Other Ollama models"):
+            director.check_ollama()
+
+    def test_assign_missing_candidate_ids_preserves_audit_ids(self):
+        candidates = [
+            {"candidate_id": "C0042"},
+            {"candidate_origin": "treatment_fallback"},
+        ]
+
+        AIDirector._assign_missing_candidate_ids(candidates, prefix="R")
+
+        self.assertEqual(candidates[0]["candidate_id"], "C0042")
+        self.assertEqual(candidates[1]["candidate_id"], "R0001")
+
+    def test_event_atom_deduplication_never_merges_adjacent_actions(self):
+        common = {
+            "asset_id": "a", "source_order": 0, "file_name": "a.mp4",
+            "quality_score": 0.8, "confidence": 0.8,
+        }
+        result = AIDirector._deduplicate_event_atoms([
+            {
+                **common, "cut_in_sec": 0.0, "cut_out_sec": 2.0,
+                "subject_action": "rider puts on a glove",
+            },
+            {
+                **common, "cut_in_sec": 1.8, "cut_out_sec": 3.5,
+                "subject_action": "rider fastens the helmet",
+            },
+            {
+                **common, "cut_in_sec": 0.1, "cut_out_sec": 2.1,
+                "subject_action": "rider puts on the glove",
+                "quality_score": 0.9,
+            },
+        ])
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["quality_score"], 0.9)
+        self.assertIn("helmet", result[1]["subject_action"])
+
+    def test_dense_temporal_refinement_preserves_atoms_when_ffmpeg_is_missing(self):
+        director = self.make_director()
+        candidates = [{
+            "asset_id": "asset-1",
+            "cut_in_sec": 1.0,
+            "cut_out_sec": 3.0,
+            "subject_action": "rider raises a helmet",
+        }]
+
+        with patch("src.director.shutil.which", return_value=None):
+            refined, rejected = director._refine_event_atoms_temporally(
+                candidates, [{"asset_id": "asset-1", "duration_sec": 10.0}]
+            )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(refined), 1)
+        self.assertEqual(refined[0]["cut_in_sec"], 1.0)
+        self.assertEqual(
+            refined[0]["temporal_refinement"]["status"], "ffmpeg_unavailable"
+        )
+
+    def test_hierarchical_story_seed_audit_accounts_for_every_atom(self):
+        director = self.make_director()
+        evidence = [
+            {
+                "candidate_id": f"C{index:04d}",
+                "asset_id": "asset-1",
+                "source_order": 0,
+                "in": float(index),
+                "out": float(index + 1),
+                "literal_visual": f"action {index}",
+            }
+            for index in range(1, 4)
+        ]
+        response = {
+            "page_summary": "Three consecutive observed actions.",
+            "story_seeds": [{
+                "form": "character_vignette",
+                "premise": "A person completes a sequence.",
+                "proof_candidate_ids": ["C0001", "C0002", "C0003"],
+                "possible_ending_candidate_id": "C0003",
+                "observable_progression": "The state changes three times.",
+                "limitations": "Only one location is visible.",
+            }],
+        }
+
+        with patch.object(director, "_request_json", return_value=response):
+            audit = director._synthesize_story_seed_pages(evidence, [])
+
+        self.assertTrue(audit["all_candidates_considered"])
+        self.assertEqual(audit["input_candidate_count"], 3)
+        self.assertEqual(
+            audit["pages"][0]["input_candidate_ids"],
+            ["C0001", "C0002", "C0003"],
+        )
+
+    def test_story_seed_pages_use_bounded_asset_coverage_at_72b_context(self):
+        sentinel = "ROLLING_REVIEW_CONCLUSION_MUST_STAY_ON_DISK"
+        director = self.make_director(
+            text_model="qwen3.6:72b-q5", num_ctx=32768
+        )
+        coverage = [
+            {
+                "asset_id": f"asset-{index:02d}",
+                "source_order": index,
+                "file": f"C{1900 + index}.MP4",
+                "duration_sec": 120.0,
+                "saved_visual_samples": 240,
+                "candidate_atom_count": 20,
+                "disposition": "event_atoms_recorded",
+                "review_conclusion": sentinel + ("x" * 800),
+            }
+            for index in range(18)
+        ]
+        evidence = [
+            {
+                "candidate_id": "C0001",
+                "asset_id": "asset-00",
+                "source_order": 0,
+                "in": 1.0,
+                "out": 2.0,
+                "literal_visual": "A rider closes a helmet visor.",
+            }
+        ]
+        prompts = []
+
+        def request(prompt, schema, images=(), model=None, progress_activity=""):
+            del schema, images, model, progress_activity
+            prompts.append(prompt)
+            return {
+                "page_summary": "A rider completes one observed action.",
+                "story_seeds": [
+                    {
+                        "form": "character_vignette",
+                        "premise": "Preparation becomes a completed gesture.",
+                        "proof_candidate_ids": ["C0001"],
+                        "possible_ending_candidate_id": "C0001",
+                        "observable_progression": "The visor moves from open to closed.",
+                        "limitations": "Only one action is present.",
+                    }
+                ],
+            }
+
+        with patch.object(director, "_request_json", side_effect=request):
+            audit = director._synthesize_story_seed_pages(evidence, coverage)
+
+        self.assertEqual(audit["input_candidate_count"], 1)
+        self.assertEqual(len(prompts), 1)
+        self.assertNotIn(sentinel, prompts[0])
+        self.assertIn('"total_sources":18', prompts[0])
+
+    def test_concept_fixed_prefix_fails_before_expensive_story_pages(self):
+        director = self.make_director(
+            text_model="qwen3.6:72b-q5",
+            num_ctx=32768,
+            creative_brief="very long brief " * 5000,
+        )
+        candidates = [
+            {
+                "candidate_id": "C0001",
+                "asset_id": "asset-1",
+                "source_order": 0,
+                "cut_in_sec": 0.0,
+                "cut_out_sec": 1.0,
+                "visual_summary": "One observed action.",
+            }
+        ]
+
+        with patch.object(
+            director,
+            "_synthesize_story_seed_pages",
+        ) as synthesize:
+            with self.assertRaisesRegex(DirectorError, "fixed concept prefix"):
+                director.request_story_concepts([], candidates, [])
+
+        synthesize.assert_not_called()
+
+    def test_visual_review_window_adapts_to_image_token_budget(self):
+        director = self.make_director(
+            model="qwen3.6:27b", num_ctx=32768
+        )
+        asset = {
+            "asset_id": "asset-1",
+            "source_video": "source.mp4",
+            "proxy_file_name": "source.mp4",
+            "duration_sec": 20.0,
+            "transcript": [],
+            "keyframes": [
+                {
+                    "timestamp_sec": index * 0.5,
+                    "file_name": f"frame-{index:03d}.jpg",
+                }
+                for index in range(40)
+            ],
+        }
+
+        chunks = director._build_visual_review_chunks([asset])
+        budget = director._vision_image_budget(EVIDENCE_ATOM_SCHEMA)
+
+        self.assertLess(
+            max(chunk["core_end_sec"] - chunk["core_start_sec"] for chunk in chunks),
+            10.0,
+        )
+        self.assertTrue(
+            all(len(chunk["keyframes"]) <= budget for chunk in chunks)
+        )
+        self.assertEqual(chunks[0]["core_start_sec"], 0.0)
+        self.assertEqual(chunks[-1]["core_end_sec"], 20.0)
+        self.assertEqual(
+            [chunk["core_end_sec"] for chunk in chunks[:-1]],
+            [chunk["core_start_sec"] for chunk in chunks[1:]],
+        )
+        for keyframe in asset["keyframes"]:
+            timestamp = keyframe["timestamp_sec"]
+            self.assertTrue(
+                any(
+                    chunk["core_start_sec"] <= timestamp < chunk["core_end_sec"]
+                    or (
+                        chunk is chunks[-1]
+                        and timestamp == chunk["core_end_sec"]
+                    )
+                    for chunk in chunks
+                ),
+                f"keyframe {timestamp} is outside every adaptive core",
+            )
+
+    def test_story_seed_reduction_recurses_without_prompting_page_provenance(self):
+        director = self.make_director()
+        original_ids = {f"C{index:04d}" for index in range(1, 7)}
+        nodes = [
+            {
+                "page_summary": f"Observed action {index}.",
+                "story_seeds": [
+                    {
+                        "form": "character_vignette",
+                        "premise": f"Action {index} changes the state.",
+                        "proof_candidate_ids": [f"C{index:04d}"],
+                        "possible_ending_candidate_id": f"C{index:04d}",
+                        "observable_progression": "A visible state changes.",
+                        "limitations": "Only one action is represented.",
+                    }
+                ],
+            }
+            for index in range(1, 7)
+        ]
+
+        def capacity(prompt, schema, model=None, reserve_output_tokens=0):
+            del schema, model, reserve_output_tokens
+            return prompt.count('"page_summary"') <= 2
+
+        def reduce_request(
+            prompt,
+            schema,
+            images=(),
+            model=None,
+            progress_activity="director_generation",
+        ):
+            del schema, images, model, progress_activity
+            group = json.loads(prompt.split("SEED NODES: ", 1)[1])
+            proof_ids = list(dict.fromkeys(
+                candidate_id
+                for node in group
+                for seed in node["story_seeds"]
+                for candidate_id in seed["proof_candidate_ids"]
+            ))
+            return {
+                "page_summary": "All supplied nodes were merged chronologically.",
+                "story_seeds": [
+                    {
+                        "form": "character_vignette",
+                        "premise": "The observed actions form one progression.",
+                        "proof_candidate_ids": proof_ids,
+                        "possible_ending_candidate_id": proof_ids[-1],
+                        "observable_progression": "Each action changes the visible state.",
+                        "limitations": "No events outside the supplied evidence are claimed.",
+                    }
+                ],
+            }
+
+        director._request_has_capacity = capacity
+        director._request_json = reduce_request
+        audits = []
+        level = 1
+        while len(nodes) > 1:
+            nodes, audit = director._reduce_story_seed_nodes(nodes, level)
+            audits.append(audit)
+            level += 1
+
+        final_ids = set(nodes[0]["story_seeds"][0]["proof_candidate_ids"])
+        self.assertEqual(final_ids, original_ids)
+        self.assertGreaterEqual(len(audits), 2)
+        self.assertTrue(all(
+            audit["output_node_count"] < audit["input_node_count"]
+            for audit in audits
+        ))
+
+        review = {
+            "all_candidates_considered": True,
+            "input_candidate_count": 6,
+            "page_count": 1,
+            "pages": [
+                {
+                    "input_candidate_ids": ["PROVENANCE_ONLY_SENTINEL"],
+                    "page_summary": "Observed actions.",
+                    "story_seeds": nodes[0]["story_seeds"],
+                }
+            ],
+        }
+        prompt_view = AIDirector._story_seed_prompt_view(review)
+        self.assertNotIn(
+            "PROVENANCE_ONLY_SENTINEL",
+            json.dumps(prompt_view, ensure_ascii=False),
+        )
 
     def test_treatment_excerpt_samples_start_middle_and_end_within_budget(self):
         segments = [
@@ -592,6 +1180,7 @@ class AIDirectorTests(unittest.TestCase):
             {
                 "asset_id": "a", "story_role": "broll", "cut_in_sec": 0.0,
                 "cut_out_sec": 2.9,
+                "reviewed_trim_bounds": {"in_sec": 0.0, "out_sec": 3.2},
             },
             {
                 "asset_id": "a", "story_role": "interview", "cut_in_sec": 3.0,
@@ -608,6 +1197,75 @@ class AIDirectorTests(unittest.TestCase):
         self.assertIn("beat_snap", result[0])
         self.assertEqual(result[1]["cut_out_sec"], 6.0)
         self.assertNotIn("beat_snap", result[1])
+
+    def test_beat_snap_stays_inside_reviewed_handle_and_after_action_apex(self):
+        director = self.make_director()
+        plan = {"beats_sec": [3.0]}
+        asset = [{"asset_id": "a", "duration_sec": 20.0, "transcript": []}]
+
+        outside_handle = director.snap_visual_cuts_to_beats(
+            [{
+                "asset_id": "a", "story_role": "broll", "cut_in_sec": 0.0,
+                "cut_out_sec": 2.9,
+                "reviewed_trim_bounds": {"in_sec": 0.0, "out_sec": 2.95},
+            }],
+            plan,
+            asset,
+        )
+        before_apex = director.snap_visual_cuts_to_beats(
+            [{
+                "asset_id": "a", "story_role": "broll", "cut_in_sec": 0.0,
+                "cut_out_sec": 2.9, "action_apex_sec": 3.05,
+                "reviewed_trim_bounds": {"in_sec": 0.0, "out_sec": 3.2},
+            }],
+            plan,
+            asset,
+        )
+
+        self.assertEqual(outside_handle[0]["cut_out_sec"], 2.9)
+        self.assertNotIn("beat_snap", outside_handle[0])
+        self.assertEqual(before_apex[0]["cut_out_sec"], 2.9)
+        self.assertNotIn("beat_snap", before_apex[0])
+
+    def test_beat_snap_does_not_extend_a_silent_shot_into_dialogue(self):
+        director = self.make_director()
+        result = director.snap_visual_cuts_to_beats(
+            [{
+                "asset_id": "a", "story_role": "broll", "cut_in_sec": 0.0,
+                "cut_out_sec": 2.9,
+                "reviewed_trim_bounds": {"in_sec": 0.0, "out_sec": 3.2},
+            }],
+            {"beats_sec": [3.0]},
+            [{
+                "asset_id": "a", "duration_sec": 20.0,
+                "transcript": [{"start_sec": 2.95, "end_sec": 3.4, "text": "hello"}],
+            }],
+        )
+
+        self.assertEqual(result[0]["cut_out_sec"], 2.9)
+        self.assertNotIn("beat_snap", result[0])
+
+    def test_priority_only_music_landmark_can_drive_a_safe_snap(self):
+        director = self.make_director()
+        result = director.snap_visual_cuts_to_beats(
+            [{
+                "asset_id": "a", "story_role": "broll", "cut_in_sec": 0.0,
+                "cut_out_sec": 2.9, "music_edit_role": "on_beat",
+                "reviewed_trim_bounds": {"in_sec": 0.0, "out_sec": 3.2},
+            }],
+            {
+                "cues": [{
+                    "timeline_in_sec": 0.0, "track_in_sec": 0.0,
+                    "track_out_sec": 4.0, "beats_sec": [],
+                    "strong_beats_sec": [], "downbeats_sec": [],
+                    "sync_points": [{"timeline_sec": 3.0, "type": "section"}],
+                }]
+            },
+            [{"asset_id": "a", "duration_sec": 20.0, "transcript": []}],
+        )
+
+        self.assertEqual(result[0]["cut_out_sec"], 3.0)
+        self.assertEqual(result[0]["beat_snap"]["timeline_beat_sec"], 3.0)
 
     def test_sparse_music_sync_points_are_grounded_from_picture_roles(self):
         director = self.make_director()
@@ -1021,7 +1679,7 @@ class AIDirectorTests(unittest.TestCase):
         self.assertEqual(result["visual_motifs"], [])
         self.assertIn("held pose", result["observed_ending"])
 
-    def test_no_progress_quality_recut_preserves_best_plan_and_continues(self):
+    def test_no_progress_quality_recut_refuses_known_bad_final(self):
         director = self.make_director()
         director._active_target_duration_sec = 20.0
         treatment = {
@@ -1159,18 +1817,14 @@ class AIDirectorTests(unittest.TestCase):
             raise AssertionError(prompt[:120])
 
         director._request_json = fake_request
-        result = director.request_sequence(candidates, assets, treatment)
+        with self.assertRaises(EditorialQualityError) as raised:
+            director.request_sequence(candidates, assets, treatment)
 
         # One incremental repair is followed by one genuinely different
         # structural reset. Repeating the same edit indefinitely is banned, but
-        # subjective scores must not discard the best complete director plan.
+        # a knowingly incoherent plan must never be rendered as a final film.
         self.assertEqual(calls.count("picture_recut"), 2)
-        directing = result["candidate_directing"]
-        self.assertFalse(directing["quality_gate_passed"])
-        self.assertTrue(directing["quality_gate_degraded_acceptance"])
-        self.assertEqual(directing["quality_gate_status"], "degraded_best_available")
-        self.assertTrue(directing["unresolved_quality_advisories"])
-        self.assertEqual(len(result["sequence"]), 4)
+        self.assertTrue(raised.exception.violations)
 
     def test_canonical_coverage_promotes_explicit_missing_event_risk(self):
         director = self.make_director()
@@ -1368,7 +2022,7 @@ class AIDirectorTests(unittest.TestCase):
 
         self.assertFalse(any("dialogue" in item.casefold() for item in violations))
 
-    def test_quality_gate_rejects_hybrid_cut_dominated_by_production_chatter(self):
+    def test_production_chatter_is_advisory_when_director_preserves_it(self):
         director = self.make_director()
         candidates = []
         sequence = []
@@ -1419,8 +2073,8 @@ class AIDirectorTests(unittest.TestCase):
         )
 
         combined = " ".join(violations)
-        self.assertIn("audible-speech ratio", combined)
-        self.assertIn("Production-process chatter", combined)
+        self.assertNotIn("audible-speech ratio", combined)
+        self.assertNotIn("Production-process chatter", combined)
 
     def test_narrative_contract_downgrades_unproven_bts_arc(self):
         director = self.make_director()
@@ -1711,6 +2365,7 @@ class AIDirectorTests(unittest.TestCase):
             frame = root / "frame.jpg"
             frame.write_bytes(b"fake-jpeg")
             source = root / "source.mp4"
+            source.write_bytes(b"fake-media")
             raw = {
                 "schema_version": "2.0",
                 "assets": [
@@ -1744,15 +2399,19 @@ class AIDirectorTests(unittest.TestCase):
             output = director.run(raw_path, output_path)
 
             image_requests = [item for item in session.posts if item.get("images")]
-            # The first multimodal pass sees representative project frames;
-            # the second request inspects the source chunk in detail.
-            self.assertEqual(len(image_requests), 2)
+            # Treatment is now downstream of the neutral full review, so only
+            # the temporal evidence request sends images.
+            self.assertEqual(len(image_requests), 1)
             self.assertEqual(output["schema_version"], "3.0")
             self.assertEqual(
-                output["visual_review"]["mode"], "continuous_all_saved_samples"
+                output["visual_review"]["mode"], "neutral_complete_temporal_coverage"
             )
-            self.assertFalse(
+            self.assertTrue(
                 output["visual_review"]["second_stage_frame_subsampling"]
+            )
+            self.assertEqual(
+                output["visual_review"]["temporal_refinement_mode"],
+                "dense_refinement_not_completed_original_atoms_preserved",
             )
             self.assertIn("discovered_central_theme", output["full_review_synopsis"])
             self.assertEqual(
@@ -1764,8 +2423,10 @@ class AIDirectorTests(unittest.TestCase):
                 "strict_chronological",
             )
             self.assertEqual(output["clips"][0]["file_name"], str(source))
+            self.assertEqual(output["clips"][0]["transition_to_next"], "cut")
             self.assertEqual(
-                output["clips"][0]["transition_to_next"], "cross_dissolve"
+                output["clips"][0]["requested_transition_to_next"],
+                "cross_dissolve",
             )
             self.assertEqual(output["clips"][0]["audio_cleanup"], "strong")
             self.assertTrue(output["clips"][0]["has_dialogue"])
@@ -1798,7 +2459,13 @@ class AIDirectorTests(unittest.TestCase):
             for index in range(1, 31)
         ]
 
-        def fake_request(prompt, schema, images=(), model=None):
+        def fake_request(
+            prompt,
+            schema,
+            images=(),
+            model=None,
+            progress_activity="director_generation",
+        ):
             page = json.loads(prompt.split("CANDIDATE PAGE:\n", 1)[1])
             keep = schema["properties"]["recommendations"]["maxItems"]
             return {
@@ -1831,6 +2498,227 @@ class AIDirectorTests(unittest.TestCase):
         self.assertEqual(audit["input_candidate_count"], len(candidates))
         self.assertGreater(len(selected), 0)
         self.assertLess(len(selected), len(candidates))
+
+    def test_sixty_shot_picture_lock_uses_bounded_pages_without_losing_a_shot(self):
+        director = self.make_director(num_ctx=8192)
+        candidates = [
+            {
+                "candidate_id": f"C{index:04d}",
+                "in": float(index * 5),
+                "out": float(index * 5 + 4),
+                "visual_summary": f"Observed action {index}",
+                "story_role": "context",
+            }
+            for index in range(1, 61)
+        ]
+        ordered_ids = [item["candidate_id"] for item in candidates]
+        requests = []
+
+        def required_ids(prompt):
+            return json.loads(
+                prompt.split("REQUIRED IDS:\n", 1)[1].split("\n", 1)[0]
+            )
+
+        def page_number(prompt, marker):
+            return int(prompt.split(marker, 1)[1].split(".", 1)[0])
+
+        def fake_request(
+            prompt, schema, images=(), model=None,
+            progress_activity="director_generation",
+        ):
+            requests.append((prompt, schema))
+            if "PICTURE ORDER MANIFEST" in prompt:
+                return {
+                    "project_summary": "A complete sixty-shot film.",
+                    "viewer_takeaway": "A long observed process develops clearly.",
+                    "editorial_style": "narrative_documentary",
+                    "ordered_candidate_ids": ordered_ids,
+                }
+            if "PICTURE SKELETON PAGE" in prompt:
+                ids = required_ids(prompt)
+                page = page_number(prompt, "PICTURE SKELETON PAGE ")
+                return {
+                    "page_index": page,
+                    "shots": [
+                        {
+                            "candidate_id": candidate_id,
+                            "trim_in_sec": next(
+                                item["in"] for item in candidates
+                                if item["candidate_id"] == candidate_id
+                            ),
+                            "trim_out_sec": next(
+                                item["out"] for item in candidates
+                                if item["candidate_id"] == candidate_id
+                            ),
+                            "narrative_function": (
+                                "hook" if candidate_id == ordered_ids[0]
+                                else "closure" if candidate_id == ordered_ids[-1]
+                                else "context"
+                            ),
+                            "audio_intent": "natural_texture",
+                            "music_edit_role": "build",
+                        }
+                        for candidate_id in ids
+                    ],
+                }
+            if "PICTURE ENRICHMENT PAGE" in prompt:
+                ids = required_ids(prompt)
+                page = page_number(prompt, "PICTURE ENRICHMENT PAGE ")
+                return {
+                    "page_index": page,
+                    "shots": [
+                        {
+                            "candidate_id": candidate_id,
+                            "viewer_information": f"Information from {candidate_id}",
+                            "reason_for_position": f"Progression at {candidate_id}",
+                            "evidence_claim": f"Observed action in {candidate_id}",
+                            "connection_to_previous": "Visible chronological progression.",
+                            "transition_to_next": "cut",
+                            "transition_duration_sec": 0.0,
+                            "audio_cleanup": "none",
+                            "color_look": "neutral",
+                            "motion": "static",
+                            "volume_db": 0.0,
+                            "drx_preset": "none",
+                            "stabilization": "none",
+                            "tracking": "none",
+                            "smart_reframe": False,
+                        }
+                        for candidate_id in ids
+                    ],
+                }
+            if "PICTURE GRAPHICS PASS" in prompt:
+                return {"graphics_plan": {"strategy": "No graphics.", "items": []}}
+            raise AssertionError(prompt[:120])
+
+        director._request_json = fake_request
+        result = director._request_staged_picture_plan(
+            "Author one coherent observed film.",
+            candidates,
+            include_review=False,
+            progress_activity="picture_assembly",
+        )
+
+        self.assertEqual(
+            [item["candidate_id"] for item in result["sequence"]], ordered_ids
+        )
+        self.assertTrue(all(item.get("evidence_claim") for item in result["sequence"]))
+        audit = result["_staged_output_audit"]
+        self.assertEqual(audit["selected_shot_count"], 60)
+        self.assertEqual(audit["full_verbose_sequence_requests"], 0)
+        self.assertLessEqual(audit["max_verbose_shots_in_any_request"], 6)
+        self.assertEqual(audit["skeleton_pages"], 5)
+        self.assertEqual(audit["enrichment_pages"], 10)
+        # No output schema can ask for one complete sixty-shot verbose sequence.
+        # The only 60-item response is the compact ID manifest.
+        for _prompt, schema in requests:
+            properties = schema.get("properties", {})
+            self.assertNotIn("sequence", properties)
+            shots = properties.get("shots", {})
+            if shots:
+                self.assertLessEqual(shots["maxItems"], 12)
+
+    def test_dense_temporal_sampling_adapts_to_32k_and_8k_vision_context(self):
+        item = {
+            "candidate_id": "C0001",
+            "asset_id": "asset-1",
+            "cut_in_sec": 0.0,
+            "cut_out_sec": 8.0,
+            "visual_summary": "A continuous observed action develops.",
+            "subject_action": "The subject completes one gesture.",
+        }
+        director_32k = self.make_director(num_ctx=32768)
+        fps_32k, frames_32k = director_32k._dense_refinement_sampling_plan(
+            item, 0.0, 8.0
+        )
+        director_8k = self.make_director(num_ctx=8192)
+        fps_8k, frames_8k = director_8k._dense_refinement_sampling_plan(
+            item, 0.0, 8.0
+        )
+
+        self.assertGreaterEqual(frames_32k, 2)
+        self.assertLess(frames_32k, 28)
+        self.assertGreaterEqual(frames_8k, 2)
+        self.assertLess(frames_8k, frames_32k)
+        self.assertLessEqual(fps_8k, fps_32k)
+        self.assertLessEqual(fps_32k, 4.0)
+        oversized_times = [round(index * 8.0 / 27.0, 4) for index in range(28)]
+        oversized_prompt = director_32k._dense_refinement_prompt(
+            item, 0.0, 8.0, oversized_times
+        )
+        self.assertFalse(
+            director_32k._request_has_multimodal_capacity(
+                oversized_prompt,
+                ATOM_REFINEMENT_SCHEMA,
+                28,
+            )
+        )
+
+    def test_music_quality_gate_fails_closed_after_two_measured_mismatches(self):
+        director = self.make_director()
+        with tempfile.TemporaryDirectory() as temporary:
+            track = Path(temporary) / "flat.wav"
+            track.touch()
+            director._music_files = [track]
+            director._music_analysis = {
+                "tracks": [
+                    {
+                        "file_name": str(track),
+                        "duration_sec": 60.0,
+                        "energy_profile": {
+                            "trend": "flat", "build_score": 0.05,
+                            "contrast_db": 0.5,
+                        },
+                        "sections": [
+                            {"start_sec": 0.0, "end_sec": 30.0, "energy": "low"}
+                        ],
+                    }
+                ]
+            }
+            calls = []
+
+            def invalid_music(*args, **kwargs):
+                calls.append(1)
+                return {
+                    "music_plan": {
+                        "strategy": "A rising climax.",
+                        "silence_regions": [],
+                        "cues": [
+                            {
+                                "cue_id": "M1", "track_file": "flat.wav",
+                                "story_beat": "payoff", "timeline_in_sec": 0,
+                                "timeline_out_sec": 10, "track_in_sec": 0,
+                                "track_out_sec": 10, "reason": "A rising climax.",
+                                "target_lufs": -18, "fade_in_sec": 1,
+                                "fade_out_sec": 1, "crossfade_sec": 0,
+                                "duck_under_dialogue_db": -10, "sync_points": [],
+                            }
+                        ],
+                    }
+                }
+
+            director._request_json = invalid_music
+            with self.assertRaisesRegex(DirectorError, "quality-first"):
+                director._request_quality_gated_music_plan(
+                    "Choose measured music.",
+                    10.0,
+                    {"music_energy_arc": "rising into a climax"},
+                )
+            self.assertEqual(len(calls), 2)
+
+            director._request_json = lambda *args, **kwargs: {
+                "music_plan": {
+                    "strategy": "Intentional silence.",
+                    "silence_regions": [],
+                    "cues": [],
+                }
+            }
+            silent = director._request_quality_gated_music_plan(
+                "Music is optional.", 10.0,
+                {"music_energy_arc": "rising into a climax"},
+            )
+            self.assertEqual(silent["cues"], [])
+            self.assertEqual(silent["mode"], "none")
 
     def test_real_video_duration_clamps_transcript_and_candidate_tail(self):
         director = self.make_director()
@@ -1967,7 +2855,7 @@ class AIDirectorTests(unittest.TestCase):
         self.assertEqual(plan["items"][0]["timeline_in_sec"], 4.0)
         self.assertEqual(plan["items"][0]["timeline_out_sec"], 6.0)
 
-    def test_first_music_cue_extends_to_program_start_without_moving_later_beats(self):
+    def test_director_authored_silent_opening_is_not_overridden(self):
         director = self.make_director()
         with tempfile.TemporaryDirectory() as temporary:
             track = Path(temporary) / "score.wav"
@@ -2000,8 +2888,8 @@ class AIDirectorTests(unittest.TestCase):
             )
 
         cue = plan["cues"][0]
-        self.assertEqual(cue["timeline_in_sec"], 0.0)
-        self.assertEqual(cue["track_in_sec"], 55.0)
+        self.assertEqual(cue["timeline_in_sec"], 24.0)
+        self.assertEqual(cue["track_in_sec"], 79.0)
         self.assertEqual(cue["timeline_out_sec"], 70.0)
 
 

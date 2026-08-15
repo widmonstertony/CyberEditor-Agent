@@ -11,6 +11,7 @@ duration must remain aligned and sampled visual similarity must stay high.
 from __future__ import annotations
 
 import argparse
+from array import array
 from datetime import datetime, timezone
 import json
 import logging
@@ -19,7 +20,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 
 LOGGER_NAME = "cybereditor.final_output_qa"
@@ -110,17 +111,17 @@ class FinalOutputQA:
 
     def _sampled_ssim(self, approved: Path, final: Path) -> float:
         """
-        Compare one frame per second after a small common scale.
-        统一缩放后每秒抽一帧计算 SSIM。
+        Compare one grayscale structural frame per second after a common scale.
+        统一缩放后每秒抽一帧，以灰度结构计算 SSIM。
 
         Parameters / 参数:
             approved/final: Approved master and Resolve export. / 审核母版与 Resolve 导出。
         """
         graph = (
             "[0:v]fps=1,scale=480:270:force_original_aspect_ratio=decrease,"
-            "pad=480:270:(ow-iw)/2:(oh-ih)/2[v0];"
+            "pad=480:270:(ow-iw)/2:(oh-ih)/2,format=gray[v0];"
             "[1:v]fps=1,scale=480:270:force_original_aspect_ratio=decrease,"
-            "pad=480:270:(ow-iw)/2:(oh-ih)/2[v1];[v0][v1]ssim"
+            "pad=480:270:(ow-iw)/2:(oh-ih)/2,format=gray[v1];[v0][v1]ssim"
         )
         completed = subprocess.run(
             [
@@ -141,6 +142,190 @@ class FinalOutputQA:
                 + "\n".join(completed.stderr.splitlines()[-8:])
             )
         return float(matches[-1])
+
+    def _scene_change_signature(self, path: Path) -> List[float]:
+        """
+        Extract hard visual-change timestamps without trusting color appearance.
+        提取硬画面变化时间，不把近似调色外观当作像素真值。
+
+        Parameters / 参数:
+            path: Media file to inspect. / 要检查的媒体文件。
+        """
+        completed = subprocess.run(
+            [
+                str(self.ffmpeg), "-hide_banner", "-nostats", "-i", str(path),
+                "-vf", "select='gt(scene,0.16)',showinfo", "-an", "-f", "null", "-",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise FinalOutputQAError(
+                "Could not extract scene-change signature from "
+                f"{path}: " + "\n".join(completed.stderr.splitlines()[-8:])
+            )
+        return [
+            float(value)
+            for value in re.findall(r"pts_time:([0-9]+(?:\.[0-9]+)?)", completed.stderr)
+        ]
+
+    @staticmethod
+    def _compare_scene_signatures(
+        approved: Sequence[float],
+        final: Sequence[float],
+        *,
+        tolerance_sec: float = 0.35,
+    ) -> Dict[str, float]:
+        """
+        Score one-to-one scene-boundary agreement with temporal tolerance.
+        在时间容差内按一对一方式计算场景边界一致率。
+        """
+        left = sorted(float(value) for value in approved)
+        right = sorted(float(value) for value in final)
+        if not left and not right:
+            return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
+        used = set()
+        matches = 0
+        for boundary in left:
+            choices = [
+                (abs(boundary - candidate), index)
+                for index, candidate in enumerate(right)
+                if index not in used and abs(boundary - candidate) <= tolerance_sec
+            ]
+            if not choices:
+                continue
+            _distance, best_index = min(choices)
+            used.add(best_index)
+            matches += 1
+        precision = matches / len(right) if right else 0.0
+        recall = matches / len(left) if left else 0.0
+        f1 = (
+            2.0 * precision * recall / (precision + recall)
+            if precision + recall > 0
+            else 0.0
+        )
+        return {"precision": precision, "recall": recall, "f1": f1}
+
+    def _audio_energy_fingerprint(
+        self,
+        path: Path,
+        *,
+        sample_rate: int = 2000,
+        window_sec: float = 0.25,
+    ) -> Dict[str, Any]:
+        """
+        Decode mono PCM and build a time-local loudness fingerprint.
+        解码单声道 PCM，并建立按时间定位的响度指纹。
+
+        The fingerprint deliberately measures the complete program rather than
+        trusting stream duration alone.  A silent track, a displaced music bed,
+        or unrelated audio can have the correct duration while still being the
+        wrong film.
+
+        Parameters / 参数:
+            path: Media file to inspect. / 要检查的媒体文件。
+            sample_rate: Low analysis sample rate. / 分析用低采样率。
+            window_sec: RMS window duration. / RMS 窗口时长。
+        """
+        completed = subprocess.run(
+            [
+                str(self.ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(sample_rate),
+                "-f",
+                "s16le",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0 or not completed.stdout:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise FinalOutputQAError(
+                f"Could not decode the first audio stream from {path}: {detail}"
+            )
+        pcm = array("h")
+        usable_bytes = len(completed.stdout) - (len(completed.stdout) % 2)
+        pcm.frombytes(completed.stdout[:usable_bytes])
+        if not pcm:
+            raise FinalOutputQAError(f"Decoded audio is empty: {path}")
+
+        window_samples = max(1, int(round(sample_rate * window_sec)))
+        envelope_db: List[float] = []
+        active_windows = 0
+        square_sum = 0.0
+        sample_count = 0
+        for offset in range(0, len(pcm), window_samples):
+            block = pcm[offset : offset + window_samples]
+            if not block:
+                continue
+            block_square = sum(float(value) * float(value) for value in block)
+            square_sum += block_square
+            sample_count += len(block)
+            rms = math.sqrt(block_square / len(block)) / 32768.0
+            dbfs = 20.0 * math.log10(max(rms, 1e-8))
+            dbfs = max(-100.0, min(0.0, dbfs))
+            envelope_db.append(dbfs)
+            if dbfs > -55.0:
+                active_windows += 1
+        if not envelope_db or sample_count <= 0:
+            raise FinalOutputQAError(f"No analyzable audio samples in {path}")
+        overall_rms = math.sqrt(square_sum / sample_count) / 32768.0
+        return {
+            "window_sec": window_sec,
+            "sample_rate": sample_rate,
+            "envelope_db": envelope_db,
+            "overall_dbfs": 20.0 * math.log10(max(overall_rms, 1e-8)),
+            "active_fraction": active_windows / len(envelope_db),
+        }
+
+    @staticmethod
+    def _compare_audio_fingerprints(
+        approved: Dict[str, Any], final: Dict[str, Any]
+    ) -> Dict[str, float]:
+        """
+        Compare aligned loudness envelopes with bounded length tolerance.
+        在有限长度容差内比较对齐的响度包络。
+
+        Parameters / 参数:
+            approved/final: Results from ``_audio_energy_fingerprint``.
+                ``_audio_energy_fingerprint`` 生成的结果。
+        """
+        left = [float(value) for value in approved.get("envelope_db", [])]
+        right = [float(value) for value in final.get("envelope_db", [])]
+        count = min(len(left), len(right))
+        if count < 4:
+            return {"envelope_similarity": 0.0, "mean_abs_db_error": 100.0}
+        left = left[:count]
+        right = right[:count]
+        # Convert dB into a bounded 0..1 loudness feature.  This keeps silent
+        # regions meaningful without allowing one loud transient to dominate.
+        left_feature = [(max(-80.0, value) + 80.0) / 80.0 for value in left]
+        right_feature = [(max(-80.0, value) + 80.0) / 80.0 for value in right]
+        dot = sum(a * b for a, b in zip(left_feature, right_feature))
+        left_norm = math.sqrt(sum(value * value for value in left_feature))
+        right_norm = math.sqrt(sum(value * value for value in right_feature))
+        cosine = dot / max(1e-12, left_norm * right_norm)
+        mean_abs_error = sum(abs(a - b) for a, b in zip(left, right)) / count
+        return {
+            "envelope_similarity": max(0.0, min(1.0, cosine)),
+            "mean_abs_db_error": mean_abs_error,
+        }
 
     def run(self, final_path: Path, approved_path: Path, output_path: Path) -> Dict[str, Any]:
         """
@@ -179,17 +364,94 @@ class FinalOutputQA:
                 f"audio={audio_duration:.3f}s."
             )
         ssim = self._sampled_ssim(approved, final)
-        if not math.isfinite(ssim) or ssim < 0.88:
+        # The Resolve source timeline legitimately applies RCM, the director's
+        # creative grade, DRX, stabilization, and tracking that the low-resolution
+        # FFmpeg review can only approximate.  A grayscale structural threshold is
+        # therefore intentionally tolerant; edit-boundary agreement below remains
+        # the hard sequencing gate.
+        if not math.isfinite(ssim) or ssim < 0.55:
             failures.append(
-                f"Resolve picture diverged from approved master (sampled SSIM={ssim:.4f})."
+                f"Resolve picture structure diverged from the approved film "
+                f"(grayscale sampled SSIM={ssim:.4f})."
+            )
+        approved_scenes = self._scene_change_signature(approved)
+        final_scenes = self._scene_change_signature(final)
+        scene_comparison = self._compare_scene_signatures(
+            approved_scenes, final_scenes
+        )
+        if (
+            max(len(approved_scenes), len(final_scenes)) >= 2
+            and float(scene_comparison["f1"]) < 0.65
+        ):
+            failures.append(
+                "Resolve edit boundaries diverged from the approved film "
+                f"(scene-boundary F1={scene_comparison['f1']:.4f})."
+            )
+        approved_audio = self._audio_energy_fingerprint(approved)
+        final_audio = self._audio_energy_fingerprint(final)
+        audio_comparison = self._compare_audio_fingerprints(
+            approved_audio, final_audio
+        )
+        if float(approved_audio["active_fraction"]) >= 0.02:
+            if float(final_audio["active_fraction"]) < 0.02 or float(
+                final_audio["overall_dbfs"]
+            ) < -60.0:
+                failures.append(
+                    "Final export audio is effectively silent although the approved film is audible."
+                )
+        if (
+            float(audio_comparison["envelope_similarity"]) < 0.94
+            or float(audio_comparison["mean_abs_db_error"]) > 6.0
+        ):
+            failures.append(
+                "Resolve audio diverged from the approved program "
+                f"(envelope similarity={audio_comparison['envelope_similarity']:.4f}, "
+                f"mean error={audio_comparison['mean_abs_db_error']:.2f} dB)."
             )
         report = {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "approved_master": approved_probe,
             "final_export": final_probe,
             "duration_tolerance_sec": round(tolerance, 4),
             "sampled_ssim": round(ssim, 6),
+            "picture_structure_qa": {
+                "approved_scene_boundaries_sec": [
+                    round(value, 4) for value in approved_scenes
+                ],
+                "final_scene_boundaries_sec": [
+                    round(value, 4) for value in final_scenes
+                ],
+                "scene_boundary_precision": round(
+                    float(scene_comparison["precision"]), 6
+                ),
+                "scene_boundary_recall": round(
+                    float(scene_comparison["recall"]), 6
+                ),
+                "scene_boundary_f1": round(
+                    float(scene_comparison["f1"]), 6
+                ),
+            },
+            "audio_qa": {
+                "approved_overall_dbfs": round(
+                    float(approved_audio["overall_dbfs"]), 3
+                ),
+                "final_overall_dbfs": round(
+                    float(final_audio["overall_dbfs"]), 3
+                ),
+                "approved_active_fraction": round(
+                    float(approved_audio["active_fraction"]), 6
+                ),
+                "final_active_fraction": round(
+                    float(final_audio["active_fraction"]), 6
+                ),
+                "envelope_similarity": round(
+                    float(audio_comparison["envelope_similarity"]), 6
+                ),
+                "mean_abs_db_error": round(
+                    float(audio_comparison["mean_abs_db_error"]), 3
+                ),
+            },
             "failures": failures,
             "passes": not failures,
         }
@@ -202,9 +464,10 @@ class FinalOutputQA:
                 "Final Resolve export failed QA: " + "; ".join(failures)
             )
         self.logger.info(
-            "Final Resolve export matches approved master: duration %.3fs, SSIM %.4f",
+            "Final Resolve export matches approved master: duration %.3fs, SSIM %.4f, audio %.4f",
             actual,
             ssim,
+            float(audio_comparison["envelope_similarity"]),
         )
         return report
 
@@ -236,4 +499,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

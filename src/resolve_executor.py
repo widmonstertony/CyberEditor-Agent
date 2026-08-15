@@ -12,6 +12,7 @@ module are used in this stage.
 
 import argparse
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
+import hashlib
 import importlib
 import json
 import logging
@@ -24,13 +25,20 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 try:
     from .runtime_services import find_resolve_executable, get_resolve_registration
+    from .frame_edl import (
+        FrameEDLError,
+        map_original_time_to_record_frame,
+        validate_frame_edl,
+    )
 except ImportError:  # pragma: no cover - direct ``python src/...`` fallback.
     from runtime_services import find_resolve_executable, get_resolve_registration
+    from frame_edl import FrameEDLError, map_original_time_to_record_frame, validate_frame_edl
 
 
 LOGGER_NAME = "cybereditor.resolve"
@@ -193,6 +201,8 @@ class DaVinciExecutor:
         self.music_plan: Dict[str, Any] = {}
         self.audio_program: Dict[str, Any] = {}
         self.graphics_plan: Dict[str, Any] = {}
+        self.frame_edl: Dict[str, Any] = {}
+        self.picture_record_start: Optional[int] = None
 
     def run(self) -> Sequence[Any]:
         """
@@ -219,13 +229,20 @@ class DaVinciExecutor:
         self.compare_fps(json_fps, active_fps)
         prepared = self.prepare_clips(clips, active_fps)
         appended = self.append_clips(prepared)
-        self.append_graphics_titles(active_fps)
+        self.append_graphics_clips(active_fps, appended)
         self.append_program_audio(active_fps, prepared)
         self.append_music_bed(active_fps, prepared)
         self.apply_timeline_audio_preset()
         self.run_macro_fallback()
         if self.approved_preview is not None:
-            self.create_reviewed_delivery_timeline(self.approved_preview)
+            # The review render is evidence that the plan passed automated
+            # critique, never the Resolve delivery source. Rendering the CRF-18
+            # preview again discarded camera originals, DRX, and native finishing.
+            # 审片文件只作为审核凭据，绝不替代 Resolve 原素材时间线进行最终渲染。
+            self.logger.info(
+                "Approved preview retained as review evidence; final Resolve render stays "
+                "on the source-media timeline."
+            )
         self.save_project()
         if self.render_enabled:
             self.render_final()
@@ -389,6 +406,12 @@ class DaVinciExecutor:
             len(decisions),
             len(decisions),
         )
+        try:
+            self.frame_edl = validate_frame_edl(payload)
+        except FrameEDLError as exc:
+            raise ResolveExecutorError(
+                f"Resolve 需要统一帧时间表 / Resolve requires frame_edl: {exc}"
+            ) from exc
         return fps, decisions
 
     def connect(self) -> Any:
@@ -891,10 +914,25 @@ class DaVinciExecutor:
         """
         index = self._index_media_pool()
         prepared: List[Tuple[ClipDecision, Dict[str, Any]]] = []
-        for decision in clips:
+        schedule_entries = self.frame_edl.get("clips")
+        if not isinstance(schedule_entries, list) or len(schedule_entries) != len(clips):
+            raise ResolveExecutorError(
+                "frame_edl 与 Resolve 决策数量不匹配 / Frame EDL does not match Resolve decisions."
+            )
+        for decision, frame_entry in zip(clips, schedule_entries):
             item, index = self._resolve_media(decision, index)
             self._configure_media_input_transform(item, decision)
             source_fps = self._media_fps(item) or fps
+            scheduled_source_fps = self._positive_decimal(
+                frame_entry.get("source_fps"),
+                f"frame_edl[{decision.clip_id!r}].source_fps",
+            )
+            if abs(source_fps - scheduled_source_fps) > Decimal("0.01"):
+                raise ResolveExecutorError(
+                    f"clip_id={decision.clip_id!r} 的 Resolve 素材 FPS={source_fps}，"
+                    f"但统一帧时间表为 {scheduled_source_fps}；代理/源素材可能错配。"
+                    " / Resolve media FPS differs from frame_edl; source/proxy may be mismatched."
+                )
             _, media_path_text = self._media_identity(item)
             if media_path_text:
                 media_path = Path(media_path_text).expanduser()
@@ -909,9 +947,19 @@ class DaVinciExecutor:
                             f"超过真实素材时长 {source_duration:.3f}s；已在修改时间线前停止。"
                             " / Cut out exceeds the real media EOF; stopped before assembly."
                         )
-            start_frame, end_frame = self.seconds_to_frames(
-                decision.cut_in_sec, decision.cut_out_sec, source_fps
-            )
+            try:
+                start_frame = int(frame_entry["source_frame_in"])
+                end_exclusive = int(frame_entry["source_frame_out_exclusive"])
+                expected_record_frames = int(frame_entry["record_frame_count"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ResolveExecutorError(
+                    f"clip_id={decision.clip_id!r} 的 frame_edl 帧字段无效 / Invalid frame EDL fields."
+                ) from exc
+            end_frame = end_exclusive - 1
+            if start_frame < 0 or end_frame < start_frame or expected_record_frames <= 0:
+                raise ResolveExecutorError(
+                    f"clip_id={decision.clip_id!r} 的 frame_edl 范围无效 / Invalid frame EDL range."
+                )
             clip_info: Dict[str, Any] = {
                 "mediaPoolItem": item,
                 "startFrame": start_frame,
@@ -1126,7 +1174,27 @@ class DaVinciExecutor:
         """
         result_items: List[Any] = []
         completed = 0
-        for decision, clip_info in prepared:
+        schedule_entries = self.frame_edl.get("clips")
+        if not isinstance(schedule_entries, list) or len(schedule_entries) != len(prepared):
+            raise ResolveExecutorError(
+                "追加前 frame_edl 数量不匹配 / Frame EDL count mismatch before append."
+            )
+        picture_record_start: Optional[int] = None
+
+        def item_integer(item: Any, method_name: str) -> int:
+            """Read an integer Resolve frame with old-version fallback. / 读取 Resolve 整数帧。"""
+            getter = getattr(item, method_name, None)
+            if not callable(getter):
+                raise ResolveExecutorError(
+                    f"Resolve TimelineItem 缺少 {method_name}；无法验证统一帧时间表。"
+                    " / Timeline timing API is unavailable."
+                )
+            try:
+                return int(getter(False))
+            except TypeError:
+                return int(getter())
+
+        for (decision, clip_info), frame_entry in zip(prepared, schedule_entries):
             try:
                 result = self.media_pool.AppendToTimeline([clip_info])
             except Exception as exc:
@@ -1144,6 +1212,30 @@ class DaVinciExecutor:
                         "AppendToTimeline returned no timeline item",
                     )
                 )
+            if len(items) != 1:
+                raise ResolveExecutorError(
+                    self._append_error(
+                        decision,
+                        completed,
+                        f"expected one video TimelineItem, got {len(items)}",
+                    )
+                )
+            actual_start = item_integer(items[0], "GetStart")
+            actual_duration = item_integer(items[0], "GetDuration")
+            expected_duration = int(frame_entry["record_frame_count"])
+            if picture_record_start is None:
+                picture_record_start = actual_start - int(frame_entry["record_frame_in"])
+            expected_start = picture_record_start + int(frame_entry["record_frame_in"])
+            if actual_start != expected_start or actual_duration != expected_duration:
+                raise ResolveExecutorError(
+                    self._append_error(
+                        decision,
+                        completed,
+                        "Resolve record frames diverged from frame_edl: "
+                        f"expected start/duration={expected_start}/{expected_duration}, "
+                        f"actual={actual_start}/{actual_duration}",
+                    )
+                )
             result_items.extend(items)
             for timeline_item in items:
                 self.apply_clip_effects(timeline_item, decision)
@@ -1157,6 +1249,7 @@ class DaVinciExecutor:
                 len(prepared),
                 decision.clip_id,
             )
+        self.picture_record_start = picture_record_start
         return result_items
 
     @staticmethod
@@ -1201,15 +1294,664 @@ class DaVinciExecutor:
             f"{separator}{out_frames:02d}"
         )
 
+    def append_graphics_clips(
+        self,
+        fps: Decimal,
+        timeline_items: Sequence[Any],
+    ) -> Sequence[Any]:
+        """
+        Render each directed graphic as a short alpha clip and place it on V2.
+        将每个导演字卡渲染为短透明片段，并精确放置到 V2。
+
+        Parameters / 参数:
+            fps: Active Resolve timeline frame rate. / 当前 Resolve 时间线帧率。
+            timeline_items: Actual V1 items returned by Resolve. / Resolve 实际返回的 V1 条目。
+
+        Short clips avoid a multi-gigabyte full-program 4K ProRes 4444 layer.
+        Every clip is frame-counted, alpha-probed, content-addressed, imported,
+        and then verified with Resolve 21's documented TimelineItem APIs.
+
+        短片段避免生成数十 GB 的全片 4K ProRes 4444；每段都会校验帧数、
+        alpha、内容哈希、媒体池属性，以及 Resolve 21 官方时间线 API 的轨道与位置。
+        """
+        raw_items = self.graphics_plan.get("items")
+        graphics = (
+            [dict(item) for item in raw_items if isinstance(item, dict)]
+            if isinstance(raw_items, list)
+            else []
+        )
+        if not graphics:
+            return []
+        picture_items = list(timeline_items)
+        if not picture_items:
+            raise ResolveExecutorError(
+                "字卡需要 Resolve 返回真实 V1 条目 / Graphics require real V1 timeline items."
+            )
+
+        def item_integer(item: Any, method_name: str) -> int:
+            getter = getattr(item, method_name, None)
+            if not callable(getter):
+                raise ResolveExecutorError(
+                    f"Resolve TimelineItem 缺少 {method_name}；无法验证字卡同步 / "
+                    "TimelineItem timing API is unavailable."
+                )
+            try:
+                return int(getter(False))
+            except TypeError:
+                try:
+                    return int(getter())
+                except Exception as exc:
+                    raise ResolveExecutorError(
+                        f"无法读取 TimelineItem.{method_name} / Could not read timeline timing: {exc}"
+                    ) from exc
+            except Exception as exc:
+                raise ResolveExecutorError(
+                    f"无法读取 TimelineItem.{method_name} / Could not read timeline timing: {exc}"
+                ) from exc
+
+        picture_starts = [item_integer(item, "GetStart") for item in picture_items]
+        picture_ends = [item_integer(item, "GetEnd") for item in picture_items]
+        picture_start = min(picture_starts)
+        picture_end = max(picture_ends)
+        program_frames = picture_end - picture_start
+        if program_frames <= 0:
+            raise ResolveExecutorError(
+                "Resolve V1 时间范围无效 / Resolve returned an invalid V1 record span."
+            )
+
+        def setting(name: str, default: int) -> int:
+            for owner in (self.timeline, self.project):
+                getter = getattr(owner, "GetSetting", None)
+                if not callable(getter):
+                    continue
+                try:
+                    value = int(float(getter(name) or 0))
+                except (TypeError, ValueError):
+                    value = 0
+                if value > 0:
+                    return value
+            return default
+
+        width = setting("timelineResolutionWidth", 1920)
+        height = setting("timelineResolutionHeight", 1080)
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        if not ffmpeg or not ffprobe:
+            raise ResolveExecutorError(
+                "生成安全 V2 字卡需要 FFmpeg/ffprobe / "
+                "FFmpeg and ffprobe are required for verified V2 graphics."
+            )
+        try:
+            from .review_renderer import ReviewRenderer
+        except ImportError:  # pragma: no cover - direct script fallback.
+            from review_renderer import ReviewRenderer
+
+        try:
+            video_tracks = int(self.timeline.GetTrackCount("video") or 0)
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"无法读取视频轨数量 / Could not read video-track count: {exc}"
+            ) from exc
+        add_track = getattr(self.timeline, "AddTrack", None)
+        while video_tracks < 2 and callable(add_track):
+            try:
+                added = add_track("video")
+            except Exception as exc:
+                raise ResolveExecutorError(
+                    f"无法创建 V2 字卡轨 / Could not create V2 graphics track: {exc}"
+                ) from exc
+            if added is False:
+                break
+            video_tracks += 1
+        if video_tracks < 2:
+            raise ResolveExecutorError(
+                "Resolve 无法创建 V2 字卡轨 / Resolve could not create a V2 graphics track."
+            )
+
+        overlay_dir = self.json_path.parent / "resolve_graphics"
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        helper = ReviewRenderer(
+            self.json_path,
+            overlay_dir / "placeholder.mov",
+            width=width,
+            height=height,
+            logger=self.logger,
+        )
+        creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        appended_all: List[Any] = []
+        for graphic_index, graphic in enumerate(graphics, start=1):
+            try:
+                start_sec = max(0.0, float(graphic.get("timeline_in_sec", 0) or 0))
+                end_sec = max(
+                    start_sec + 0.2,
+                    float(graphic.get("timeline_out_sec", start_sec + 2.5) or 0),
+                )
+            except (TypeError, ValueError):
+                raise ResolveExecutorError(
+                    f"字卡 {graphic_index} 时间码无效 / Graphic timing is invalid."
+                )
+            start_offset = map_original_time_to_record_frame(
+                self.frame_edl, start_sec, rounding="floor"
+            )
+            end_offset = map_original_time_to_record_frame(
+                self.frame_edl, end_sec, rounding="ceil"
+            )
+            start_offset = min(program_frames - 1, max(0, start_offset))
+            end_offset = min(program_frames, max(start_offset + 1, end_offset))
+            frame_count = end_offset - start_offset
+            local_duration = Decimal(frame_count) / fps
+            local_graphic = dict(graphic)
+            local_graphic["timeline_in_sec"] = 0.0
+            local_graphic["timeline_out_sec"] = float(local_duration)
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "graphic": local_graphic,
+                        "fps": self._decimal_text(fps),
+                        "width": width,
+                        "height": height,
+                        "frames": frame_count,
+                        "renderer_contract": "short-alpha-v2-2026-08-15.1",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            overlay_path = overlay_dir / f"CyberEditor_Graphic_{fingerprint}.mov"
+            graph = helper._graphics_filter(
+                local_graphic,
+                "base",
+                "graphic",
+                transparent_canvas=True,
+            )
+            if not graph:
+                continue
+            script_path: Optional[Path] = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    suffix=".fffilter",
+                    prefix="resolve_graphic_",
+                    dir=str(overlay_dir),
+                    delete=False,
+                ) as handle:
+                    handle.write("[0:v]format=yuva444p10le[base];\n" + graph)
+                    script_path = Path(handle.name)
+                completed = subprocess.run(
+                    [
+                        ffmpeg,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        (
+                            f"color=c=black@0.0:s={width}x{height}:"
+                            f"r={self._decimal_text(fps)}:d={self._decimal_text(local_duration)},"
+                            "format=rgba"
+                        ),
+                        "-filter_complex_script",
+                        str(script_path),
+                        "-map",
+                        "[graphic]",
+                        "-frames:v",
+                        str(frame_count),
+                        "-an",
+                        "-c:v",
+                        "prores_ks",
+                        "-profile:v",
+                        "4",
+                        "-pix_fmt",
+                        "yuva444p10le",
+                        "-color_primaries",
+                        "bt709",
+                        "-color_trc",
+                        "bt709",
+                        "-colorspace",
+                        "bt709",
+                        str(overlay_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    creationflags=creation_flags,
+                )
+            except OSError as exc:
+                raise ResolveExecutorError(
+                    f"生成透明字卡失败 / Could not render alpha graphic: {exc}"
+                ) from exc
+            finally:
+                if script_path is not None:
+                    try:
+                        script_path.unlink()
+                    except OSError:
+                        pass
+            if (
+                completed.returncode != 0
+                or not overlay_path.is_file()
+                or overlay_path.stat().st_size <= 0
+            ):
+                raise ResolveExecutorError(
+                    "FFmpeg 未生成透明字卡："
+                    f"{completed.stderr[-1200:]} / Alpha-graphic render failed."
+                )
+
+            probe = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height,avg_frame_rate,nb_frames,pix_fmt",
+                    "-of", "json", str(overlay_path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                creationflags=creation_flags,
+            )
+            try:
+                stream = json.loads(probe.stdout)["streams"][0]
+                probed_frames = int(stream["nb_frames"])
+            except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ResolveExecutorError(
+                    f"无法验证透明字卡媒体 / Could not verify alpha graphic: {exc}"
+                ) from exc
+            if (
+                probe.returncode != 0
+                or int(stream.get("width", 0) or 0) != width
+                or int(stream.get("height", 0) or 0) != height
+                or probed_frames != frame_count
+                or "yuva" not in str(stream.get("pix_fmt") or "").casefold()
+            ):
+                raise ResolveExecutorError(
+                    "透明字卡的分辨率、帧数或 alpha 像素格式不匹配 / "
+                    "Alpha graphic dimensions, frame count, or pixel format do not match."
+                )
+            alpha_probe = subprocess.run(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "info",
+                    "-ss", self._decimal_text(local_duration / Decimal("2")),
+                    "-i", str(overlay_path),
+                    "-vf", "alphaextract,signalstats,metadata=print",
+                    "-frames:v", "1", "-f", "null", "-",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                creationflags=creation_flags,
+            )
+            alpha_values = re.findall(
+                r"lavfi\.signalstats\.YAVG=([0-9.]+)", alpha_probe.stderr
+            )
+            if (
+                alpha_probe.returncode != 0
+                or not alpha_values
+                or max(float(value) for value in alpha_values) <= 0.05
+            ):
+                raise ResolveExecutorError(
+                    "透明字卡没有可见 alpha 内容 / Alpha graphic contains no visible pixels."
+                )
+
+            imported = self._import_media(overlay_path)
+            media_item = imported[0] if len(imported) == 1 else None
+            if media_item is None:
+                matches = self._items_for_path(overlay_path)
+                if len(matches) != 1:
+                    raise ResolveExecutorError(
+                        "无法唯一定位透明字卡 / Could not uniquely resolve alpha graphic."
+                    )
+                media_item = matches[0]
+            setter = getattr(media_item, "SetClipProperty", None)
+            getter = getattr(media_item, "GetClipProperty", None)
+            if not callable(setter) or not callable(getter):
+                raise ResolveExecutorError(
+                    "Resolve 不支持验证字卡 alpha/色彩属性 / "
+                    "Resolve cannot verify graphic alpha/color properties."
+                )
+            try:
+                alpha_set = setter("Alpha Mode", "Straight")
+                color_set = setter("Input Color Space", "Rec.709/Gamma 2.4")
+                alpha_value = str(getter("Alpha Mode") or "")
+                color_value = str(getter("Input Color Space") or "")
+            except Exception as exc:
+                raise ResolveExecutorError(
+                    f"设置字卡 alpha/色彩失败 / Could not set graphic alpha/color: {exc}"
+                ) from exc
+            normalized_alpha = re.sub(r"[^a-z]", "", alpha_value.casefold())
+            normalized_color = re.sub(r"[^a-z0-9]", "", color_value.casefold())
+            if (
+                alpha_set is False
+                or color_set is False
+                or "straight" not in normalized_alpha
+                or "rec709" not in normalized_color
+            ):
+                raise ResolveExecutorError(
+                    "Resolve 未确认字卡 Straight Alpha 与 Rec.709 输入标签 / "
+                    "Resolve did not confirm Straight Alpha and Rec.709 graphics input."
+                )
+
+            record_frame = picture_start + start_offset
+            result = self.media_pool.AppendToTimeline(
+                [
+                    {
+                        "mediaPoolItem": media_item,
+                        "startFrame": 0,
+                        "endFrame": frame_count - 1,
+                        "mediaType": 1,
+                        "trackIndex": 2,
+                        "recordFrame": record_frame,
+                    }
+                ]
+            )
+            appended = self._coerce_items(result)
+            if not appended:
+                raise ResolveExecutorError(
+                    "Resolve 未能把透明字卡放到 V2 / Resolve did not append the V2 graphic."
+                )
+            for timeline_item in appended:
+                track_getter = getattr(timeline_item, "GetTrackTypeAndIndex", None)
+                if not callable(track_getter):
+                    raise ResolveExecutorError(
+                        "Resolve 无法验证 V2 字卡轨道 / Cannot verify the V2 graphic track."
+                    )
+                try:
+                    track_info = list(track_getter() or [])
+                except Exception as exc:
+                    raise ResolveExecutorError(
+                        f"无法验证 V2 字卡轨道 / Could not verify graphic track: {exc}"
+                    ) from exc
+                if len(track_info) < 2 or str(track_info[0]).casefold() != "video" or int(track_info[1]) != 2:
+                    raise ResolveExecutorError(
+                        f"字卡不在 V2：{track_info!r} / Graphic was not placed on V2."
+                    )
+                actual_start = item_integer(timeline_item, "GetStart")
+                actual_duration = item_integer(timeline_item, "GetDuration")
+                if actual_start != record_frame or actual_duration != frame_count:
+                    raise ResolveExecutorError(
+                        "V2 字卡位置或时长错位："
+                        f"expected={record_frame}/{frame_count}, actual={actual_start}/{actual_duration} / "
+                        "Graphic placement verification failed."
+                    )
+            appended_all.extend(appended)
+
+        if appended_all:
+            try:
+                self.timeline.SetTrackName("video", 2, "AI Graphics / AI 字卡")
+            except Exception:
+                pass
+            self.logger.info(
+                "已验证并放置 %d 个短透明字卡到 V2 / "
+                "Verified and placed %d short alpha graphics on V2",
+                len(appended_all),
+                len(appended_all),
+            )
+        return appended_all
+
+    def append_graphics_overlay(
+        self,
+        fps: Decimal,
+        prepared: Sequence[Tuple[ClipDecision, Dict[str, Any]]],
+    ) -> Sequence[Any]:
+        """
+        Render one transparent ProRes graphics layer and place it safely on V2.
+        渲染一条透明 ProRes 字卡层，并安全放置到 V2。
+
+        Parameters / 参数:
+            fps: Active Resolve timeline frame rate. / 当前 Resolve 时间线帧率。
+            prepared: Frame-quantized picture decisions. / 已按帧量化的画面决策。
+
+        Returns / 返回:
+            Appended V2 overlay timeline items, or an empty list when no graphics
+            were directed. / 已追加的 V2 覆盖层；无字卡计划时为空。
+
+        Resolve 21 cannot target V2 with ``InsertFusionTitleIntoTimeline`` and may
+        ripple V1 without A1. A full-duration alpha movie uses the documented
+        ``trackIndex``/``recordFrame`` path and never changes program duration.
+        """
+        raise ResolveExecutorError(
+            "append_graphics_overlay 已弃用：全片 alpha 文件会产生错误混合 FPS 时长和巨大 4K "
+            "中间件；请使用 append_graphics_clips。 / append_graphics_overlay is deprecated; "
+            "use verified short alpha clips instead."
+        )
+        raw_items = self.graphics_plan.get("items")
+        items = [item for item in raw_items if isinstance(item, dict)] \
+            if isinstance(raw_items, list) else []
+        if not items:
+            return []
+        if not prepared:
+            raise ResolveExecutorError(
+                "字卡覆盖层缺少已量化画面长度 / Graphics overlay lacks picture duration."
+            )
+        total_frames = sum(
+            max(
+                0,
+                int(info.get("endFrame", -1)) - int(info.get("startFrame", 0)) + 1,
+            )
+            for _decision, info in prepared
+        )
+        if total_frames <= 0:
+            raise ResolveExecutorError(
+                "无法计算字卡覆盖层时长 / Cannot calculate graphics-overlay duration."
+            )
+
+        def setting(name: str, default: int) -> int:
+            for owner in (self.timeline, self.project):
+                getter = getattr(owner, "GetSetting", None)
+                if not callable(getter):
+                    continue
+                try:
+                    value = int(float(getter(name) or 0))
+                except (TypeError, ValueError):
+                    value = 0
+                if value > 0:
+                    return value
+            return default
+
+        width = setting("timelineResolutionWidth", 1920)
+        height = setting("timelineResolutionHeight", 1080)
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise ResolveExecutorError(
+                "生成安全 V2 字卡需要 FFmpeg / FFmpeg is required for the safe V2 graphics layer."
+            )
+        try:
+            from .review_renderer import ReviewRenderer
+        except ImportError:  # pragma: no cover - direct script fallback.
+            from review_renderer import ReviewRenderer
+
+        overlay_dir = self.json_path.parent / "resolve_graphics"
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        overlay_path = overlay_dir / "CyberEditor_Graphics_Overlay.mov"
+        helper = ReviewRenderer(
+            self.json_path,
+            overlay_path,
+            width=width,
+            height=height,
+            logger=self.logger,
+        )
+        filters = ["[0:v]format=yuva444p10le[base]"]
+        current_label = "base"
+        rendered_count = 0
+        for index, graphic in enumerate(items):
+            output_label = f"graphic{index}"
+            graph = helper._graphics_filter(graphic, current_label, output_label)
+            if not graph:
+                continue
+            filters.append(graph)
+            current_label = output_label
+            rendered_count += 1
+        if rendered_count == 0:
+            return []
+        duration_sec = Decimal(total_frames) / fps
+        script_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".fffilter",
+                prefix="resolve_graphics_",
+                dir=str(overlay_dir),
+                delete=False,
+            ) as handle:
+                handle.write(";\n".join(filters))
+                script_path = Path(handle.name)
+            command = [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                (
+                    f"color=c=black@0.0:s={width}x{height}:"
+                    f"r={self._decimal_text(fps)}:d={self._decimal_text(duration_sec)},format=rgba"
+                ),
+                "-filter_complex_script",
+                str(script_path),
+                "-map",
+                f"[{current_label}]",
+                "-an",
+                "-c:v",
+                "prores_ks",
+                "-profile:v",
+                "4",
+                "-pix_fmt",
+                "yuva444p10le",
+                str(overlay_path),
+            ]
+            creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                creationflags=creation_flags,
+            )
+        except OSError as exc:
+            raise ResolveExecutorError(
+                f"生成透明字卡覆盖层失败 / Could not render graphics overlay: {exc}"
+            ) from exc
+        finally:
+            if script_path is not None:
+                try:
+                    script_path.unlink()
+                except OSError:
+                    pass
+        if completed.returncode != 0 or not overlay_path.is_file() or overlay_path.stat().st_size == 0:
+            raise ResolveExecutorError(
+                "FFmpeg 未生成有效透明字卡覆盖层："
+                f"{completed.stderr[-1200:]} / FFmpeg graphics-overlay render failed."
+            )
+
+        imported = self._import_media(overlay_path)
+        media_item = imported[0] if len(imported) == 1 else None
+        if media_item is None:
+            matches = self._items_for_path(overlay_path)
+            if len(matches) != 1:
+                raise ResolveExecutorError(
+                    "无法唯一定位字卡覆盖层 / Could not uniquely resolve graphics overlay."
+                )
+            media_item = matches[0]
+        setter = getattr(media_item, "SetClipProperty", None)
+        if callable(setter):
+            try:
+                setter("Alpha Mode", "Straight")
+            except Exception:
+                pass
+        try:
+            video_tracks = int(self.timeline.GetTrackCount("video") or 0)
+        except Exception:
+            video_tracks = 0
+        add_track = getattr(self.timeline, "AddTrack", None)
+        while video_tracks < 2 and callable(add_track):
+            try:
+                added = add_track("video")
+            except Exception as exc:
+                raise ResolveExecutorError(
+                    f"无法创建 V2 字卡轨 / Could not create V2 graphics track: {exc}"
+                ) from exc
+            if added is False:
+                break
+            video_tracks += 1
+        if video_tracks < 2:
+            raise ResolveExecutorError(
+                "Resolve 无法创建 V2 字卡轨 / Resolve could not create a V2 graphics track."
+            )
+        try:
+            record_frame = int(self.timeline.GetStartFrame() or 0)
+        except Exception:
+            record_frame = 0
+        clip_info = {
+            "mediaPoolItem": media_item,
+            "startFrame": 0,
+            "endFrame": total_frames - 1,
+            "mediaType": 1,
+            "trackIndex": 2,
+            "recordFrame": record_frame,
+        }
+        result = self.media_pool.AppendToTimeline([clip_info])
+        appended = self._coerce_items(result)
+        if not appended:
+            raise ResolveExecutorError(
+                "Resolve 未能把透明字卡放到 V2 / Resolve did not append the V2 graphics overlay."
+            )
+        for timeline_item in appended:
+            checks = (
+                ("GetTrackIndex", 2, "track"),
+                ("GetStart", record_frame, "start"),
+                ("GetDuration", total_frames, "duration"),
+            )
+            for method_name, expected, label in checks:
+                getter = getattr(timeline_item, method_name, None)
+                if not callable(getter):
+                    continue
+                try:
+                    actual = int(getter())
+                except Exception as exc:
+                    raise ResolveExecutorError(
+                        f"无法验证 V2 字卡 {label} / Could not verify graphics {label}: {exc}"
+                    ) from exc
+                if actual != expected:
+                    raise ResolveExecutorError(
+                        f"V2 字卡 {label} 错位：expected={expected}, actual={actual} / "
+                        "Graphics overlay placement verification failed."
+                    )
+        try:
+            self.timeline.SetTrackName("video", 2, "AI Graphics / AI 字卡")
+        except Exception:
+            pass
+        self.logger.info(
+            "已将 %d 个字卡渲染为透明 ProRes 并安全放置到 V2 / "
+            "Rendered %d graphics into one transparent ProRes V2 overlay",
+            rendered_count,
+            rendered_count,
+        )
+        return appended
+
     def append_graphics_titles(self, fps: Decimal) -> Sequence[Any]:
         """
-        Insert the director's validated typography as editable Resolve Text+ items.
-        将导演已校验的字体设计插入为可编辑的 Resolve Text+ 条目。
+        Refuse unsafe Resolve Text+ insertion that can ripple program video.
+        拒绝可能 ripple 主画面的不安全 Resolve Text+ 插入。
 
-        The FFmpeg review renderer executes the same plan. Resolve title support
-        varies slightly by build, so unavailable controls are logged and skipped
-        without sacrificing the assembled picture or audio.
-        FFmpeg 审片与此处共用同一方案；不同 Resolve 版本缺失的控件会友好降级。
+        Graphics are rendered into the approved preview. The public Resolve 21
+        API cannot target V2 for ``InsertFusionTitleIntoTimeline``; using it can
+        insert a five-second V1 item and leave audio at zero. Returning an empty
+        sequence is an intentional synchronization guarantee, not degradation.
+        字卡已由审核预览渲染。Resolve 21 公开 API 无法把 Text+ 定位到 V2，
+        因此返回空序列是音画同步硬保证，不是降级。
         """
         raw_items = self.graphics_plan.get("items")
         items = raw_items if isinstance(raw_items, list) else []
@@ -1494,17 +2236,20 @@ class DaVinciExecutor:
                     f"无法唯一导入{label_cn} / Could not uniquely import {label_en}: {path}"
                 )
             media_item = matches[0]
-        program_frames = sum(
-            max(
-                1,
-                int(
-                    ((decision.cut_out_sec - decision.cut_in_sec) * fps).to_integral_value(
-                        rounding=ROUND_CEILING
-                    )
-                ),
+        program_frames = int(self.frame_edl.get("total_record_frames", 0) or 0)
+        if program_frames <= 0:
+            raise ResolveExecutorError(
+                "frame_edl 总帧数无效 / Frame EDL total record frames are invalid."
             )
-            for decision, _ in prepared
+        expected_fingerprint = str(self.frame_edl.get("fingerprint") or "")
+        audio_fingerprint = str(
+            self.audio_program.get("frame_edl_fingerprint") or ""
         )
+        if not expected_fingerprint or audio_fingerprint != expected_fingerprint:
+            raise ResolveExecutorError(
+                f"{label_cn}不是基于当前统一帧时间表生成的 / Pre-conformed "
+                f"{label_en} does not match the current frame EDL."
+            )
         audio_seconds = self._probe_media_duration(path)
         if audio_seconds <= 0:
             raise ResolveExecutorError(f"无法读取{label_cn}时长 / Could not read {label_en} duration: {path}")
@@ -1516,8 +2261,7 @@ class DaVinciExecutor:
                 )
             ),
         )
-        allowed_shortfall = max(2, len(prepared) + 1)
-        if audio_frames + allowed_shortfall < program_frames:
+        if audio_frames < program_frames:
             raise ResolveExecutorError(
                 f"{label_cn}短于最终时间线 / Pre-conformed {label_en} is shorter than the program."
             )
@@ -1534,11 +2278,12 @@ class DaVinciExecutor:
             raise ResolveExecutorError(
                 f"无法创建音轨 {track_index} / Could not create audio track {track_index}."
             )
-        try:
-            record_frame = int(self.timeline.GetStartFrame() or 0)
-        except Exception:
-            record_frame = 0
-        segment_frames = min(audio_frames, program_frames)
+        if self.picture_record_start is None:
+            raise ResolveExecutorError(
+                "无法确定 V1 节目起始帧 / Picture record start is unavailable."
+            )
+        record_frame = self.picture_record_start
+        segment_frames = program_frames
         clip_info = {
             "mediaPoolItem": media_item,
             "startFrame": 0,
@@ -1549,13 +2294,22 @@ class DaVinciExecutor:
         }
         result = self.media_pool.AppendToTimeline([clip_info])
         items = self._coerce_items(result)
-        if result is None or result is False or (not items and result is not True):
+        if len(items) != 1:
             raise ResolveExecutorError(
                 f"Resolve 无法把{label_cn}追加到音轨 {track_index} / "
-                f"Could not append {label_en} to audio track {track_index}."
+                f"Could not append exactly one {label_en} TimelineItem to audio "
+                f"track {track_index}; returned {len(items)}."
             )
+        self._verify_audio_timeline_item(
+            items[0],
+            track_index=track_index,
+            expected_start=record_frame,
+            expected_duration=segment_frames,
+            context=f"{label_cn} / {label_en}",
+        )
         self.logger.info(
-            "已导入预混%s：%s（音轨 %d）/ Pre-conformed %s added on audio track %d",
+            "已导入并验证预混%s：%s（音轨 %d）/ "
+            "Pre-conformed %s added and verified on audio track %d",
             label_cn,
             path.name,
             track_index,
@@ -1605,30 +2359,28 @@ class DaVinciExecutor:
             raise ResolveExecutorError(
                 f"无法读取配乐时长 / Could not read music duration: {path}"
             )
-        program_frames = sum(
-            max(
-                1,
-                int(
-                    ((decision.cut_out_sec - decision.cut_in_sec) * fps).to_integral_value(
-                        rounding=ROUND_CEILING
-                    )
-                ),
+        program_frames = int(self.frame_edl.get("total_record_frames", 0) or 0)
+        if program_frames <= 0:
+            raise ResolveExecutorError(
+                "frame_edl 总帧数无效 / Frame EDL total record frames are invalid."
             )
-            for decision, _ in prepared
-        )
         music_frames = max(
             1,
             int((Decimal(str(music_seconds)) * fps).to_integral_value(rounding=ROUND_CEILING)),
         )
         if bed_text:
-            # Every picture range is quantized independently to Resolve frames.
-            # A bed rendered from the summed seconds can therefore be roughly
-            # one frame shorter per cut. Accept only that bounded delta and
-            # leave the tiny tail as production audio/silence; never loop a bed.
-            # 每段画面会独立舍入到 Resolve 帧；按总秒数合成的音乐床因此可能每个
-            # 切点少约一帧。只容忍这个有界误差，尾部保留现场声/静音且绝不循环。
-            allowed_shortfall = max(2, len(prepared) + 1)
-            if music_frames + allowed_shortfall < program_frames:
+            expected_fingerprint = str(self.frame_edl.get("fingerprint") or "")
+            bed_render = self.music_plan.get("bed_render")
+            bed_fingerprint = str(
+                bed_render.get("frame_edl_fingerprint") or ""
+                if isinstance(bed_render, dict)
+                else ""
+            )
+            if not expected_fingerprint or bed_fingerprint != expected_fingerprint:
+                raise ResolveExecutorError(
+                    "音乐床不是基于当前统一帧时间表生成的 / Music bed does not match frame_edl."
+                )
+            if music_frames < program_frames:
                 raise ResolveExecutorError(
                     "预合成音乐床短于最终时间线 / Pre-conformed music bed is shorter than the program."
                 )
@@ -1645,10 +2397,11 @@ class DaVinciExecutor:
             raise ResolveExecutorError(
                 "无法创建配乐音轨 2 / Could not create music audio track 2."
             )
-        try:
-            record_frame = int(self.timeline.GetStartFrame() or 0)
-        except Exception:
-            record_frame = 0
+        if self.picture_record_start is None:
+            raise ResolveExecutorError(
+                "无法确定 V1 节目起始帧 / Picture record start is unavailable."
+            )
+        record_frame = self.picture_record_start
         appended: List[Any] = []
         cursor = 0
         while cursor < program_frames:
@@ -1663,27 +2416,31 @@ class DaVinciExecutor:
             }
             result = self.media_pool.AppendToTimeline([clip_info])
             items = self._coerce_items(result)
-            if result is None or result is False or (not items and result is not True):
+            if len(items) != 1:
                 raise ResolveExecutorError(
-                    "Resolve 无法把配乐追加到音轨 2 / Could not append music to track 2."
+                    "Resolve 无法把恰好一个配乐条目追加到音轨 2 / "
+                    f"Could not append exactly one music TimelineItem to track 2; "
+                    f"returned {len(items)}."
                 )
+            self._verify_audio_timeline_item(
+                items[0],
+                track_index=2,
+                expected_start=record_frame + cursor,
+                expected_duration=segment_frames,
+                context=(
+                    "预合成音乐床 / pre-conformed music bed"
+                    if bed_text
+                    else f"旧版循环配乐第 {len(appended) + 1} 段 / legacy music segment {len(appended) + 1}"
+                ),
+            )
             appended.extend(items)
             cursor += segment_frames
             if bed_text:
                 break
         if bed_text:
-            tail_frames = max(0, program_frames - cursor)
-            if tail_frames:
-                self.logger.info(
-                    "音乐床因逐片段帧舍入比画面短 %d 帧（%.3f 秒）；尾部保留现场声/静音 / "
-                    "Music bed ends %d frame(s) early after per-cut frame rounding; "
-                    "leaving production audio/silence",
-                    tail_frames,
-                    float(Decimal(tail_frames) / fps),
-                    tail_frames,
-                )
             self.logger.info(
-                "已导入预合成音乐床：%s（音轨 2）/ Pre-conformed music bed added on track 2",
+                "已导入并验证预合成音乐床：%s（音轨 2）/ "
+                "Pre-conformed music bed added and verified on track 2",
                 path.name,
             )
         else:
@@ -2722,6 +3479,149 @@ class DaVinciExecutor:
             return max(0, int(getattr(value, method_name)()))
         except Exception:
             return 0
+
+    @staticmethod
+    def _timeline_item_frame(
+        item: Any,
+        method_name: str,
+        context: str,
+    ) -> int:
+        """
+        Read one Resolve TimelineItem frame with Resolve 21 compatibility.
+        以兼容 Resolve 21 的方式读取一个 TimelineItem 帧值。
+
+        Resolve 21 accepts ``GetStart(False)``/``GetDuration(False)`` while
+        older mocks and builds may expose the historical no-argument form. A
+        missing method or unreadable value is unsafe for synchronization and
+        therefore fails closed.
+
+        Resolve 21 支持 ``GetStart(False)``/``GetDuration(False)``，旧版本或
+        测试替身可能只支持无参数形式。缺失或不可读取的时间值无法证明同步正确，
+        因此必须停止执行。
+
+        Parameters / 参数:
+            item: Resolve TimelineItem returned by ``AppendToTimeline``. /
+                ``AppendToTimeline`` 返回的 Resolve TimelineItem。
+            method_name: Timing method such as ``GetStart`` or ``GetDuration``. /
+                ``GetStart`` 或 ``GetDuration`` 等时间方法名。
+            context: Bilingual diagnostic context. / 双语诊断上下文。
+        """
+        getter = getattr(item, method_name, None)
+        if not callable(getter):
+            raise ResolveExecutorError(
+                f"Resolve TimelineItem 缺少 {method_name}，无法验证 {context} / "
+                f"TimelineItem.{method_name} is unavailable; cannot verify {context}."
+            )
+        try:
+            value = getter(False)
+        except TypeError:
+            try:
+                value = getter()
+            except Exception as exc:
+                raise ResolveExecutorError(
+                    f"无法读取 {context} 的 {method_name} / "
+                    f"Could not read {context} {method_name}: {exc}"
+                ) from exc
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"无法读取 {context} 的 {method_name} / "
+                f"Could not read {context} {method_name}: {exc}"
+            ) from exc
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ResolveExecutorError(
+                f"{context} 的 {method_name} 不是有效整数帧：{value!r} / "
+                f"{context} {method_name} is not a valid integer frame."
+            ) from exc
+
+    @staticmethod
+    def _timeline_item_track(item: Any, context: str) -> Tuple[str, int]:
+        """
+        Read and validate ``GetTrackTypeAndIndex`` across Resolve variants.
+        跨 Resolve 返回格式读取并校验 ``GetTrackTypeAndIndex``。
+
+        Resolve 21 normally returns ``[trackType, trackIndex]``. Dictionary
+        forms are accepted as a defensive compatibility path for API wrappers.
+        Resolve 21 通常返回 ``[轨道类型, 轨道索引]``；同时兼容 API 包装器的字典形式。
+
+        Parameters / 参数:
+            item: Resolve TimelineItem returned by ``AppendToTimeline``. /
+                ``AppendToTimeline`` 返回的 Resolve TimelineItem。
+            context: Bilingual diagnostic context. / 双语诊断上下文。
+        """
+        getter = getattr(item, "GetTrackTypeAndIndex", None)
+        if not callable(getter):
+            raise ResolveExecutorError(
+                f"Resolve TimelineItem 缺少 GetTrackTypeAndIndex，无法验证 {context} 轨道 / "
+                f"Cannot verify the {context} track."
+            )
+        try:
+            raw = getter()
+        except Exception as exc:
+            raise ResolveExecutorError(
+                f"无法读取 {context} 轨道 / Could not read the {context} track: {exc}"
+            ) from exc
+        if isinstance(raw, dict):
+            track_type = raw.get("trackType", raw.get("type"))
+            track_index = raw.get("trackIndex", raw.get("index"))
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            track_type, track_index = raw[0], raw[1]
+        else:
+            raise ResolveExecutorError(
+                f"{context} 返回了无效轨道信息：{raw!r} / "
+                f"{context} returned invalid track information."
+            )
+        normalized_type = str(track_type or "").strip().casefold()
+        try:
+            normalized_index = int(track_index)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ResolveExecutorError(
+                f"{context} 返回了无效轨道索引：{raw!r} / "
+                f"{context} returned an invalid track index."
+            ) from exc
+        if normalized_type not in {"audio", "video"} or normalized_index < 1:
+            raise ResolveExecutorError(
+                f"{context} 返回了无效轨道：{raw!r} / "
+                f"{context} returned an invalid track."
+            )
+        return normalized_type, normalized_index
+
+    def _verify_audio_timeline_item(
+        self,
+        item: Any,
+        *,
+        track_index: int,
+        expected_start: int,
+        expected_duration: int,
+        context: str,
+    ) -> None:
+        """
+        Fail closed unless an appended audio item matches its frame schedule.
+        仅当追加音频条目与帧时间表完全一致时才继续，否则立即停止。
+
+        Parameters / 参数:
+            item: Actual TimelineItem returned by Resolve. / Resolve 返回的真实时间线条目。
+            track_index: Expected one-based audio track. / 预期的从 1 开始音轨索引。
+            expected_start: Expected record start frame. / 预期记录起始帧。
+            expected_duration: Expected record duration in frames. / 预期记录帧时长。
+            context: Bilingual diagnostic label. / 双语诊断标签。
+        """
+        actual_type, actual_track = self._timeline_item_track(item, context)
+        actual_start = self._timeline_item_frame(item, "GetStart", context)
+        actual_duration = self._timeline_item_frame(item, "GetDuration", context)
+        if (
+            actual_type != "audio"
+            or actual_track != track_index
+            or actual_start != expected_start
+            or actual_duration != expected_duration
+        ):
+            raise ResolveExecutorError(
+                f"{context} 在 Resolve 中错位：预期 audio {track_index} / "
+                f"start {expected_start} / duration {expected_duration}，实际 "
+                f"{actual_type} {actual_track} / start {actual_start} / "
+                f"duration {actual_duration} / {context} placement verification failed."
+            )
 
     @staticmethod
     def _coerce_items(value: Any) -> List[Any]:

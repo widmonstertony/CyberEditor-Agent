@@ -132,27 +132,47 @@ the local gate completes setup, development, payoff, and ending without forcing
 every source file into the movie or repeating an action/countdown to fill time.
 
 The full workflow does not merely concatenate every file. Each source is
-transcribed and sampled continuously at one saved frame per second by default,
-allowing the vision model to understand setup, action, reaction, and
-payoff rather than merely naming objects. A vision model first writes a
-project-wide treatment with theme, four story beats, target runtime, an
-executable color bible, and music mood. It then reviews every saved one-fps image
-and the dialogue in order. Ollama cannot accept thousands of images from an hour
-in one request, so 16-second transport batches overlap by two seconds on each side.
-No second representative-frame selection occurs, and a rolling identity, location,
-action, emotion, and unresolved-intention summary crosses every batch boundary.
+transcribed and sampled continuously as a time-ordered JPEG every 0.5 seconds (2 fps),
+allowing the vision model to identify an action's entry, apex, reaction, and
+result rather than merely naming objects. The vision model first reviews all
+evidence without a predetermined theme and builds a neutral action/continuity
+ledger. It then compares several evidence-backed story concepts and writes the
+treatment, story beats, runtime, executable color bible, and music mood.
+“Complete coverage” does not mean one enormous model request. Ollama cannot
+accept thousands of images from an hour at once, so the reviewer first tries
+chronological 10-second core windows with up to one second of overlap. Before every
+request it budgets text, JSON Schema, output headroom, and estimated image tokens;
+the core shrinks when the configured context cannot hold it, and one request never
+exceeds 32 images. A rolling identity, location, action, emotion, and
+unresolved-intention state crosses every boundary without silently dropping samples.
+Each window records action entry, apex, and exit. After the neutral ledger is
+complete, every short event atom up to eight seconds is extracted again as
+consecutive frames at up to 4 fps to refine readable entry, action apex, and clean
+exit. Dialogue retains Whisper timing; the silent vision model cannot trim words.
 A second global-director pass keeps only the
 minority of shots that serve that treatment. Local validation enforces actual
-source order and in-file timecode, plus per-shot and total-runtime limits. It
-plans cuts/dissolves/fades, audio cleanup, creative looks, gentle push-ins,
+source order and in-file timecode, plus per-shot and total-runtime limits. To keep
+the FFmpeg review, program audio, and Resolve output frame-aligned, the current
+automated deliverable executes hard cuts in every engine; requested dissolves or
+fades remain audit hints rather than running in only one renderer. It plans audio cleanup, creative looks, gentle push-ins,
 gain, stabilization, tracking, and a one-to-three-cue pre-mixed score chosen by
 the two-director pipeline. The result can include an editable
 Resolve timeline, an immediately watchable FFmpeg 1080p review, and a final
 movie rendered by Resolve's Deliver pipeline.
 
-The global director now creates a **picture lock before music spotting**. Every
-selected shot must state its narrative function, the new information it gives
-the viewer, its exact source trim, audio intent, and music-edit role. Dialogue
+### Score-informed picture rhythm, then exact post-lock cueing and graphics
+
+Music and picture use a two-level coupling, not “ignore music until picture lock.”
+Before selecting shots, the text director reads measured candidate `score_profiles`
+(BPM, sections, energy curve, and whether a real climax exists) and designs shot
+length, escalation, natural-sound gaps, and `music_edit_role` around feasible music.
+Evidence review, supervising review, and the blind viewer then produce a validated
+**picture lock**. Only then does a separate schema-constrained request place zero to
+three exact cues against final timeline boundaries, dialogue ranges, strong beats,
+and downbeats. This lets picture rhythm serve real music from the start without
+leaving payoff hits attached to boundaries that later disappeared. Every selected
+shot must state its narrative function, the new information it gives the viewer,
+its exact source trim, audio intent, and music-edit role. Dialogue
 about microphones, filters, blocking, or repeated takes receives an advisory
 `production_context_hint`, but is never automatically cut or muted. The director
 alone decides whether to exclude it, preserve it, use it as natural texture, mix
@@ -214,13 +234,16 @@ single global assembly request. The orchestrator therefore defaults to a
 7,200-second (two-hour) Ollama read timeout while emitting honest elapsed-time
 heartbeats every 15 seconds. CLI users may override it with
 `--ollama-timeout`.
-Only after that validated picture lock exists does the music director place
-cues against real shot boundaries and exact dialogue regions. The CPU renderer
-then performs sample-accurate ducking and refuses to publish a silent or nearly
-silent music bed. Optional title cards, chapters, lower thirds, and end cards
-from `graphics_plan` are rendered in both the FFmpeg review and Resolve Text+.
-Typography is used to clarify or deliberately stylize a coherent edit; it is
-not allowed to disguise weak shot selection.
+After lock, the cue pass is responsible for exact track sections, in/out points,
+and sync points; the earlier picture pass has already used measured score profiles.
+The CPU renderer then performs sample-accurate ducking and refuses to publish a
+silent or nearly silent music bed. Optional title cards, chapters, lower thirds,
+and end cards from `graphics_plan` are drawn in the FFmpeg review. Resolve receives
+each item as a short, frame-counted ProRes 4444 alpha clip at the exact V2 record
+frame, with dimensions and visible alpha verified before import. This reproducible
+path is **not editable Text+**; edit `graphics_plan` and rerun to change the words.
+Typography may clarify or deliberately stylize a coherent edit, but cannot disguise
+weak shot selection.
 
 Online music uses an authoritative manifest: stale downloads cannot masquerade
 as user-supplied tracks, and interview, podcast, narration, and show-like results
@@ -326,20 +349,20 @@ process exit as a hard VRAM barrier:
 Whisper + OpenCV child process
           │ exits completely; Windows releases the CUDA context
           ▼
-Qwen3.6 first music-director pass (frames + dialogue + story)
-          │ writes music_brief.json, then keep_alive=0 unload
+Qwen3.6 neutral whole-footage review (2-fps coverage + up-to-4-fps short-atom rewatch + dialogue)
+          │ writes footage ledger, treatment, and music brief; then unloads
           ▼
 CPU local/network retrieval + Librosa/FFmpeg music analysis
           │ beats, strong beats, sections, key, dynamics, LUFS; zero GPU
           ▼
-Qwen3.6 final director (shots + 1–3 cues + silence + climax sync)
+Qwen3.6 final director (score-informed picture rhythm + exact post-lock cues)
           │ writes timeline_cuts.json, then fully unloads
           ▼
 FFmpeg CPU render of music_bed.wav
           │ cue changes, fades, loudness matching, dialogue ducking
           ▼
 FFmpeg review-render child process
-          │ renders transitions, denoise, looks, and basic motion
+          │ renders frame-matched hard cuts, denoise, looks, and basic motion
           ▼
 DaVinci Resolve executor child process
           │ native effects / DRX / optional guarded UI macro / final render
@@ -357,22 +380,49 @@ DaVinci Resolve executor child process
 - `timeline_cuts.json` is written atomically only after every chunk succeeds
   and all decisions are validated and merged.
 
-## Why Qwen3.6-27B dense Q8 is now the default
+## Why vision review and text direction use separate Qwen3.6 roles
 
-- `qwen3.6:27b-mtp-q8_0` is a dense, native image-text model of about 30 GB.
-  Q8 preserves substantially more weight fidelity and fits mixed 16 GB VRAM +
-  64 GB RAM inference.
+- On a 16 GB GPU, dense 2-fps visual review prefers the installed
+  `qwen3.6:27b` tag, which Ollama currently reports as Q4_K_M. Its roughly
+  17 GB weights reduce RAM/PCIe churn
+  while thousands of images are inspected.
+- After the vision model is fully unloaded, the global text director prefers
+  an installed `qwen3.6:27b-mtp-q8_0` tag. Its roughly 30 GB Q8 weights retain
+  more fidelity for final story comparison and structure decisions.
 - Official video benchmarks generally place dense 27B above 35B-A3B on
   VideoMME, VideoMMMU, MLVU, and MVBench. The sparse model is faster; this
   project prioritizes editorial judgment.
 - The older text-only Qwen2.5 72B Q5 is about 54 GB. Parameter count alone does
-  not guarantee better directing than Qwen3.6's newer multimodal post-training.
+  not guarantee better directing than Qwen3.6's newer image-vision and instruction
+  post-training.
 
-The same Qwen3.6 model first reviews images and speech, then performs the
-text-only global assembly. Only one model is resident, without loading a second
-54 GB checkpoint. A page-file safety margin remains recommended. Right-click
+Automatic configuration chooses both roles only from tags that Ollama actually
+reports as installed. If only one compatible model exists, the two serial stages
+reuse it; CyberEditor never silently downloads or invents another tag. As of
+2026-08-15, Qwen has not released downloadable local weights named
+“Qwen3.8-27B.” `qwen3.8-max-preview` is a hosted preview name, not an Ollama local
+model tag; see the [Qwen Code 2026-07-23 update](https://qwenlm.github.io/qwen-code-docs/en/blog/updates/weekly-update-2026-07-23/).
+
+A page-file safety margin remains recommended. Right-click
 `scripts\configure_pagefile_admin.cmd` and run it as Administrator to keep a
 4–8 GB C: page file and add a 32–48 GB D: page file. It never reboots Windows.
+
+### Current vision boundary: complete ordered sampling, not pretend-native video
+
+The present Windows/Ollama backend calls Ollama's `images` array with chronological
+JPEGs; it does **not** hand an MP4 to the model as a continuous video stream. Here,
+“full review” means gap-free 2-fps survey coverage from start to finish, all dialogue
+preserved, context-adaptive request windows, and up-to-4-fps reinspection of short
+actions. It does not mean every original 59.94-fps frame, inter-frame optical flow,
+or the source audio track is available as native model video input. Ollama's current
+public [Vision API](https://docs.ollama.com/capabilities/vision) documents image input.
+
+vLLM documents OpenAI-compatible `video_url` input and selectable video decoders, so
+it is a credible future optional native-video backend. This repository has not yet
+implemented that adapter and does not claim it as current functionality. Official
+vLLM GPU installation is Linux-first; Windows requires WSL or a separate Linux model
+node. See [vLLM multimodal video input](https://docs.vllm.ai/en/latest/features/multimodal_inputs/)
+and [vLLM GPU requirements](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/).
 
 ## Eight-stage evidence-first finishing pipeline
 
@@ -381,27 +431,32 @@ The implementation now follows this strict serial chain:
 1. **Extraction**: each video gets its own Whisper/OpenCV child process, which
    writes dialogue, real JPEG keyframes, and media metadata. The process exits
    before the parent crosses the VRAM-release barrier.
-2. **First music-director pass**: Qwen3.6 reads representative frames, dialogue,
-   and shoot order, then defines theme, emotional arc, search terms,
-   instrumentation, BPM range, vocal policy, one to three cues, and intentional
-   silence. It writes `director_treatment.json` and `music_brief.json`, then unloads.
+2. **Neutral full review and first music pass**: Qwen3.6 first reads all 2-fps
+   evidence, dialogue, and shoot order without a predetermined theme, then
+   rewatches every event atom up to eight seconds at up to 4 fps and writes
+   `footage_ledger.json`. It compares multiple story concepts that cite real
+   timestamps, then writes `director_treatment.json` and `music_brief.json` with
+   the emotional arc, search terms, instrumentation, BPM range, one to three cues,
+   and intentional silence. The model then unloads completely.
 3. **Retrieval and analysis (CPU)**: choose a local licensed library, Jamendo with
    verifiable license URLs, or the explicitly confirmed yt-dlp any-online mode.
    Librosa/FFmpeg extracts BPM, beats, strong beats, approximate downbeats, energy
    sections, whole-track energy trend, peak position, key, dynamic range, and EBU
    R128 LUFS into `music_analysis.json`. Ranking combines BPM, semantic relevance,
    and whether the measured curve can deliver the requested build or climax.
-4. **Whole-footage audit and evidence contract**: Qwen3.6 reloads and reviews every saved one-fps visual sample
-   and transcript in order. Overlapping 16-second batches only satisfy the context
-   window; they do not discard intermediate samples, and a rolling continuity summary
-   carries whole-source understanding into cross-source story assembly. Before shot
-   selection, an evidence role must cite real `candidate_id` values for the subject,
+4. **Evidence contract and global assembly**: the text director loads after the
+   visual reviewer has exited and reads the complete, fingerprint-validated evidence
+   ledger plus vocal-filtered candidates and their measured BPM, sections, and energy
+   profiles from `music_analysis.json`. Legacy v2 candidate caches are never reused. Before shot selection, an
+   evidence role must cite real `candidate_id` values for the subject,
    goal, state changes, and final observed state. Fewer than three audited state changes
    cannot support a causal/BTS claim; the system must choose an honest character vignette
    or mood montage instead.
    Dynamic shot limits range from 10-second B-roll to complete 45-second interview
-   thoughts. Picture selection assigns natural-sound, on-beat, phrase-start, build,
-   payoff-hit, or release roles; local validation grounds two to six sync points in
+   thoughts. Picture is not designed in musical ignorance: the director first uses
+   measured `score_profiles` to shape shot length, escalation, and payoff. Picture
+   selection assigns natural-sound, on-beat, phrase-start, build, payoff-hit, or
+   release roles; after picture lock, a second constrained request grounds two to six sync points in
    measured strong beats/downbeats. Normal visual shifts are bounded to ±0.45 seconds
    and payoff hits to ±0.75 seconds; interview dialogue is never truncated for rhythm.
 5. **Picture assembly and blind-viewer gate**: after picture assembly and supervising
@@ -423,6 +478,9 @@ The implementation now follows this strict serial chain:
    `CreateMagicMask()`, and `SmartReframe()`. User-exported DRX grades are applied
    through the node graph's `ApplyGradeFromDRX()`. Resolve 21 exposes stabilization
    and Magic Mask natively, so fragile coordinate macros are not the default.
+   Graphics avoid the undocumented, unstable Text+ insertion path: each item is a
+   short ProRes 4444 alpha clip whose frame count, dimensions, and alpha are verified
+   before exact placement on V2.
    Enable **Export final movie in Resolve** in the UI to create
    a Render Job, start it, log percentage progress, and validate completion. The
    current Deliver format/codec is preserved unless an existing Resolve render
@@ -533,8 +591,10 @@ CyberEditor-Agent/
 ### Minimum recommendations
 
 - Windows 10/11 64-bit
-- Python 3.12 64-bit
-- 16 GB system RAM; 32–64 GB is recommended for mixed 32B/70B inference
+- Python 3.11 or 3.12 64-bit
+- 16 GB system RAM is suitable only for development, tests, or smaller models;
+  the default 27B Q4/Q8 quality path recommends 64 GB, and mixed 70B inference
+  recommends at least 128 GB
 - At least 20 GB of free disk space, plus space for proxies and model weights
 - FFmpeg
 - Ollama
@@ -542,17 +602,36 @@ CyberEditor-Agent/
 
 ### Model recommendations
 
-| Hardware | Whisper | Ollama | Notes |
-|---|---|---|---|
-| Integrated GPU / CPU only | `tiny` / `base` | Qwen 3.6 27B Q4 (very slow) | A smaller vision model may be more practical |
-| 8–12 GB VRAM | `small` / `turbo` | `qwen3.6:27b-mtp-q4_K_M` | About 18 GB; mixed RAM/GPU |
-| 16 GB VRAM | `large-v3` | `qwen3.6:27b-mtp-q4_K_M` | About 18 GB; mostly GPU-offloaded |
-| 16 GB VRAM + 64 GB RAM | `large-v3` | `qwen3.6:27b-mtp-q8_0` | About 30 GB; dense Q8 quality default |
-| 24 GB+ VRAM | `large-v3` | Qwen 3.6 27B Q8 | Serial execution is still recommended |
+| Hardware | Whisper | Vision reviewer | Global text director | Positioning |
+|---|---|---|---|---|
+| Current Quadro RTX 5000 Max-Q 16 GB + 64 GB RAM | `large-v3` | `qwen3.6:27b` Q4_K_M | `qwen3.6:27b-mtp-q8_0` | Runs the serial path, but Q8 requires mixed RAM/VRAM and long projects are slow; no native continuous-video input |
+| One RTX 5090 32 GB + 128/192 GB RAM | `large-v3` | Qwen3.6-27B Q8 | Qwen3.6-27B Q8; benchmark a larger text model optionally | Best consumer Windows choice; 32 GB must still hold vision/KV/context overhead, so a roughly 30 GB weight file is not guaranteed to remain entirely in VRAM |
+| RTX PRO 6000 Blackwell 96 GB + 256 GB RAM | `large-v3` | high-precision Qwen3.6-27B | enable a 70B-class text director only after project-specific evaluation | Most practical single-GPU Windows workstation ceiling; much more capacity at far higher cost and 600 W power/cooling requirements |
+| Mac Studio M3 Ultra with 512 GB unified memory | separate extraction or model node | can hold much larger MLX multimodal weights | can hold much larger local text weights | Capacity-first LAN model node; current registry, worker, and Resolve automation are Windows paths, so this is not a drop-in replacement without a backend migration |
 
-On a 16 GB Quadro with 64 GB RAM, prefer `qwen3.6:27b-mtp-q8_0` for quality or
-Q4_K_M for speed and space. Both accept text and images and support thinking:
-[Qwen 3.6 on Ollama](https://ollama.com/library/qwen3.6).
+The current 16 GB Quadro + 64 GB RAM system does not need immediate replacement
+to validate this redesign. Its default is `qwen3.6:27b` Q4 vision review followed
+serially by `qwen3.6:27b-mtp-q8_0` final text direction; the tradeoff is extensive
+mixed-memory inference and waiting. For a new single-machine Windows build, one
+RTX 5090 32 GB with 128 GB RAM (192 GB preferred) is the consumer recommendation.
+When cost is secondary, RTX PRO 6000 Blackwell 96 GB plus 256 GB RAM is the more
+appropriate single-GPU Windows model/Resolve workstation. Two RTX 5090 cards have
+no NVLink: 64 GB aggregate VRAM is not one 64 GB pool, and performance depends on
+PCIe plus the inference backend's partitioning strategy.
+
+Faster or larger hardware expands model choice, usable context, and throughput; it
+**cannot repair a flawed narrative process, an event that was never filmed, a bad
+music candidate set, or missing human-reference evaluation**. In this redesign,
+the neutral evidence ledger, measured-score-informed picture rhythm, post-lock cueing,
+isolated blind-viewer review, and human-reference benchmark are more directly tied
+to human-like results than merely swapping 27B for a larger checkpoint. No hardware
+tier promises professional-human-editor quality automatically.
+
+Model details: [official Qwen3.6-27B weights](https://huggingface.co/Qwen/Qwen3.6-27B)
+and [Qwen 3.6 on Ollama](https://ollama.com/library/qwen3.6). Hardware specifications:
+[GeForce RTX 5090](https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/),
+[RTX PRO 6000 Blackwell](https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/rtx-pro-6000/),
+and [Mac Studio](https://www.apple.com/mac-studio/specs/).
 
 Whisper's published approximate VRAM requirements range from about 1 GB for
 tiny/base to about 6 GB for turbo. See the
@@ -616,17 +695,19 @@ details.
 
 ### 3. Prepare Ollama
 
-Quality-first for 16 GB VRAM + 64 GB RAM (about a 30 GB download and slower
-mixed CPU/GPU inference):
+Quality-first with separate visual/text roles on 16 GB VRAM + 64 GB RAM
+(about 47 GB total download):
 
 ```powershell
+ollama pull qwen3.6:27b
 ollama pull qwen3.6:27b-mtp-q8_0
 ```
 
-For a faster, smaller high-quality model (about 18 GB):
+To retain only one smaller model, both serial stages can reuse Q4 (about 17 GB,
+with lower final text-director fidelity than Q8):
 
 ```powershell
-ollama pull qwen3.6:27b-mtp-q4_K_M
+ollama pull qwen3.6:27b
 ```
 
 Models are downloaded once. The UI subsequently starts Ollama automatically
@@ -660,7 +741,8 @@ API. Resolve Studio's External Scripting preference must still be set to
 ```powershell
 python main.py `
   --input-folder "D:\Documentary\Camera originals" `
-  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "qwen3.6:27b" `
+  --director-model "qwen3.6:27b-mtp-q8_0" `
   --project-fps 23.976 `
   --chunk-minutes 10
 ```
@@ -673,7 +755,8 @@ python main.py `
   --video "D:\Shoot\A001.mp4" `
   --video "D:\Shoot\B001.mp4" `
   --input-folder "D:\Shoot\B-roll" `
-  --ollama-model "qwen3.6:27b-mtp-q8_0"
+  --ollama-model "qwen3.6:27b" `
+  --director-model "qwen3.6:27b-mtp-q8_0"
 ```
 
 Default outputs:
@@ -682,6 +765,7 @@ Default outputs:
 data/raw_data.json
 data/assets/<asset_id>/transcript.srt
 data/assets/<asset_id>/keyframes/*.jpg
+data/footage_ledger.json
 data/director_treatment.json
 data/music_brief.json
 data/music_analysis.json
@@ -701,7 +785,8 @@ running:
 # Reuse raw_data.json and rerun only the director and Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "qwen3.6:27b" `
+  --director-model "qwen3.6:27b-mtp-q8_0" `
   --creative-brief "Tell the preparation-to-payoff story in shooting order" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
@@ -710,7 +795,8 @@ python main.py --skip-extraction `
 
 # Any-online candidates (the UI is preferred because it shows the full warning)
 python main.py --skip-extraction --skip-resolve `
-  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "qwen3.6:27b" `
+  --director-model "qwen3.6:27b-mtp-q8_0" `
   --music-provider yt_dlp --music-candidate-limit 8 `
   --music-rights-confirmed `
   --music-rights-claim "I hold the rights required to download, adapt, synchronize, and use candidate audio and will follow source-platform terms"
@@ -799,8 +885,8 @@ The director produces this core structure:
       "reason_for_cut": "Complete statement of the main idea",
       "confidence": 0.9,
       "story_role": "interview",
-      "transition_to_next": "cross_dissolve",
-      "transition_duration_sec": 0.5,
+      "transition_to_next": "cut",
+      "transition_duration_sec": 0.0,
       "audio_cleanup": "strong",
       "color_look": "warm",
       "motion": "gentle_push_in"
@@ -815,15 +901,24 @@ out-point up, then subtracts one frame to match Resolve's inclusive `endFrame`.
 
 ## Robustness boundaries
 
-- “Full review” means every saved one-fps visual sample plus all dialogue from
+- “Full review” means every saved 2-fps visual sample plus all dialogue from
   beginning to end, not every original frame of a 59.94 fps stream. A one-hour
-  source therefore sends about 3,600 images in overlapping batches with no
-  second sampling pass. This is the explicit boundary between complete temporal
-  coverage and a local VLM context window.
+  source therefore sends about 7,200 images. “Complete” means no temporal holes,
+  not a single request: the initial 10-second cores shrink against the real
+  text/Schema/image-token budget, each request is capped at 32 images, and a rolling
+  continuity ledger covers the film. Every candidate action up to eight seconds is
+  then rewatched at up to 4 fps while long dialogue retains Whisper boundaries.
+  This is an Ollama image-sequence path, not native continuous MP4 understanding.
 - Resolve's public scripting API has no stable general transition-insertion
-  method. The FFmpeg preview truly renders the AI transition, denoise, look,
-  and motion plan. The editable Resolve timeline applies supported Voice
-  Isolation, CDL, and transform properties and stores the full plan in markers.
+  method. To prevent overlap-duration drift between the FFmpeg review, program
+  audio, and Resolve output, the current execution path uses matched hard cuts;
+  requested dissolves/fades remain audit hints. FFmpeg still renders denoise,
+  look, and motion plans, while the editable Resolve timeline applies supported
+  Voice Isolation, CDL, and transform properties and stores the plan in markers.
+- Resolve's public scripting contract also does not reliably create and write
+  Text+ titles. The current implementation renders each graphic as an independent,
+  short, alpha-verified ProRes 4444 clip on V2. The result is reproducible but the
+  title is not native editable Text+.
 - A normal Rec.709 plan may reuse an empty current project. When a PP8
   transform is required and the current project already contains a timeline,
   the script creates an isolated `Director Cut` project so existing global
@@ -833,7 +928,8 @@ out-point up, then subtracts one frame to match Resolve's inclusive `endFrame`.
   user can inspect and undo the partial timeline.
 - Semantic review requires an Ollama model reporting the `vision` capability.
   Plain `qwen2.5:3b` is a text-only smoke-test model and cannot run this
-  multimodal path; prefer `qwen3.6:27b-mtp-q8_0` when quality matters most.
+  multimodal path. On 16 GB VRAM, prefer `qwen3.6:27b` (Q4_K_M) for dense visual
+  review and `qwen3.6:27b-mtp-q8_0` for the serial text director.
 
 ## Tests
 
@@ -843,6 +939,11 @@ Tests require no GPU, Ollama, or Resolve:
 python -m unittest discover -s tests -v
 python -m compileall -q gui.py main.py src tests
 ```
+
+The project also includes a [human-reference editorial benchmark](evals/README.md)
+for source-selection F1, trim-boundary error, shot order, repetition, and runtime
+deviation on a frozen test set. It catches regressions; it does not replace blinded
+human scoring of story clarity, emotion, music, or performance choice.
 
 ## Privacy
 

@@ -105,15 +105,15 @@ Worker，Worker 密钥也不进入浏览器。若不希望云端保留任何成�
 主题。目标时长是上限与创作目标，不是填充指标；本地守门只补齐开场、发展、高潮和结尾，
 不会再强制每个源文件都进入成片，也不会用重复动作或倒计时凑时长。
 
-完整流程不是把所有视频简单首尾相接。每个素材会被依次转写，并默认从头到尾每秒保存
-一张连续视觉证据，使视觉模型理解动作的开始、发展、反应和结果，而不是只识别物体。
-AI 先根据全部素材生成包含主题、四段叙事节拍、目标时长、可执行调色圣经和音乐情绪的
-导演阐述，再让视觉模型按时间顺序审看全部一帧/秒证据和台词。由于 Ollama 无法在一次
-请求中容纳一小时的数千张图，内部使用 16 秒、两侧各 2 秒重叠的传输批次；批次不再二次
-挑代表帧，并携带累积的角色、地点、动作、情绪和未完成意图摘要，所以不会在边界重置剧情。
-第二遍 70B 全局导演只保留服务主题的少数镜头；本地校验器强制按真实素材顺序与素材内
+完整流程不是把所有视频简单首尾相接。每个素材会被依次转写，并默认从头到尾每 0.5 秒保存
+一张按时间排序的 JPEG 视觉证据（2fps），使视觉模型理解动作的入画、顶点、反应和结果，而不是只识别物体。
+视觉模型先在不带预设主题的情况下审完全部证据，建立动作原子与连续性账本；再比较多个有证据的故事方向，
+生成主题、叙事节拍、目标时长、调色圣经和音乐情绪。“完整覆盖”不等于把一小时影像塞进单次请求：Ollama 的图片数和上下文有上限，
+因此 2fps 证据会先尝试按 10 秒核心、最多 1 秒重叠的窗口顺序传输，并通过滚动人物/地点/动作状态跨越边界。每次请求前会同时估算文字、Schema、输出余量与图片 token；若当前 Context 放不下，核心窗口自动缩短，且单次不超过 32 张图，而不是静默丢弃中间采样。中立账本完成后，系统会把不超过 8 秒的短动作原子重新抽取为最高 4fps 的连续帧，二次确认可读入点、动作顶点和干净出点；对白仍以 Whisper 时间码为准，不让无声视觉模型剪断字句。
+第二遍全局文字导演只保留服务主题的少数镜头；本地校验器强制按真实素材顺序与素材内
 时间码排列，并限制
-单镜头与总成片时长。它同时规划硬切/叠化/淡黑、音频降噪、创意色彩、音量、防抖、跟踪、
+单镜头与总成片时长。为保证 FFmpeg 审片、节目原声和 Resolve 成片逐帧同长，当前自动交付
+统一执行硬切；模型若提出叠化/淡黑，会保留为审计提示但不会在一个引擎中单独执行。它还规划音频降噪、创意色彩、音量、防抖、跟踪、
 轻微推镜，以及由双导演流程选择并预混的 1–3 段配乐。最终可同时输出 Resolve 可编辑时间线、
 FFmpeg 1080p 审片预览，以及由 Resolve Deliver 页面真正渲染的最终成片。
 
@@ -128,7 +128,7 @@ FFmpeg 1080p 审片预览，以及由 Resolve Deliver 页面真正渲染的最�
 Ollama 上下文，以及在内存预算内质量最合适的**已安装** Ollama 模型；模型排序会
 考虑中文、长上下文、指令遵循和量化，不再只比较文件大小。自动档不会擅自下载十几
 GB 的模型，也不会让硬件性能档修改素材属性。16GB VRAM + 64GB RAM 会默认进入
-“高质量（较慢）”：Whisper `large-v3`、10 分钟分块、16K 上下文。
+“高质量（较慢）”：Whisper `large-v3`、10 分钟分块、32K 上下文。
 
 UI 启动时会检测本机 Ollama；若已安装但服务未运行，会自动启动后台 API，但不会
 加载模型或占用模型显存。Resolve 支持 C/D/其他盘的自定义安装位置，只在严格串行
@@ -201,20 +201,20 @@ MP4，并调用 DaVinci Resolve Python API 组装可继续精修的时间线。
 Whisper + OpenCV 子进程
           │ 完全退出，Windows 回收 CUDA 上下文
           ▼
-Qwen3.6 音乐导演初审（代表帧 + 台词 + 剧情）
-          │ 写出 music_brief.json，keep_alive=0 完全卸载
+Qwen3.6 中立全片审片（2fps 全覆盖 + 短动作最高 4fps 复审 + 台词）
+          │ 写出 footage_ledger / treatment / music_brief，keep_alive=0 卸载
           ▼
 CPU 联网/本地找歌 + Librosa/FFmpeg 音乐听诊
           │ 节拍、强拍、段落、调性、动态范围、LUFS；0 GPU
           ▼
-Qwen3.6 最终导演（镜头 + 1–3 段 cue + 留白 + 高潮命中点）
+Qwen3.6 最终导演（实测配乐 profile 参与画面节奏 + 锁画后精确 cue）
           │ 写出 timeline_cuts.json，keep_alive=0 完全卸载
           ▼
 FFmpeg CPU 合成 music_bed.wav
           │ 换歌、淡化、响度统一、对白 ducking
           ▼
 FFmpeg 预览渲染子进程
-          │ 生成真实转场、降噪与基础运动效果
+          │ 生成与 Resolve 同步的硬切、降噪与基础运动效果
           ▼
 DaVinci Resolve 执行子进程
           │ 原生效果 / DRX / 可选受保护 UI 宏 / 最终渲染
@@ -227,23 +227,37 @@ DaVinci Resolve 执行子进程
   总时长上限。多个视频及一小时以上素材会拆成多个窗口串行审片，再统一编排。
 - `timeline_cuts.json` 只在所有分块成功、校验和合并后原子写入。
 
-## 为什么默认改用 Qwen3.6-27B Dense Q8
+## 为什么分开 Qwen3.6 视觉审片与文字导演
 
-- `qwen3.6:27b-mtp-q8_0` 是 27B 全量稠密、原生图文模型，约 30GB；Q8 接近原始
-  权重精度，适合 16GB VRAM + 64GB RAM 混合推理。
+- 16GB VRAM 机器的 2fps 视觉审片优先已安装的 `qwen3.6:27b`；Ollama 当前该约 17GB 标签的量化级别为 Q4_K_M，能减少高密度传图时的 RAM/PCIe 抖动。
+- 视觉阶段完全卸载后，全局文字导演优先已安装的 `qwen3.6:27b-mtp-q8_0`；约 30GB，Q8 用于保留最终故事比较与结构决策精度。
 - 官方视频理解评测中，27B 在 VideoMME、VideoMMMU、MLVU、MVBench 上整体高于
   只激活约 3B 参数的 35B-A3B。后者更快，但本项目优先剪辑判断质量。
 - 旧 `Qwen2.5 72B Q5` 虽有更多参数，但模型代际更早、纯文本且约 54GB；参数数量
-  不能直接抵消 3.6 的新训练、原生视觉与指令遵循优势，因此不再作为默认导演。
+  不能直接抵消 3.6 的新训练、图像视觉能力与指令遵循优势，因此不再作为默认导演。
 
-同一 Qwen3.6 模型先结合关键帧与台词生成候选，再进行纯文字全局编排；始终只有一个
-模型驻留，也避免卸载、加载另一套 54GB 权重。分页文件脚本仍用于给 Windows 和长上下文
-保留安全余量：
+自动配置只会从 Ollama 实际已安装的标签中分别选择两个角色；若只安装一个兼容模型，则两阶段串行复用它，绝不自动下载不存在的权重。
+截至 2026-08-15，Qwen 官方没有可下载的“Qwen3.8-27B”本地权重；`qwen3.8-max-preview` 是托管预览名称，不能当作 Ollama 本地标签。
+项目不会伪造或默认一个官方未发布的模型名。参见 [Qwen Code 2026-07-23 更新](https://qwenlm.github.io/qwen-code-docs/en/blog/updates/weekly-update-2026-07-23/)。
+分页文件脚本仍用于给 Windows 和长上下文保留安全余量：
 
 ```powershell
 # 右键 scripts\configure_pagefile_admin.cmd，选择“以管理员身份运行”
 # 默认保留 C: 4–8GB，并在 D: 创建 32–48GB；脚本不会自动重启。
 ```
+
+### 当前视觉输入边界：完整有序采样，不是假装原生视频
+
+当前 Windows/Ollama 后端调用的是 Ollama 的 `images` 数组，传入按时间排序的 JPEG，
+**没有**把 MP4 作为连续视频流直接交给模型。这里的“完整审片”准确含义是：默认 2fps
+从头到尾无时间空洞、所有台词均保留、窗口按 Context 自适应且短动作会以最高 4fps 加密复审；
+它不等于观看原始 59.94fps 的每一帧，也不保留帧间光流或原始音轨作为模型视频输入。
+[Ollama Vision 文档](https://docs.ollama.com/capabilities/vision)目前公开的是图片输入。
+
+vLLM 已公开 OpenAI 兼容的 `video_url` 输入及视频解码后端，可作为未来的可选原生视频后端，
+但本仓库尚未实现该适配，不能写成现有能力；而且 vLLM 官方 GPU 安装以 Linux 为主，Windows
+需 WSL 或独立 Linux 模型节点。参见 [vLLM 多模态视频输入](https://docs.vllm.ai/en/latest/features/multimodal_inputs/)
+和 [vLLM GPU 安装要求](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/)。
 
 ## 八阶段证据优先自动成片能力
 
@@ -251,23 +265,24 @@ DaVinci Resolve 执行子进程
 
 1. **提取期**：每个视频单独启动 Whisper/OpenCV 子进程，写入台词、真实 JPEG
    关键帧和素材元数据；每个子进程退出后，父调度器再执行显存释放屏障。
-2. **音乐导演初审**：Qwen3.6 读取跨素材代表帧、台词和拍摄顺序，先确定主题、情绪
-   弧线、检索词、乐器、BPM 范围、人声策略、1–3 个 cue 和有意留白，分别写入
-   `director_treatment.json` 与 `music_brief.json`，随后完全卸载。
+2. **中立全片审片与音乐初审**：Qwen3.6 先不带主题偏见地读完 2fps 画面、台词与拍摄顺序，再对不超过 8 秒的动作原子以最高 4fps 复看精确边界，落盘
+   `footage_ledger.json`，再比较多个可被真实时间码证明的故事方向，生成 `director_treatment.json` 和
+   `music_brief.json`。音乐简报包含情绪弧线、检索词、乐器、BPM、1–3 个 cue 和有意留白，随后模型完全卸载。
 3. **候选获取与听诊（CPU）**：可选本地授权曲库、带许可证链接的 Jamendo，或显式
    确认后的 yt-dlp 任意在线模式。Librosa/FFmpeg 提取 BPM、全部节拍、强拍、近似
    downbeat、能量段落、整曲能量走势、峰值位置、调性、动态范围和 EBU R128 LUFS，写入
    `music_analysis.json`；候选会按 BPM、检索语义和是否满足“渐强/高潮”弧线综合排序。
-4. **全片事实审计与事件契约**：Qwen3.6 再次加载，按顺序审看全片每秒视觉证据与台词；内部 16 秒重叠
-   批次只负责适配上下文，不抽掉中间采样，并通过滚动连续性摘要理解完整素材。过程会落盘
-   检查点。正式选镜头前，独立的证据角色必须用真实 `candidate_id` 写出人物、目标、状态变化
+4. **证据契约与全局编排**：文字导演加载后读取已通过指纹验证的完整证据账本、`music_analysis.json`
+   中经过人声排除的候选及其 BPM、段落和能量 profile，不再用旧的 v2 候选缓存。
+   正式选镜头前，独立的证据角色必须用真实 `candidate_id` 写出人物、目标、状态变化
    和最终可见状态；不足三个已审计状态变化时，不允许硬编因果/BTS 剧情，而会诚实选择人物
    小品或情绪蒙太奇。所有可剪候选都会进入文字导演，不再由
    Python 固定截成 Top 21/28；完整候选表能放入上下文时一次总审，超长项目则由同一导演
    按时间顺序分页审完全部候选后再汇总。`timeline_cuts.json` 会记录每页输入和晋级 ID，
    便于确认没有候选未经导演审阅。镜头时长按角色动态限制：B-roll 10 秒、
    桥段 12 秒、语境 20 秒、高潮 25 秒、结尾 30 秒、完整采访语义最长 45 秒。
-   镜头在选中时就标记自然声、踩拍、乐句开头、递进、高潮命中或释放；本地校验器再从
+   画面编排不是先忽略音乐：导演先根据可用曲目的实测 `score_profiles` 设计镜长、递进与高潮，
+   镜头在选中时就标记自然声、踩拍、乐句开头、递进、高潮命中或释放；锁画后第二个受约束请求再从
    真实强拍/downbeat 补齐 2–6 个有效同步点。一般纯画面在 ±0.45 秒、高潮在最多 ±0.75 秒
    内吸附，采访对白绝不为卡点截断。
 5. **画面编排与陌生观众盲审**：画面导演和总剪辑师完成方案后，另一个隔离 Prompt 只看到
@@ -283,14 +298,21 @@ DaVinci Resolve 执行子进程
    Isolation、基础 CDL、`Stabilize()`、`CreateMagicMask()` 和 `SmartReframe()`；
    用户导出的 DRX 通过节点图 `ApplyGradeFromDRX()` 注入。Resolve 21 已原生公开
    防抖与 Magic Mask 接口，因此默认不使用脆弱的坐标宏。
+   字卡不走未公开、不可稳定自动插入的 Text+ 路径；每一项会渲染成经帧数、分辨率与 alpha
+   校验的短 ProRes 4444 透明片段，并按精确 record frame 放到 V2。
    启用 UI 中“Resolve 导出最终成片”后，执行器创建 Render Job、启动
    渲染、持续报告百分比并校验完成状态；默认沿用当前 Deliver 页面格式/编码设置，
    也可填写一个现有的 Resolve 渲染预设名。
 
-### 先锁画面，再配音乐与字卡
+### 先以实测配乐设计画面节奏，锁画后再精确 cue 与字卡
 
-全局导演现在必须先完成可校验的 **picture lock（画面锁定）**。每个入选镜头都要给出
-精确的源素材裁切范围、叙事功能、观众从该镜头获得的新信息、声音意图和音乐剪辑角色。
+配乐与画面采用两级耦合，而不是“完全锁画后才第一次看音乐”。文字导演在选镜头之前先读取
+候选曲目的实测 `score_profiles`（BPM、段落、能量走势与是否真的存在高潮），据此设计镜长、
+递进、自然声留白和 `music_edit_role`。画面通过证据契约、总剪辑复审和陌生观众盲审后形成
+可校验的 **picture lock（画面锁定）**；随后单独的 Schema 受约束请求才根据最终时间线边界、
+精确对白区间、强拍和 downbeat 写出 0–3 段 cue。这样既让镜头节奏从一开始就能服务真实音乐，
+又避免后续画面变动让高潮命中点落到不存在的剪点上。每个入选镜头都要给出精确的源素材裁切
+范围、叙事功能、观众从该镜头获得的新信息、声音意图和音乐剪辑角色。
 系统会把关于麦克风、滤镜、站位和重复拍摄的对白标记为“可能的制作现场语境”，但该标记
 只提供给导演参考，绝不自动裁切或静音。导演会结合主题自行决定排除、保留对白、作为环境
 质感、与音乐混合或完全静音；执行层只忠实落实导演写入 `audio_intent` 的选择。
@@ -331,12 +353,13 @@ Whisper 的结构性静音幻听也会在新提取及读取旧 `raw_data.json` �
 Ollama 读取超时设为 7200 秒（2 小时），期间每 15 秒发送真实耗时心跳；慢推理不再因旧的
 1800 秒上限被误判失败。命令行用户仍可通过 `--ollama-timeout` 明确调整。
 
-音乐导演只在最终镜头和时长确定后工作，cue 与同步点必须落在真实镜头边界；对白 ducking
-按台词的精确时间区间执行，不再把整条素材都压低。CPU 音乐床渲染后还会测量实际峰值，
+锁画后的 cue 导演只负责精确选曲段、进出点与同步点；画面节奏在更早的镜头编排阶段已经参考
+实测配乐 profile。对白 ducking 按台词的精确时间区间执行，不再把整条素材都压低。CPU 音乐床渲染后还会测量实际峰值，
 全静音或近似静音的 WAV 会令阶段明确失败，不能悄悄进入 Resolve。导演可输出标题卡、
 章节、人物下三分之一和结尾卡；同一份 `graphics_plan` 会在 FFmpeg 预览中绘制，并在
-Resolve 中插入可编辑 Text+。字卡用于明确主题或主动选择另类风格，不能用来掩盖无意义
-的镜头选择。
+Resolve 中渲染为短 ProRes 4444 透明片段并放置到 V2。该路径保证预览与最终时间线的字卡
+画面和帧位置一致，但它不是可编辑 Text+；要修改文字，应修改 `graphics_plan` 后重新执行。
+字卡用于明确主题或主动选择另类风格，不能用来掩盖无意义的镜头选择。
 
 ### 任意在线音频模式与版权
 
@@ -436,8 +459,9 @@ CyberEditor-Agent/
 ### 最低建议
 
 - Windows 10/11 64 位
-- Python 3.12 64 位
-- 16GB 系统内存；运行 32B/70B 混合推理时建议 32–64GB
+- Python 3.11 或 3.12 64 位
+- 16GB 系统内存只适合开发、测试或更小模型；本项目默认的 27B Q4/Q8 串行质量档建议 64GB，
+  70B 混合推理建议 128GB 以上
 - 至少 20GB 可用磁盘空间，另加代理素材和模型空间
 - FFmpeg
 - Ollama
@@ -445,17 +469,30 @@ CyberEditor-Agent/
 
 ### 模型建议
 
-| 设备 | Whisper | Ollama 建议 | 说明 |
-|---|---|---|---|
-| 核显/纯 CPU | `tiny` / `base` | Qwen 3.6 27B Q4（很慢） | 可运行但建议更小视觉模型 |
-| 8–12GB VRAM | `small` / `turbo` | `qwen3.6:27b-mtp-q4_K_M` | 约 18GB，RAM/GPU 混合 |
-| 16GB VRAM | `large-v3` | `qwen3.6:27b-mtp-q4_K_M` | 约 18GB，大部分权重可卸载至 GPU |
-| 16GB VRAM + 64GB RAM | `large-v3` | `qwen3.6:27b-mtp-q8_0` | 约 30GB，稠密 Q8，质量优先默认档 |
-| 24GB+ VRAM | `large-v3` | Qwen 3.6 27B Q8 | 仍建议保留串行策略 |
+| 设备 | Whisper | 视觉审片 | 全局文字导演 | 定位 |
+|---|---|---|---|---|
+| 当前 Quadro RTX 5000 Max-Q 16GB + 64GB RAM | `large-v3` | `qwen3.6:27b` Q4_K_M | `qwen3.6:27b-mtp-q8_0` | 能跑完整串行路径；Q8 必须 RAM/VRAM 混合，长片会很慢，不能原生连续视频输入 |
+| 单 RTX 5090 32GB + 128/192GB RAM | `large-v3` | Qwen3.6-27B Q8 | Qwen3.6-27B Q8；可评测更大纯文字模型 | 消费级 Windows 首选；32GB 仍需给视觉编码器、KV cache 和 Context 留空间，不能假定 30GB 权重始终全驻显存 |
+| RTX PRO 6000 Blackwell 96GB + 256GB RAM | `large-v3` | Qwen3.6-27B 高精度权重 | 经本项目评测后再启用 70B 级文字导演 | 目前最稳妥的单卡 Windows 工作站上限；容量显著更宽裕，成本和 600W 供电/散热也显著更高 |
+| Mac Studio M3 Ultra 512GB 统一内存 | 独立提取或模型节点 | 可容纳更大 MLX 多模态权重 | 可容纳更大本地文字权重 | 容量优先的局域网模型节点；当前注册表、Worker 与 Resolve 自动化是 Windows 路径，不能直接替换而无需后端迁移 |
 
-你的 16GB Quadro + 64GB RAM 默认选择 `qwen3.6:27b-mtp-q8_0`；若更看重速度和
-磁盘空间，则选择 Q4_K_M。两者都支持文字、图片与思考模式：
-[Qwen 3.6 on Ollama](https://ollama.com/library/qwen3.6)。
+你的 16GB Quadro + 64GB RAM 不需要为验证这次架构立即换机；默认就是 `qwen3.6:27b`
+Q4 视觉审片 + `qwen3.6:27b-mtp-q8_0` 最终文字导演，代价是大量混合内存推理和等待。
+若购买新的单机 Windows 主机，单 RTX 5090 32GB + 128GB（更推荐 192GB）RAM 是消费级首选；
+若预算优先于价格，RTX PRO 6000 Blackwell 96GB + 256GB RAM 才是更合适的单卡 Windows
+本地模型/Resolve 一体工作站。双 5090 没有 NVLink，64GB 合计显存不等于一张 64GB 显卡，
+跨卡推理会受 PCIe 和推理后端的切分策略限制。
+
+更快/更大的硬件只会扩大可用模型、Context 和吞吐，**不会自动修复错误的叙事流程、素材中未拍到的
+事件、错误音乐候选或缺少人工参考评测**。本次架构中，中立证据账本、实测配乐参与画面节奏、
+锁画后 cue、陌生观众盲审和人工参考 benchmark，比单纯把 27B 换成更大模型更直接地决定成片是否
+像人剪的；任何配置都不承诺自动达到专业人类剪辑师水平。
+
+模型说明：[Qwen3.6-27B 官方权重](https://huggingface.co/Qwen/Qwen3.6-27B) 和
+[Qwen 3.6 on Ollama](https://ollama.com/library/qwen3.6)。硬件规格参见
+[GeForce RTX 5090](https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/)、
+[RTX PRO 6000 Blackwell](https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/rtx-pro-6000/)
+和 [Mac Studio](https://www.apple.com/mac-studio/specs/)。
 
 Whisper 官方列出的近似显存占用从 tiny/base 的约 1GB 到 turbo 的约 6GB：
 [OpenAI Whisper README](https://github.com/openai/whisper#available-models-and-languages)。
@@ -513,16 +550,17 @@ Whisper 需要系统 FFmpeg；其官方安装和 Python 调用方式见
 
 ### 3. 准备 Ollama
 
-质量优先（16GB VRAM + 64GB RAM，下载约 30GB，运行较慢）：
+质量优先且分离视觉/文字角色（16GB VRAM + 64GB RAM，合计约 47GB）：
 
 ```powershell
+ollama pull qwen3.6:27b
 ollama pull qwen3.6:27b-mtp-q8_0
 ```
 
-更快、更省磁盘的高质量选择（约 18GB）：
+只保留一个较小模型时，两阶段可串行复用 Q4（约 17GB，最终文字导演精度低于 Q8）：
 
 ```powershell
-ollama pull qwen3.6:27b-mtp-q4_K_M
+ollama pull qwen3.6:27b
 ```
 
 模型只需下载一次。之后 UI 会自动启动 Ollama 服务并优先选择已安装的高质量模型，
@@ -551,7 +589,8 @@ Studio 的 External Scripting 仍需预先设置一次为 `Local`。
 ```powershell
 python main.py `
   --input-folder "D:\Documentary\Camera originals" `
-  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "qwen3.6:27b" `
+  --director-model "qwen3.6:27b-mtp-q8_0" `
   --project-fps 23.976 `
   --chunk-minutes 10
 ```
@@ -563,7 +602,8 @@ python main.py `
   --video "D:\Shoot\A001.mp4" `
   --video "D:\Shoot\B001.mp4" `
   --input-folder "D:\Shoot\B-roll" `
-  --ollama-model "qwen3.6:27b-mtp-q8_0"
+  --ollama-model "qwen3.6:27b" `
+  --director-model "qwen3.6:27b-mtp-q8_0"
 ```
 
 默认输出：
@@ -572,6 +612,7 @@ python main.py `
 data/raw_data.json
 data/assets/<asset_id>/transcript.srt
 data/assets/<asset_id>/keyframes/*.jpg
+data/footage_ledger.json
 data/director_treatment.json
 data/music_brief.json
 data/music_analysis.json
@@ -590,7 +631,8 @@ data/cybereditor.log
 # 已有 raw_data.json，只重跑导演与 Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "qwen3.6:27b" `
+  --director-model "qwen3.6:27b-mtp-q8_0" `
   --creative-brief "按拍摄时间讲述团队从准备到完成动作的过程" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
@@ -599,7 +641,8 @@ python main.py --skip-extraction `
 
 # 任意在线候选（更推荐在 UI 中运行，以看到完整、不可跳过的警告）
 python main.py --skip-extraction --skip-resolve `
-  --ollama-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "qwen3.6:27b" `
+  --director-model "qwen3.6:27b-mtp-q8_0" `
   --music-provider yt_dlp --music-candidate-limit 8 `
   --music-rights-confirmed `
   --music-rights-claim "我拥有下载、改编、同步和使用候选音频所需的权利，并会遵守来源平台条款"
@@ -688,8 +731,8 @@ from src.resolve_executor import DaVinciExecutor
       "reason_for_cut": "完整表达主题观点",
       "confidence": 0.9,
       "story_role": "interview",
-      "transition_to_next": "cross_dissolve",
-      "transition_duration_sec": 0.5,
+      "transition_to_next": "cut",
+      "transition_duration_sec": 0.0,
       "audio_cleanup": "strong",
       "color_look": "warm",
       "motion": "gentle_push_in"
@@ -703,18 +746,24 @@ from src.resolve_executor import DaVinciExecutor
 
 ## 鲁棒性边界
 
-- “完整审片”指默认从头到尾审看每秒一张视觉证据和全部台词，不是让 VLM 解码原始
-  59.94 fps 的每一帧；一小时素材约审看 3600 张图。全部采样会按重叠批次传输且不再
-  二次抽样，这是长片完整时间覆盖与本地上下文限制之间的明确边界。
-- Resolve 公共脚本 API 没有稳定的通用转场插入方法。FFmpeg 预览会真正执行 AI 选择
-  的转场/降噪/运动效果；Resolve 时间线应用 Voice Isolation、CDL、缩放等受支持效果，
-  并用片段标记保留完整效果计划，供后续人工精修。
+- “完整审片”指默认从头到尾审看 2fps 视觉证据和全部台词，不是让 VLM 解码原始
+  59.94 fps 的每一帧；一小时素材约审看 7200 张图。“完整”表示时间轴无空洞，不表示单次请求；
+  初始 10 秒核心窗口会按实际文字/Schema/图片 token 预算自适应缩短，单次最多 32 图，并用滚动
+  连续性账本串起全片。随后所有不超过 8 秒的候选动作会以最高 4fps 二次复审入点/顶点/出点，
+  长对白则保留 Whisper 边界。这是 Ollama 图片序列方案，不是 MP4 原生连续视频理解。
+- Resolve 公共脚本 API 没有稳定的通用转场插入方法。为避免 FFmpeg 预览、节目原声与 Resolve
+  成片因重叠时长不同而失步，当前执行路径统一使用硬切；模型请求的叠化/淡黑只保留为审计提示。
+  FFmpeg 预览仍执行降噪/运动计划，Resolve 时间线应用 Voice Isolation、CDL、缩放等受支持效果，
+  并用片段标记保留完整计划，供后续人工精修。
+- Resolve 的公开脚本 API 也没有可靠的 Text+ 创建/文本写入契约；当前实现把每项字卡渲染成
+  独立、短时长、已校验 alpha 的 ProRes 4444 片段放到 V2。因此成片可复现，但字卡不是原生
+  可编辑 Text+。
 - 普通 Rec.709 计划可复用当前空工程；需要 PP8 技术还原且当前工程已有时间线时，脚本
   会创建独立 `Director Cut` 工程，防止全局色彩设置污染已有项目。
 - 如果中途某个 Resolve 片段追加失败，API 没有可靠事务回滚；日志会指出已追加
   数量，用户需要检查时间线并撤销。
 - 视觉理解由支持图片输入的 Ollama 模型完成。普通 `qwen2.5:3b` 是纯文本烟雾测试
-  模型，不能用于此多模态流程；质量优先时建议使用 `qwen3.6:27b-mtp-q8_0`。
+  模型，不能用于此多模态流程；16GB VRAM 高密度视觉审片建议 `qwen3.6:27b`（Q4_K_M），文字总导演建议 `qwen3.6:27b-mtp-q8_0`。
 
 ## 测试
 
@@ -724,6 +773,10 @@ from src.resolve_executor import DaVinciExecutor
 python -m unittest discover -s tests -v
 python -m compileall -q main.py src tests
 ```
+
+项目还提供 [人工参考剪辑评测](evals/README.md)，可在固定测试素材上比较素材选择
+F1、剪辑边界误差、镜头顺序、重复镜头和时长偏差。它用于量化版本回退，不能代替
+故事清晰度、情绪、音乐和表演选择的人工盲测。
 
 ## 隐私
 

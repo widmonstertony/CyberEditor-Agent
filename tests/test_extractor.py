@@ -87,10 +87,10 @@ class MediaExtractorTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["end_sec"], 12.512)
 
-    def test_default_visual_policy_is_full_one_fps_coverage(self):
-        self.assertEqual(self.extractor.sample_interval_sec, 1.0)
-        self.assertEqual(self.extractor.min_keyframe_gap_sec, 1.0)
-        self.assertEqual(self.extractor.max_keyframes, 7200)
+    def test_default_visual_policy_is_full_two_fps_coverage(self):
+        self.assertEqual(self.extractor.sample_interval_sec, 0.5)
+        self.assertEqual(self.extractor.min_keyframe_gap_sec, 0.5)
+        self.assertEqual(self.extractor.max_keyframes, 14400)
 
     def test_write_srt_utf8(self):
         with tempfile.TemporaryDirectory() as temporary:

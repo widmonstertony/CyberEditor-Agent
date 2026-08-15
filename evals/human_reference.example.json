@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "benchmark_id": "synthetic-documentary-example-v1",
+  "target_duration_sec": 13.0,
+  "clips": [
+    {
+      "clip_id": "human-001",
+      "source_id": "sample-interview-a",
+      "file_name": "sample_interview_a.mp4",
+      "cut_in_sec": 2.0,
+      "cut_out_sec": 6.0,
+      "editor_note": "Opening statement / 开场观点"
+    },
+    {
+      "clip_id": "human-002",
+      "source_id": "sample-b-roll-b",
+      "file_name": "sample_b_roll_b.mp4",
+      "cut_in_sec": 10.0,
+      "cut_out_sec": 14.0,
+      "editor_note": "Visual proof / 视觉论据"
+    },
+    {
+      "clip_id": "human-003",
+      "source_id": "sample-interview-a",
+      "file_name": "sample_interview_a.mp4",
+      "cut_in_sec": 20.0,
+      "cut_out_sec": 23.0,
+      "editor_note": "Resolution line / 收束台词"
+    },
+    {
+      "clip_id": "human-004",
+      "source_id": "sample-reaction-c",
+      "file_name": "sample_reaction_c.mp4",
+      "cut_in_sec": 4.0,
+      "cut_out_sec": 6.0,
+      "editor_note": "Final reaction / 结尾反应"
+    }
+  ]
+}

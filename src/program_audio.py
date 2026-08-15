@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 import logging
 import math
@@ -28,6 +29,8 @@ import shutil
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Sequence
+
+from .frame_edl import FrameEDLError, validate_frame_edl
 
 
 LOGGER_NAME = "cybereditor.program_audio"
@@ -140,29 +143,62 @@ class ProgramAudioRenderer:
         Returns / 返回:
             Command argument list and program duration. / 命令参数列表与成片时长。
         """
+        try:
+            frame_edl = validate_frame_edl(payload)
+        except FrameEDLError as exc:
+            raise ProgramAudioError(
+                f"现场声需要统一帧时间表 / Production audio requires frame_edl: {exc}"
+            ) from exc
+        project_fps = Decimal(str(frame_edl["project_fps"]))
+        schedule_entries = frame_edl["clips"]
         inputs: List[str] = []
         filters: List[str] = []
         labels: List[str] = []
         program_duration = 0.0
-        for index, raw in enumerate(payload.get("clips", [])):
+        for index, (raw, frame_entry) in enumerate(
+            zip(payload.get("clips", []), schedule_entries)
+        ):
             if not isinstance(raw, dict):
                 raise ProgramAudioError(f"clips[{index}] 必须是对象 / must be an object.")
             source = Path(str(raw.get("file_name") or "")).expanduser().resolve()
             if not source.is_file():
                 raise ProgramAudioError(f"找不到原声素材 / Source file not found: {source}")
-            cut_in = self._finite_number(raw.get("cut_in_sec"), f"clips[{index}].cut_in_sec")
-            cut_out = self._finite_number(raw.get("cut_out_sec"), f"clips[{index}].cut_out_sec")
-            duration = cut_out - cut_in
-            if cut_in < 0 or duration <= 0:
+            source_fps = Decimal(str(frame_entry["source_fps"]))
+            source_in_frame = int(frame_entry["source_frame_in"])
+            source_out_frame = int(frame_entry["source_frame_out_exclusive"])
+            record_frames = int(frame_entry["record_frame_count"])
+            cut_in = float(Decimal(source_in_frame) / source_fps)
+            cut_out = float(Decimal(source_out_frame) / source_fps)
+            source_duration = cut_out - cut_in
+            duration = float(Decimal(record_frames) / project_fps)
+            if cut_in < 0 or source_duration <= 0 or duration <= 0:
                 raise ProgramAudioError(f"clips[{index}] 时间范围无效 / invalid source range.")
             input_index = index
-            has_audio = self._has_audio_stream(source)
+            audio_intent = str(
+                raw.get("audio_intent") or "natural_texture"
+            ).casefold()
+            muted_by_director = audio_intent == "mute_for_music"
+            has_audio = self._has_audio_stream(source) and not muted_by_director
             if has_audio:
                 inputs.extend(["-i", str(source)])
                 chain = [
                     f"[{input_index}:a:0]atrim=start={cut_in:.6f}:end={cut_out:.6f}",
                     "asetpts=PTS-STARTPTS",
                 ]
+                # The picture range is source-frame quantized and Resolve must
+                # represent that duration on an integer project-frame grid. A
+                # tiny deterministic atempo correction fits the same complete
+                # source interval to the exact record-frame duration, preventing
+                # every edit boundary from accumulating a fractional-frame slip.
+                # 画面先按源帧量化，再落到整数工程帧；用极小且确定性的 atempo 修正
+                # 将完整源区间贴合记录帧时长，避免每个剪点累计亚帧漂移。
+                tempo = source_duration / duration
+                if not 0.5 <= tempo <= 2.0:
+                    raise ProgramAudioError(
+                        f"clips[{index}] 源/记录时长比例异常 / source-record ratio is unsafe: {tempo:.6f}"
+                    )
+                if abs(tempo - 1.0) >= 0.000001:
+                    chain.append(f"atempo={tempo:.9f}")
             else:
                 inputs.extend(
                     [
@@ -182,12 +218,19 @@ class ProgramAudioRenderer:
                 ]
             )
             cleanup = str(raw.get("audio_cleanup") or "light").casefold()
+            if muted_by_director:
+                cleanup = "none"
             if cleanup == "strong":
                 chain.extend(["highpass=f=90", "lowpass=f=15000", "afftdn=nr=16:nf=-30"])
             elif cleanup == "light":
                 chain.extend(["highpass=f=70", "lowpass=f=17000", "afftdn=nr=9:nf=-36"])
-            has_dialogue = bool(raw.get("has_dialogue"))
+            has_dialogue = bool(raw.get("has_dialogue")) and not muted_by_director
             gain = self._finite_number(raw.get("volume_db", 0), f"clips[{index}].volume_db")
+            if muted_by_director:
+                # The director's explicit audio intent is authoritative.  A
+                # dialogue flag must never clamp an intended mute back to -3 dB.
+                # 导演明确要求静音时，对白标记不得把 -60 dB 又钳回 -3 dB。
+                gain = 0.0
             if has_dialogue:
                 # The model may describe relative emphasis, but it must never bury
                 # spoken content. Normalize every spoken cut and permit only a
@@ -276,6 +319,8 @@ class ProgramAudioRenderer:
             "codec": "pcm_s24le",
             "rendered_at_utc": datetime.now(timezone.utc).isoformat(),
             "picture_cut_count": len(payload["clips"]),
+            "frame_edl_fingerprint": str(payload["frame_edl"]["fingerprint"]),
+            "total_record_frames": int(payload["frame_edl"]["total_record_frames"]),
         }
         self._atomic_write_json(payload, self.timeline_path)
         return self.output_path
