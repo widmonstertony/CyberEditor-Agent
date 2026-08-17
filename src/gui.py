@@ -685,7 +685,10 @@ def recommend_automatic_settings(
             elif "q6_k" in normalized:
                 role_bonus += 150.0
             elif "q4_k_m" in normalized:
-                role_bonus += 45.0
+                # A newer Qwen3.8 Q4 remains preferable to a legacy Qwen3.6
+                # Q8 while the 3.8 Q8 quality tier is still being installed.
+                # 新版 3.8 Q4 仍应优先于旧 3.6 Q8，避免升级期间导演回退。
+                role_bonus += 160.0
         elif "qwen3.6:27b" in normalized:
             if "mtp" in normalized:
                 role_bonus += 120.0

@@ -433,6 +433,27 @@ class WorkflowOptionsTests(unittest.TestCase):
         )
         self.assertEqual(recommendation["effective_num_ctx"], 32768)
 
+    def test_qwen38_q4_does_not_fall_back_to_legacy_qwen36_q8(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {"ram_gb": 64, "vram_gb": 16, "cpu_threads": 16, "torch_cuda": True},
+            [
+                {
+                    "name": "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+                    "size": 19 * 1024**3,
+                },
+                {"name": "qwen3.6:27b-mtp-q8_0", "size": 30 * 1024**3},
+            ],
+        )
+
+        self.assertEqual(
+            recommendation["ollama_model"],
+            "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+        )
+        self.assertEqual(
+            recommendation["director_model"],
+            "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+        )
+
     def test_auto_profile_reports_72b_effective_context_without_rewriting_request(self) -> None:
         recommendation = recommend_automatic_settings(
             {"ram_gb": 64, "vram_gb": 16, "cpu_threads": 16, "torch_cuda": True},
