@@ -1400,6 +1400,29 @@ class AIDirectorTests(unittest.TestCase):
         self.assertEqual(len(generation_posts), 1)
         self.assertIs(generation_posts[0]["think"], False)
 
+    def test_qwen38_structured_json_disables_thinking_on_literal_first_attempt(self):
+        session = FakeSession()
+        director = self.make_director(
+            model="hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
+            session=session,
+        )
+
+        result = director._request_json(
+            "Return one decision.",
+            {
+                "type": "object",
+                "properties": {"decisions": {"type": "array"}},
+                "required": ["decisions"],
+            },
+        )
+
+        self.assertIn("decisions", result)
+        generation_posts = [
+            item for item in session.posts if item.get("keep_alive") != 0
+        ]
+        self.assertEqual(len(generation_posts), 1)
+        self.assertIs(generation_posts[0]["think"], False)
+
     def test_final_director_splits_picture_and_music_contexts(self):
         session = VisionSession()
         director = self.make_director(session=session)

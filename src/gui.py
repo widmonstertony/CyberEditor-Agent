@@ -597,6 +597,7 @@ def recommend_automatic_settings(
         # long-context reasoning, and quantization—not simply file size.
         # 剪辑质量取决于指令遵循、中文、长上下文与量化，而非只看文件大小。
         family_scores = (
+            ("qwen3.8-27b", 1400.0),
             ("qwen3.6:27b", 1200.0),
             ("qwen3.6:35b-a3b", 1160.0),
             ("qwen3.5:35b-a3b", 1000.0),
@@ -629,7 +630,17 @@ def recommend_automatic_settings(
         name, size_gb, quality = item
         normalized = name.casefold()
         role_bonus = 0.0
-        if "qwen3.6:27b" in normalized:
+        if "qwen3.8-27b" in normalized:
+            # The official GGUF Q4_K_M is the stable dense-vision default on
+            # 16 GiB GPUs; Q8 remains reserved for serial text direction.
+            # 16 GiB 显卡用官方 GGUF Q4 稳定审片；Q8 留给串行文字导演。
+            if "q4_k_m" in normalized:
+                role_bonus = 360.0
+            elif "q8_0" in normalized:
+                role_bonus = 140.0
+            else:
+                role_bonus = 200.0
+        elif "qwen3.6:27b" in normalized:
             # On a 16 GiB GPU, Q4_K_M minimizes PCIe/RAM churn while every
             # half-second frame is inspected. MTP Q8 is reserved for the later
             # text-only global assembly when both installed tags are present.
@@ -654,7 +665,7 @@ def recommend_automatic_settings(
         if any(
             marker in item[0].casefold()
             for marker in (
-                "qwen3.6", "qwen3.5", "qwen2.5-vl", "gemma3", "llava", "minicpm-v",
+                "qwen3.8", "qwen3.6", "qwen3.5", "qwen2.5-vl", "gemma3", "llava", "minicpm-v",
             )
         )
     ]
@@ -668,7 +679,14 @@ def recommend_automatic_settings(
         name, size_gb, quality = item
         normalized = name.casefold()
         role_bonus = 0.0
-        if "qwen3.6:27b" in normalized:
+        if "qwen3.8-27b" in normalized:
+            if "q8_0" in normalized:
+                role_bonus += 240.0
+            elif "q6_k" in normalized:
+                role_bonus += 150.0
+            elif "q4_k_m" in normalized:
+                role_bonus += 45.0
+        elif "qwen3.6:27b" in normalized:
             if "mtp" in normalized:
                 role_bonus += 120.0
             if "q8_0" in normalized:
@@ -885,8 +903,8 @@ class WorkflowOptions:
     language: str = ""
     sample_interval: float = 0.5
     max_keyframes: int = 14400
-    ollama_model: str = "qwen3.6:27b"
-    director_model: str = "qwen3.6:27b-mtp-q8_0"
+    ollama_model: str = "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M"
+    director_model: str = "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"
     ollama_url: str = "http://localhost:11434"
     chunk_minutes: float = 12.0
     project_fps: float = 25.0
@@ -1350,8 +1368,12 @@ class CyberEditorApp:
         self.whisper_var = tk.StringVar(value="small")
         self.device_var = tk.StringVar(value="auto")
         self.language_var = tk.StringVar()
-        self.ollama_model_var = tk.StringVar(value="qwen3.6:27b")
-        self.director_model_var = tk.StringVar(value="qwen3.6:27b-mtp-q8_0")
+        self.ollama_model_var = tk.StringVar(
+            value="hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M"
+        )
+        self.director_model_var = tk.StringVar(
+            value="hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"
+        )
         self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
         self.chunk_var = tk.DoubleVar(value=12.0)
         self.fps_var = tk.DoubleVar(value=25.0)
@@ -1565,6 +1587,8 @@ class CyberEditorApp:
             ttk.Combobox,
             textvariable=self.ollama_model_var,
             values=(
+                "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+                "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
                 "qwen3.6:27b",
                 "qwen3.6:27b-q4_K_M",
                 "qwen3.6:27b-mtp-q8_0",
@@ -1635,6 +1659,8 @@ class CyberEditorApp:
             ttk.Combobox,
             textvariable=self.director_model_var,
             values=(
+                "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
+                "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
                 "qwen3.6:27b-mtp-q8_0",
                 "qwen3.6:27b-q4_K_M",
             ),

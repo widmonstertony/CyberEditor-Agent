@@ -349,13 +349,13 @@ process exit as a hard VRAM barrier:
 Whisper + OpenCV child process
           │ exits completely; Windows releases the CUDA context
           ▼
-Qwen3.6 neutral whole-footage review (2-fps coverage + up-to-4-fps short-atom rewatch + dialogue)
+Qwen3.8 neutral whole-footage review (2-fps coverage + up-to-4-fps short-atom rewatch + dialogue)
           │ writes footage ledger, treatment, and music brief; then unloads
           ▼
 CPU local/network retrieval + Librosa/FFmpeg music analysis
           │ beats, strong beats, sections, key, dynamics, LUFS; zero GPU
           ▼
-Qwen3.6 final director (score-informed picture rhythm + exact post-lock cues)
+Qwen3.8 final director (score-informed picture rhythm + exact post-lock cues)
           │ writes timeline_cuts.json, then fully unloads
           ▼
 FFmpeg CPU render of music_bed.wav
@@ -380,28 +380,29 @@ DaVinci Resolve executor child process
 - `timeline_cuts.json` is written atomically only after every chunk succeeds
   and all decisions are validated and merged.
 
-## Why vision review and text direction use separate Qwen3.6 roles
+## Why vision review and text direction use separate Qwen3.8 roles
 
 - On a 16 GB GPU, dense 2-fps visual review prefers the installed
-  `qwen3.6:27b` tag, which Ollama currently reports as Q4_K_M. Its roughly
-  17 GB weights reduce RAM/PCIe churn
+  `hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M` model. Its roughly
+  19 GB Q4_K_M weights reduce RAM/PCIe churn
   while thousands of images are inspected.
 - After the vision model is fully unloaded, the global text director prefers
-  an installed `qwen3.6:27b-mtp-q8_0` tag. Its roughly 30 GB Q8 weights retain
+  `hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0`. Its roughly 28.6 GB Q8 weights retain
   more fidelity for final story comparison and structure decisions.
 - Official video benchmarks generally place dense 27B above 35B-A3B on
   VideoMME, VideoMMMU, MLVU, and MVBench. The sparse model is faster; this
   project prioritizes editorial judgment.
 - The older text-only Qwen2.5 72B Q5 is about 54 GB. Parameter count alone does
-  not guarantee better directing than Qwen3.6's newer image-vision and instruction
+  not guarantee better directing than Qwen3.8's newer native vision and instruction
   post-training.
 
-Automatic configuration chooses both roles only from tags that Ollama actually
+Automatic configuration chooses both roles only from models that Ollama actually
 reports as installed. If only one compatible model exists, the two serial stages
-reuse it; CyberEditor never silently downloads or invents another tag. As of
-2026-08-15, Qwen has not released downloadable local weights named
-“Qwen3.8-27B.” `qwen3.8-max-preview` is a hosted preview name, not an Ollama local
-model tag; see the [Qwen Code 2026-07-23 update](https://qwenlm.github.io/qwen-code-docs/en/blog/updates/weekly-update-2026-07-23/).
+reuse it. Qwen3.8-27B was released on 2026-08-14. This project runs the ggml-org
+GGUF by direct Hugging Face reference because Ollama's public library does not yet
+provide a first-party short tag that the project can depend on. See the
+[official Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B) and
+[ggml-org GGUF repository](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF).
 
 A page-file safety margin remains recommended. Right-click
 `scripts\configure_pagefile_admin.cmd` and run it as Administrator to keep a
@@ -431,7 +432,7 @@ The implementation now follows this strict serial chain:
 1. **Extraction**: each video gets its own Whisper/OpenCV child process, which
    writes dialogue, real JPEG keyframes, and media metadata. The process exits
    before the parent crosses the VRAM-release barrier.
-2. **Neutral full review and first music pass**: Qwen3.6 first reads all 2-fps
+2. **Neutral full review and first music pass**: Qwen3.8 first reads all 2-fps
    evidence, dialogue, and shoot order without a predetermined theme, then
    rewatches every event atom up to eight seconds at up to 4 fps and writes
    `footage_ledger.json`. It compares multiple story concepts that cite real
@@ -604,14 +605,14 @@ CyberEditor-Agent/
 
 | Hardware | Whisper | Vision reviewer | Global text director | Positioning |
 |---|---|---|---|---|
-| Current Quadro RTX 5000 Max-Q 16 GB + 64 GB RAM | `large-v3` | `qwen3.6:27b` Q4_K_M | `qwen3.6:27b-mtp-q8_0` | Runs the serial path, but Q8 requires mixed RAM/VRAM and long projects are slow; no native continuous-video input |
-| One RTX 5090 32 GB + 128/192 GB RAM | `large-v3` | Qwen3.6-27B Q8 | Qwen3.6-27B Q8; benchmark a larger text model optionally | Best consumer Windows choice; 32 GB must still hold vision/KV/context overhead, so a roughly 30 GB weight file is not guaranteed to remain entirely in VRAM |
-| RTX PRO 6000 Blackwell 96 GB + 256 GB RAM | `large-v3` | high-precision Qwen3.6-27B | enable a 70B-class text director only after project-specific evaluation | Most practical single-GPU Windows workstation ceiling; much more capacity at far higher cost and 600 W power/cooling requirements |
+| Current Quadro RTX 5000 Max-Q 16 GB + 64 GB RAM | `large-v3` | Qwen3.8-27B Q4_K_M | Qwen3.8-27B Q8_0 | Runs the serial path, but both use mixed RAM/VRAM and long projects are slow; the current backend is not native continuous-MP4 input |
+| One RTX 5090 32 GB + 128/192 GB RAM | `large-v3` | Qwen3.8-27B Q8 | Qwen3.8-27B Q8; benchmark a larger text model optionally | Best consumer Windows choice; 32 GB must still hold vision/KV/context overhead, so the 28.6 GB weight file is not guaranteed to remain entirely in VRAM |
+| RTX PRO 6000 Blackwell 96 GB + 256 GB RAM | `large-v3` | high-precision Qwen3.8-27B | enable a larger text director only after project-specific evaluation | Most practical single-GPU Windows workstation ceiling; much more capacity at far higher cost and 600 W power/cooling requirements |
 | Mac Studio M3 Ultra with 512 GB unified memory | separate extraction or model node | can hold much larger MLX multimodal weights | can hold much larger local text weights | Capacity-first LAN model node; current registry, worker, and Resolve automation are Windows paths, so this is not a drop-in replacement without a backend migration |
 
 The current 16 GB Quadro + 64 GB RAM system does not need immediate replacement
-to validate this redesign. Its default is `qwen3.6:27b` Q4 vision review followed
-serially by `qwen3.6:27b-mtp-q8_0` final text direction; the tradeoff is extensive
+to validate this redesign. Its default is Qwen3.8-27B Q4_K_M vision review followed
+serially by Qwen3.8-27B Q8_0 final text direction; the tradeoff is extensive
 mixed-memory inference and waiting. For a new single-machine Windows build, one
 RTX 5090 32 GB with 128 GB RAM (192 GB preferred) is the consumer recommendation.
 When cost is secondary, RTX PRO 6000 Blackwell 96 GB plus 256 GB RAM is the more
@@ -627,8 +628,8 @@ isolated blind-viewer review, and human-reference benchmark are more directly ti
 to human-like results than merely swapping 27B for a larger checkpoint. No hardware
 tier promises professional-human-editor quality automatically.
 
-Model details: [official Qwen3.6-27B weights](https://huggingface.co/Qwen/Qwen3.6-27B)
-and [Qwen 3.6 on Ollama](https://ollama.com/library/qwen3.6). Hardware specifications:
+Model details: [official Qwen3.8-27B weights](https://huggingface.co/Qwen/Qwen3.8-27B)
+and [ggml-org Qwen3.8-27B GGUF](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF). Hardware specifications:
 [GeForce RTX 5090](https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/),
 [RTX PRO 6000 Blackwell](https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/rtx-pro-6000/),
 and [Mac Studio](https://www.apple.com/mac-studio/specs/).
@@ -699,15 +700,15 @@ Quality-first with separate visual/text roles on 16 GB VRAM + 64 GB RAM
 (about 47 GB total download):
 
 ```powershell
-ollama pull qwen3.6:27b
-ollama pull qwen3.6:27b-mtp-q8_0
+ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
+ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0
 ```
 
 To retain only one smaller model, both serial stages can reuse Q4 (about 17 GB,
 with lower final text-director fidelity than Q8):
 
 ```powershell
-ollama pull qwen3.6:27b
+ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
 ```
 
 Models are downloaded once. The UI subsequently starts Ollama automatically
@@ -741,8 +742,8 @@ API. Resolve Studio's External Scripting preference must still be set to
 ```powershell
 python main.py `
   --input-folder "D:\Documentary\Camera originals" `
-  --ollama-model "qwen3.6:27b" `
-  --director-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
+  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
   --project-fps 23.976 `
   --chunk-minutes 10
 ```
@@ -755,8 +756,8 @@ python main.py `
   --video "D:\Shoot\A001.mp4" `
   --video "D:\Shoot\B001.mp4" `
   --input-folder "D:\Shoot\B-roll" `
-  --ollama-model "qwen3.6:27b" `
-  --director-model "qwen3.6:27b-mtp-q8_0"
+  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
+  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"
 ```
 
 Default outputs:
@@ -785,8 +786,8 @@ running:
 # Reuse raw_data.json and rerun only the director and Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen3.6:27b" `
-  --director-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
+  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
   --creative-brief "Tell the preparation-to-payoff story in shooting order" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
@@ -795,8 +796,8 @@ python main.py --skip-extraction `
 
 # Any-online candidates (the UI is preferred because it shows the full warning)
 python main.py --skip-extraction --skip-resolve `
-  --ollama-model "qwen3.6:27b" `
-  --director-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
+  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
   --music-provider yt_dlp --music-candidate-limit 8 `
   --music-rights-confirmed `
   --music-rights-claim "I hold the rights required to download, adapt, synchronize, and use candidate audio and will follow source-platform terms"
@@ -928,8 +929,8 @@ out-point up, then subtracts one frame to match Resolve's inclusive `endFrame`.
   user can inspect and undo the partial timeline.
 - Semantic review requires an Ollama model reporting the `vision` capability.
   Plain `qwen2.5:3b` is a text-only smoke-test model and cannot run this
-  multimodal path. On 16 GB VRAM, prefer `qwen3.6:27b` (Q4_K_M) for dense visual
-  review and `qwen3.6:27b-mtp-q8_0` for the serial text director.
+  multimodal path. On 16 GB VRAM, prefer Qwen3.8-27B Q4_K_M for dense visual
+  review and Qwen3.8-27B Q8_0 for the serial text director.
 
 ## Tests
 

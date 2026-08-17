@@ -201,13 +201,13 @@ MP4，并调用 DaVinci Resolve Python API 组装可继续精修的时间线。
 Whisper + OpenCV 子进程
           │ 完全退出，Windows 回收 CUDA 上下文
           ▼
-Qwen3.6 中立全片审片（2fps 全覆盖 + 短动作最高 4fps 复审 + 台词）
+Qwen3.8 中立全片审片（2fps 全覆盖 + 短动作最高 4fps 复审 + 台词）
           │ 写出 footage_ledger / treatment / music_brief，keep_alive=0 卸载
           ▼
 CPU 联网/本地找歌 + Librosa/FFmpeg 音乐听诊
           │ 节拍、强拍、段落、调性、动态范围、LUFS；0 GPU
           ▼
-Qwen3.6 最终导演（实测配乐 profile 参与画面节奏 + 锁画后精确 cue）
+Qwen3.8 最终导演（实测配乐 profile 参与画面节奏 + 锁画后精确 cue）
           │ 写出 timeline_cuts.json，keep_alive=0 完全卸载
           ▼
 FFmpeg CPU 合成 music_bed.wav
@@ -227,18 +227,16 @@ DaVinci Resolve 执行子进程
   总时长上限。多个视频及一小时以上素材会拆成多个窗口串行审片，再统一编排。
 - `timeline_cuts.json` 只在所有分块成功、校验和合并后原子写入。
 
-## 为什么分开 Qwen3.6 视觉审片与文字导演
+## 为什么分开 Qwen3.8 视觉审片与文字导演
 
-- 16GB VRAM 机器的 2fps 视觉审片优先已安装的 `qwen3.6:27b`；Ollama 当前该约 17GB 标签的量化级别为 Q4_K_M，能减少高密度传图时的 RAM/PCIe 抖动。
-- 视觉阶段完全卸载后，全局文字导演优先已安装的 `qwen3.6:27b-mtp-q8_0`；约 30GB，Q8 用于保留最终故事比较与结构决策精度。
+- 16GB VRAM 机器的 2fps 视觉审片优先 `hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M`；约 19GB 的 Q4_K_M 权重能减少高密度传图时的 RAM/PCIe 抖动。
+- 视觉阶段完全卸载后，全局文字导演优先 `hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0`；约 28.6GB，Q8 用于保留最终故事比较与结构决策精度。
 - 官方视频理解评测中，27B 在 VideoMME、VideoMMMU、MLVU、MVBench 上整体高于
   只激活约 3B 参数的 35B-A3B。后者更快，但本项目优先剪辑判断质量。
 - 旧 `Qwen2.5 72B Q5` 虽有更多参数，但模型代际更早、纯文本且约 54GB；参数数量
-  不能直接抵消 3.6 的新训练、图像视觉能力与指令遵循优势，因此不再作为默认导演。
+  不能直接抵消 3.8 的新训练、原生视觉能力与指令遵循优势，因此不再作为默认导演。
 
-自动配置只会从 Ollama 实际已安装的标签中分别选择两个角色；若只安装一个兼容模型，则两阶段串行复用它，绝不自动下载不存在的权重。
-截至 2026-08-15，Qwen 官方没有可下载的“Qwen3.8-27B”本地权重；`qwen3.8-max-preview` 是托管预览名称，不能当作 Ollama 本地标签。
-项目不会伪造或默认一个官方未发布的模型名。参见 [Qwen Code 2026-07-23 更新](https://qwenlm.github.io/qwen-code-docs/en/blog/updates/weekly-update-2026-07-23/)。
+自动配置只会从 Ollama 实际已安装的标签中分别选择两个角色；若只安装一个兼容模型，则两阶段串行复用它。Qwen3.8-27B 已于 2026-08-14 发布；本项目通过 ggml-org 的 GGUF 直接引用运行，因为 Ollama 公共模型库尚无可依赖的第一方短标签。参见 [Qwen3.8-27B 官方模型卡](https://huggingface.co/Qwen/Qwen3.8-27B) 与 [ggml-org GGUF](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF)。
 分页文件脚本仍用于给 Windows 和长上下文保留安全余量：
 
 ```powershell
@@ -265,7 +263,7 @@ vLLM 已公开 OpenAI 兼容的 `video_url` 输入及视频解码后端，可作
 
 1. **提取期**：每个视频单独启动 Whisper/OpenCV 子进程，写入台词、真实 JPEG
    关键帧和素材元数据；每个子进程退出后，父调度器再执行显存释放屏障。
-2. **中立全片审片与音乐初审**：Qwen3.6 先不带主题偏见地读完 2fps 画面、台词与拍摄顺序，再对不超过 8 秒的动作原子以最高 4fps 复看精确边界，落盘
+2. **中立全片审片与音乐初审**：Qwen3.8 先不带主题偏见地读完 2fps 画面、台词与拍摄顺序，再对不超过 8 秒的动作原子以最高 4fps 复看精确边界，落盘
    `footage_ledger.json`，再比较多个可被真实时间码证明的故事方向，生成 `director_treatment.json` 和
    `music_brief.json`。音乐简报包含情绪弧线、检索词、乐器、BPM、1–3 个 cue 和有意留白，随后模型完全卸载。
 3. **候选获取与听诊（CPU）**：可选本地授权曲库、带许可证链接的 Jamendo，或显式
@@ -471,13 +469,13 @@ CyberEditor-Agent/
 
 | 设备 | Whisper | 视觉审片 | 全局文字导演 | 定位 |
 |---|---|---|---|---|
-| 当前 Quadro RTX 5000 Max-Q 16GB + 64GB RAM | `large-v3` | `qwen3.6:27b` Q4_K_M | `qwen3.6:27b-mtp-q8_0` | 能跑完整串行路径；Q8 必须 RAM/VRAM 混合，长片会很慢，不能原生连续视频输入 |
-| 单 RTX 5090 32GB + 128/192GB RAM | `large-v3` | Qwen3.6-27B Q8 | Qwen3.6-27B Q8；可评测更大纯文字模型 | 消费级 Windows 首选；32GB 仍需给视觉编码器、KV cache 和 Context 留空间，不能假定 30GB 权重始终全驻显存 |
-| RTX PRO 6000 Blackwell 96GB + 256GB RAM | `large-v3` | Qwen3.6-27B 高精度权重 | 经本项目评测后再启用 70B 级文字导演 | 目前最稳妥的单卡 Windows 工作站上限；容量显著更宽裕，成本和 600W 供电/散热也显著更高 |
+| 当前 Quadro RTX 5000 Max-Q 16GB + 64GB RAM | `large-v3` | Qwen3.8-27B Q4_K_M | Qwen3.8-27B Q8_0 | 能跑完整串行路径；两者都需 RAM/VRAM 混合，长片会很慢；当前后端不是原生连续 MP4 输入 |
+| 单 RTX 5090 32GB + 128/192GB RAM | `large-v3` | Qwen3.8-27B Q8 | Qwen3.8-27B Q8；可评测更大纯文字模型 | 消费级 Windows 首选；32GB 仍需给视觉编码器、KV cache 和 Context 留空间，不能假定 28.6GB 权重始终全驻显存 |
+| RTX PRO 6000 Blackwell 96GB + 256GB RAM | `large-v3` | Qwen3.8-27B 高精度权重 | 经本项目评测后再启用更大文字导演 | 目前最稳妥的单卡 Windows 工作站上限；容量显著更宽裕，成本和 600W 供电/散热也显著更高 |
 | Mac Studio M3 Ultra 512GB 统一内存 | 独立提取或模型节点 | 可容纳更大 MLX 多模态权重 | 可容纳更大本地文字权重 | 容量优先的局域网模型节点；当前注册表、Worker 与 Resolve 自动化是 Windows 路径，不能直接替换而无需后端迁移 |
 
-你的 16GB Quadro + 64GB RAM 不需要为验证这次架构立即换机；默认就是 `qwen3.6:27b`
-Q4 视觉审片 + `qwen3.6:27b-mtp-q8_0` 最终文字导演，代价是大量混合内存推理和等待。
+你的 16GB Quadro + 64GB RAM 不需要为验证这次架构立即换机；默认就是 Qwen3.8-27B
+Q4_K_M 视觉审片 + Qwen3.8-27B Q8_0 最终文字导演，代价是大量混合内存推理和等待。
 若购买新的单机 Windows 主机，单 RTX 5090 32GB + 128GB（更推荐 192GB）RAM 是消费级首选；
 若预算优先于价格，RTX PRO 6000 Blackwell 96GB + 256GB RAM 才是更合适的单卡 Windows
 本地模型/Resolve 一体工作站。双 5090 没有 NVLink，64GB 合计显存不等于一张 64GB 显卡，
@@ -488,8 +486,8 @@ Q4 视觉审片 + `qwen3.6:27b-mtp-q8_0` 最终文字导演，代价是大量混
 锁画后 cue、陌生观众盲审和人工参考 benchmark，比单纯把 27B 换成更大模型更直接地决定成片是否
 像人剪的；任何配置都不承诺自动达到专业人类剪辑师水平。
 
-模型说明：[Qwen3.6-27B 官方权重](https://huggingface.co/Qwen/Qwen3.6-27B) 和
-[Qwen 3.6 on Ollama](https://ollama.com/library/qwen3.6)。硬件规格参见
+模型说明：[Qwen3.8-27B 官方权重](https://huggingface.co/Qwen/Qwen3.8-27B) 和
+[ggml-org Qwen3.8-27B GGUF](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF)。硬件规格参见
 [GeForce RTX 5090](https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/)、
 [RTX PRO 6000 Blackwell](https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/rtx-pro-6000/)
 和 [Mac Studio](https://www.apple.com/mac-studio/specs/)。
@@ -553,14 +551,14 @@ Whisper 需要系统 FFmpeg；其官方安装和 Python 调用方式见
 质量优先且分离视觉/文字角色（16GB VRAM + 64GB RAM，合计约 47GB）：
 
 ```powershell
-ollama pull qwen3.6:27b
-ollama pull qwen3.6:27b-mtp-q8_0
+ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
+ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0
 ```
 
 只保留一个较小模型时，两阶段可串行复用 Q4（约 17GB，最终文字导演精度低于 Q8）：
 
 ```powershell
-ollama pull qwen3.6:27b
+ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
 ```
 
 模型只需下载一次。之后 UI 会自动启动 Ollama 服务并优先选择已安装的高质量模型，
@@ -589,8 +587,8 @@ Studio 的 External Scripting 仍需预先设置一次为 `Local`。
 ```powershell
 python main.py `
   --input-folder "D:\Documentary\Camera originals" `
-  --ollama-model "qwen3.6:27b" `
-  --director-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
+  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
   --project-fps 23.976 `
   --chunk-minutes 10
 ```
@@ -602,8 +600,8 @@ python main.py `
   --video "D:\Shoot\A001.mp4" `
   --video "D:\Shoot\B001.mp4" `
   --input-folder "D:\Shoot\B-roll" `
-  --ollama-model "qwen3.6:27b" `
-  --director-model "qwen3.6:27b-mtp-q8_0"
+  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
+  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"
 ```
 
 默认输出：
@@ -631,8 +629,8 @@ data/cybereditor.log
 # 已有 raw_data.json，只重跑导演与 Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "qwen3.6:27b" `
-  --director-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
+  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
   --creative-brief "按拍摄时间讲述团队从准备到完成动作的过程" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
@@ -641,8 +639,8 @@ python main.py --skip-extraction `
 
 # 任意在线候选（更推荐在 UI 中运行，以看到完整、不可跳过的警告）
 python main.py --skip-extraction --skip-resolve `
-  --ollama-model "qwen3.6:27b" `
-  --director-model "qwen3.6:27b-mtp-q8_0" `
+  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
+  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
   --music-provider yt_dlp --music-candidate-limit 8 `
   --music-rights-confirmed `
   --music-rights-claim "我拥有下载、改编、同步和使用候选音频所需的权利，并会遵守来源平台条款"
@@ -763,7 +761,7 @@ from src.resolve_executor import DaVinciExecutor
 - 如果中途某个 Resolve 片段追加失败，API 没有可靠事务回滚；日志会指出已追加
   数量，用户需要检查时间线并撤销。
 - 视觉理解由支持图片输入的 Ollama 模型完成。普通 `qwen2.5:3b` 是纯文本烟雾测试
-  模型，不能用于此多模态流程；16GB VRAM 高密度视觉审片建议 `qwen3.6:27b`（Q4_K_M），文字总导演建议 `qwen3.6:27b-mtp-q8_0`。
+  模型，不能用于此多模态流程；16GB VRAM 高密度视觉审片建议 Qwen3.8-27B Q4_K_M，文字总导演建议 Qwen3.8-27B Q8_0。
 
 ## 测试
 

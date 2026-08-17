@@ -508,10 +508,20 @@ class ModernCyberEditorApp:
             value=str(data.get("language", ""))
         )
         self.ollama_model_var = tk.StringVar(
-            value=str(data.get("ollama_model", "qwen3.6:27b"))
+            value=str(
+                data.get(
+                    "ollama_model",
+                    "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+                )
+            )
         )
         self.director_model_var = tk.StringVar(
-            value=str(data.get("director_model", "qwen3.6:27b-mtp-q8_0"))
+            value=str(
+                data.get(
+                    "director_model",
+                    "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
+                )
+            )
         )
         self.ollama_url_var = tk.StringVar(
             value=str(data.get("ollama_url", "http://localhost:11434"))

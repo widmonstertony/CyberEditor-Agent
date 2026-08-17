@@ -1345,8 +1345,8 @@ class WorkflowOrchestrator:
             raise WorkflowError(
                 f"模型 {model!r} 不支持图像输入，不能审阅视频画面。"
                 "请先安装并选择视觉模型，例如：\n"
-                "  ollama pull qwen3.6:27b\n"
-                "  ollama pull qwen3.6:27b-mtp-q8_0\n"
+                "  ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M\n"
+                "  ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0\n"
                 "The selected model is text-only; a vision model is required."
             )
 
@@ -1469,10 +1469,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-keyframes", type=int, default=14400,
         help="每个素材的视觉证据硬上限 / per-source visual evidence cap",
     )
-    parser.add_argument("--ollama-model", default="qwen3.6:27b")
+    parser.add_argument(
+        "--ollama-model",
+        default="hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+    )
     parser.add_argument(
         "--director-model",
-        default="qwen3.6:27b-mtp-q8_0",
+        default="hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
         help="视觉阶段卸载后加载的全局文字导演 / global text director",
     )
     parser.add_argument("--ollama-url", default="http://localhost:11434")

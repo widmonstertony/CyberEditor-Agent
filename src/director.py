@@ -4935,17 +4935,18 @@ class AIDirector:
                 return
             raise DirectorError(
                 f"模型 {self.model!r} 不支持看图，不能执行多视频视觉剪辑。"
-                "请安装视觉模型，例如：ollama pull qwen3.6:27b\n"
+                "请安装视觉模型，例如："
+                "ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M\n"
                 "The selected model has no vision capability. Install a vision model."
             )
         normalized = self.model.casefold().replace("_", "-")
         known_vision_markers = (
-            "qwen3.6", "qwen3.5", "qwen2.5-vl", "gemma3", "llava", "minicpm-v",
+            "qwen3.8", "qwen3.6", "qwen3.5", "qwen2.5-vl", "gemma3", "llava", "minicpm-v",
             "llama3.2-vision", "moondream",
         )
         if not any(marker in normalized for marker in known_vision_markers):
             raise DirectorError(
-                f"无法确认模型 {self.model!r} 支持视觉输入。请改用 qwen3.6 等视觉模型。\n"
+                f"无法确认模型 {self.model!r} 支持视觉输入。请改用 Qwen3.8 等视觉模型。\n"
                 "Cannot confirm vision support for the selected model."
             )
 
@@ -5171,7 +5172,7 @@ class AIDirector:
                 num_predict,
                 request_num_ctx,
             )
-        if "qwen3.6" in normalized_model:
+        if any(marker in normalized_model for marker in ("qwen3.8", "qwen3.6")):
             # Temporal evidence extraction is a literal formatting task, but
             # concept selection and picture editing benefit from Qwen's real
             # reasoning pass. High-level calls therefore try thinking first and
