@@ -383,11 +383,11 @@ DaVinci Resolve executor child process
 ## Why vision review and text direction use separate Qwen3.8 roles
 
 - On a 16 GB GPU, dense 2-fps visual review prefers the installed
-  `hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M` model. Its roughly
+  `qwen3.8:27b` short tag. It points to roughly
   19 GB Q4_K_M weights reduce RAM/PCIe churn
   while thousands of images are inspected.
 - After the vision model is fully unloaded, the global text director prefers
-  `hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0`. Its roughly 28.6 GB Q8 weights retain
+  `qwen3.8:27b-q8_0`. Its roughly 28.6 GB Q8 weights retain
   more fidelity for final story comparison and structure decisions.
 - Official video benchmarks generally place dense 27B above 35B-A3B on
   VideoMME, VideoMMMU, MLVU, and MVBench. The sparse model is faster; this
@@ -702,6 +702,10 @@ Quality-first with separate visual/text roles on 16 GB VRAM + 64 GB RAM
 ```powershell
 ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
 ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0
+ollama cp hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M qwen3.8:27b
+ollama cp hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0 qwen3.8:27b-q8_0
+ollama rm hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
+ollama rm hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0
 ```
 
 To retain only one smaller model, both serial stages can reuse Q4 (about 17 GB,
@@ -709,6 +713,8 @@ with lower final text-director fidelity than Q8):
 
 ```powershell
 ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
+ollama cp hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M qwen3.8:27b
+ollama rm hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
 ```
 
 Models are downloaded once. The UI subsequently starts Ollama automatically
@@ -742,8 +748,8 @@ API. Resolve Studio's External Scripting preference must still be set to
 ```powershell
 python main.py `
   --input-folder "D:\Documentary\Camera originals" `
-  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
-  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
+  --ollama-model "qwen3.8:27b" `
+  --director-model "qwen3.8:27b-q8_0" `
   --project-fps 23.976 `
   --chunk-minutes 10
 ```
@@ -756,8 +762,8 @@ python main.py `
   --video "D:\Shoot\A001.mp4" `
   --video "D:\Shoot\B001.mp4" `
   --input-folder "D:\Shoot\B-roll" `
-  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
-  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"
+  --ollama-model "qwen3.8:27b" `
+  --director-model "qwen3.8:27b-q8_0"
 ```
 
 Default outputs:
@@ -786,8 +792,8 @@ running:
 # Reuse raw_data.json and rerun only the director and Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
-  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
+  --ollama-model "qwen3.8:27b" `
+  --director-model "qwen3.8:27b-q8_0" `
   --creative-brief "Tell the preparation-to-payoff story in shooting order" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
@@ -796,8 +802,8 @@ python main.py --skip-extraction `
 
 # Any-online candidates (the UI is preferred because it shows the full warning)
 python main.py --skip-extraction --skip-resolve `
-  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
-  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
+  --ollama-model "qwen3.8:27b" `
+  --director-model "qwen3.8:27b-q8_0" `
   --music-provider yt_dlp --music-candidate-limit 8 `
   --music-rights-confirmed `
   --music-rights-claim "I hold the rights required to download, adapt, synchronize, and use candidate audio and will follow source-platform terms"

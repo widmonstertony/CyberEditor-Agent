@@ -25,7 +25,7 @@ import shutil
 import subprocess
 import sys
 import threading
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -41,6 +41,7 @@ from .gui import (
     detect_system_theme,
     detect_torch_runtime,
     format_director_context_status,
+    format_ollama_model_label,
     enable_windows_high_dpi,
     ensure_ollama_service,
     find_resolve_executable,
@@ -195,6 +196,7 @@ class ModernDropdown(ctk.CTkFrame):
         command: object,
         width: int = 180,
         height: int = 36,
+        display_transform: Optional[Callable[[str], str]] = None,
     ) -> None:
         """Create the selector and retain canonical display values. / 创建选择器并保存规范显示值。"""
         super().__init__(
@@ -207,12 +209,13 @@ class ModernDropdown(ctk.CTkFrame):
         self._values = [str(item) for item in values]
         self._value = str(selected)
         self._command = command
+        self._display_transform = display_transform or str
         self._popup: Optional[ctk.CTkToplevel] = None
         self._height = int(height)
         self.grid_columnconfigure(0, weight=1)
         self.button = DropdownFieldButton(
             self,
-            text=self._value,
+            text=self._display_transform(self._value),
             command=self._toggle_popup,
             height=height,
             corner_radius=11,
@@ -240,7 +243,7 @@ class ModernDropdown(ctk.CTkFrame):
     def set(self, value: str) -> None:
         """Update the selected value without firing the command. / 更新所选值但不触发回调。"""
         self._value = str(value)
-        self.button.configure(text=self._value)
+        self.button.configure(text=self._display_transform(self._value))
 
     def set_values(self, values: Sequence[str]) -> None:
         """Replace popup choices while retaining a valid selection. / 替换浮层选项并保留有效选择。"""
@@ -348,7 +351,7 @@ class ModernDropdown(ctk.CTkFrame):
             selected = value == self._value
             item = ctk.CTkButton(
                 surface,
-                text=value,
+                text=self._display_transform(value),
                 command=lambda choice=value: self._select(choice),
                 height=34,
                 corner_radius=9,
@@ -511,7 +514,7 @@ class ModernCyberEditorApp:
             value=str(
                 data.get(
                     "ollama_model",
-                    "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+                    "qwen3.8:27b",
                 )
             )
         )
@@ -519,7 +522,7 @@ class ModernCyberEditorApp:
             value=str(
                 data.get(
                     "director_model",
-                    "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
+                    "qwen3.8:27b-q8_0",
                 )
             )
         )
@@ -892,13 +895,19 @@ class ModernCyberEditorApp:
         )
         self.ollama_menu = self._option_field(
             ai, 1, self.t("ollama_model"), [self.ollama_model_var.get()],
-            self.ollama_model_var.get(), self.ollama_model_var.set, column=1
+            self.ollama_model_var.get(), self.ollama_model_var.set, column=1,
+            display_transform=lambda value: format_ollama_model_label(
+                value, self.active_language
+            ),
         )
         self.director_model_menu = self._option_field(
             ai, 2, self.t("director_model"),
             [self.director_model_var.get() or self.ollama_model_var.get()],
             self.director_model_var.get() or self.ollama_model_var.get(),
-            self.director_model_var.set, column=0
+            self.director_model_var.set, column=0,
+            display_transform=lambda value: format_ollama_model_label(
+                value, self.active_language
+            ),
         )
         self._entry_field(
             ai, 2, self.t("ollama_context"), self.ctx_var, column=1
@@ -1211,7 +1220,8 @@ class ModernCyberEditorApp:
     def _option_field(
         self, parent: ctk.CTkBaseClass, row: int, label: str,
         values: List[str], selected: str, command: object,
-        column: int = 0, columnspan: int = 1
+        column: int = 0, columnspan: int = 1,
+        display_transform: Optional[Callable[[str], str]] = None,
     ) -> ModernDropdown:
         """Create one labeled option menu. / 创建一个带标签的选项菜单。"""
         frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1232,6 +1242,7 @@ class ModernCyberEditorApp:
             selected=selected,
             command=command,
             height=36,
+            display_transform=display_transform,
         )
         menu.grid(row=1, column=0, sticky="ew")
         return menu

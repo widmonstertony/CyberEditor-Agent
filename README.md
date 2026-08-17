@@ -229,8 +229,8 @@ DaVinci Resolve 执行子进程
 
 ## 为什么分开 Qwen3.8 视觉审片与文字导演
 
-- 16GB VRAM 机器的 2fps 视觉审片优先 `hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M`；约 19GB 的 Q4_K_M 权重能减少高密度传图时的 RAM/PCIe 抖动。
-- 视觉阶段完全卸载后，全局文字导演优先 `hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0`；约 28.6GB，Q8 用于保留最终故事比较与结构决策精度。
+- 16GB VRAM 机器的 2fps 视觉审片优先短标签 `qwen3.8:27b`；它对应约 19GB 的 Q4_K_M 权重，能减少高密度传图时的 RAM/PCIe 抖动。
+- 视觉阶段完全卸载后，全局文字导演优先 `qwen3.8:27b-q8_0`；它对应约 28.6GB 的 Q8 权重，用于保留最终故事比较与结构决策精度。
 - 官方视频理解评测中，27B 在 VideoMME、VideoMMMU、MLVU、MVBench 上整体高于
   只激活约 3B 参数的 35B-A3B。后者更快，但本项目优先剪辑判断质量。
 - 旧 `Qwen2.5 72B Q5` 虽有更多参数，但模型代际更早、纯文本且约 54GB；参数数量
@@ -553,12 +553,18 @@ Whisper 需要系统 FFmpeg；其官方安装和 Python 调用方式见
 ```powershell
 ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
 ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0
+ollama cp hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M qwen3.8:27b
+ollama cp hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0 qwen3.8:27b-q8_0
+ollama rm hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
+ollama rm hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0
 ```
 
 只保留一个较小模型时，两阶段可串行复用 Q4（约 17GB，最终文字导演精度低于 Q8）：
 
 ```powershell
 ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
+ollama cp hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M qwen3.8:27b
+ollama rm hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M
 ```
 
 模型只需下载一次。之后 UI 会自动启动 Ollama 服务并优先选择已安装的高质量模型，
@@ -587,8 +593,8 @@ Studio 的 External Scripting 仍需预先设置一次为 `Local`。
 ```powershell
 python main.py `
   --input-folder "D:\Documentary\Camera originals" `
-  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
-  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
+  --ollama-model "qwen3.8:27b" `
+  --director-model "qwen3.8:27b-q8_0" `
   --project-fps 23.976 `
   --chunk-minutes 10
 ```
@@ -600,8 +606,8 @@ python main.py `
   --video "D:\Shoot\A001.mp4" `
   --video "D:\Shoot\B001.mp4" `
   --input-folder "D:\Shoot\B-roll" `
-  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
-  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"
+  --ollama-model "qwen3.8:27b" `
+  --director-model "qwen3.8:27b-q8_0"
 ```
 
 默认输出：
@@ -629,8 +635,8 @@ data/cybereditor.log
 # 已有 raw_data.json，只重跑导演与 Resolve
 python main.py --skip-extraction `
   --proxy "D:\Documentary\proxy\source_1080p.mp4" `
-  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
-  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
+  --ollama-model "qwen3.8:27b" `
+  --director-model "qwen3.8:27b-q8_0" `
   --creative-brief "按拍摄时间讲述团队从准备到完成动作的过程" `
   --target-duration-sec 80 `
   --camera-profile sony_pp8_slog3_sgamut3cine `
@@ -639,8 +645,8 @@ python main.py --skip-extraction `
 
 # 任意在线候选（更推荐在 UI 中运行，以看到完整、不可跳过的警告）
 python main.py --skip-extraction --skip-resolve `
-  --ollama-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M" `
-  --director-model "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0" `
+  --ollama-model "qwen3.8:27b" `
+  --director-model "qwen3.8:27b-q8_0" `
   --music-provider yt_dlp --music-candidate-limit 8 `
   --music-rights-confirmed `
   --music-rights-claim "我拥有下载、改编、同步和使用候选音频所需的权利，并会遵守来源平台条款"

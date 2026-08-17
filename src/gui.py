@@ -49,6 +49,24 @@ except ImportError:  # pragma: no cover - only relevant outside Windows.
     winreg = None  # type: ignore[assignment]
 
 APP_TITLE = "CyberEditor Agent"
+
+
+def format_ollama_model_label(model: str, language: str = "en") -> str:
+    """Return a concise UI label while preserving the canonical Ollama tag. / 返回简洁显示名但保留规范 Ollama 标签。"""
+    value = str(model or "").strip()
+    normalized = value.casefold()
+    chinese = str(language or "").casefold().startswith("zh")
+    if normalized in {
+        "qwen3.8:27b",
+        "hf.co/ggml-org/qwen3.8-27b-gguf:q4_k_m",
+    }:
+        return "Qwen 3.8 27B · 视觉 Q4" if chinese else "Qwen 3.8 27B · Vision Q4"
+    if normalized in {
+        "qwen3.8:27b-q8_0",
+        "hf.co/ggml-org/qwen3.8-27b-gguf:q8_0",
+    }:
+        return "Qwen 3.8 27B · 导演 Q8" if chinese else "Qwen 3.8 27B · Director Q8"
+    return value
 DARK_PALETTE = {
     "BG": "#09111F",
     "CARD": "#111C2D",
@@ -597,7 +615,6 @@ def recommend_automatic_settings(
         # long-context reasoning, and quantization—not simply file size.
         # 剪辑质量取决于指令遵循、中文、长上下文与量化，而非只看文件大小。
         family_scores = (
-            ("qwen3.8-27b", 1400.0),
             ("qwen3.6:27b", 1200.0),
             ("qwen3.6:35b-a3b", 1160.0),
             ("qwen3.5:35b-a3b", 1000.0),
@@ -610,10 +627,13 @@ def recommend_automatic_settings(
             ("qwen2.5:14b", 680.0),
             ("gemma3:12b", 640.0),
         )
-        for marker, score in family_scores:
-            if marker in normalized:
-                quality_score = score
-                break
+        if any(marker in normalized for marker in ("qwen3.8-27b", "qwen3.8:27b")):
+            quality_score = 1400.0
+        else:
+            for marker, score in family_scores:
+                if marker in normalized:
+                    quality_score = score
+                    break
         if "q8_0" in normalized or "q8-0" in normalized:
             quality_score += 35.0
         elif "q6_k" in normalized:
@@ -630,7 +650,7 @@ def recommend_automatic_settings(
         name, size_gb, quality = item
         normalized = name.casefold()
         role_bonus = 0.0
-        if "qwen3.8-27b" in normalized:
+        if any(marker in normalized for marker in ("qwen3.8-27b", "qwen3.8:27b")):
             # The official GGUF Q4_K_M is the stable dense-vision default on
             # 16 GiB GPUs; Q8 remains reserved for serial text direction.
             # 16 GiB 显卡用官方 GGUF Q4 稳定审片；Q8 留给串行文字导演。
@@ -679,7 +699,7 @@ def recommend_automatic_settings(
         name, size_gb, quality = item
         normalized = name.casefold()
         role_bonus = 0.0
-        if "qwen3.8-27b" in normalized:
+        if any(marker in normalized for marker in ("qwen3.8-27b", "qwen3.8:27b")):
             if "q8_0" in normalized:
                 role_bonus += 240.0
             elif "q6_k" in normalized:
@@ -906,8 +926,8 @@ class WorkflowOptions:
     language: str = ""
     sample_interval: float = 0.5
     max_keyframes: int = 14400
-    ollama_model: str = "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M"
-    director_model: str = "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"
+    ollama_model: str = "qwen3.8:27b"
+    director_model: str = "qwen3.8:27b-q8_0"
     ollama_url: str = "http://localhost:11434"
     chunk_minutes: float = 12.0
     project_fps: float = 25.0
@@ -1372,10 +1392,10 @@ class CyberEditorApp:
         self.device_var = tk.StringVar(value="auto")
         self.language_var = tk.StringVar()
         self.ollama_model_var = tk.StringVar(
-            value="hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M"
+            value="qwen3.8:27b"
         )
         self.director_model_var = tk.StringVar(
-            value="hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0"
+            value="qwen3.8:27b-q8_0"
         )
         self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
         self.chunk_var = tk.DoubleVar(value=12.0)
@@ -1590,8 +1610,8 @@ class CyberEditorApp:
             ttk.Combobox,
             textvariable=self.ollama_model_var,
             values=(
-                "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
-                "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
+                "qwen3.8:27b",
+                "qwen3.8:27b-q8_0",
                 "qwen3.6:27b",
                 "qwen3.6:27b-q4_K_M",
                 "qwen3.6:27b-mtp-q8_0",
@@ -1662,8 +1682,8 @@ class CyberEditorApp:
             ttk.Combobox,
             textvariable=self.director_model_var,
             values=(
-                "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
-                "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+                "qwen3.8:27b-q8_0",
+                "qwen3.8:27b",
                 "qwen3.6:27b-mtp-q8_0",
                 "qwen3.6:27b-q4_K_M",
             ),

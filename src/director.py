@@ -4937,6 +4937,7 @@ class AIDirector:
                 f"模型 {self.model!r} 不支持看图，不能执行多视频视觉剪辑。"
                 "请安装视觉模型，例如："
                 "ollama pull hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M\n"
+                "ollama cp hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M qwen3.8:27b\n"
                 "The selected model has no vision capability. Install a vision model."
             )
         normalized = self.model.casefold().replace("_", "-")

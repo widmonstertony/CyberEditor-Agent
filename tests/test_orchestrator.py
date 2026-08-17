@@ -30,11 +30,11 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(args.max_keyframes, 14400)
         self.assertEqual(
             args.ollama_model,
-            "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q4_K_M",
+            "qwen3.8:27b",
         )
         self.assertEqual(
             args.director_model,
-            "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
+            "qwen3.8:27b-q8_0",
         )
 
     def test_stage_waits_for_child_success(self):

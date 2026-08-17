@@ -15,6 +15,7 @@ from src.gui import (
     director_context_contract,
     enable_windows_high_dpi,
     format_director_context_status,
+    format_ollama_model_label,
     get_primary_work_area,
     parse_frame_rate,
     recommend_automatic_settings,
@@ -23,6 +24,17 @@ from src.ui_i18n import resolve_language, translate
 
 
 class WorkflowOptionsTests(unittest.TestCase):
+    def test_qwen38_model_labels_are_friendly_but_role_specific(self) -> None:
+        self.assertEqual(
+            format_ollama_model_label("qwen3.8:27b", "zh"),
+            "Qwen 3.8 27B · 视觉 Q4",
+        )
+        self.assertEqual(
+            format_ollama_model_label("qwen3.8:27b-q8_0", "en"),
+            "Qwen 3.8 27B · Director Q8",
+        )
+        self.assertEqual(format_ollama_model_label("custom:model", "zh"), "custom:model")
+
     def test_pythonw_is_replaced_by_console_python_for_child_logs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -432,6 +444,20 @@ class WorkflowOptionsTests(unittest.TestCase):
             "hf.co/ggml-org/Qwen3.8-27B-GGUF:Q8_0",
         )
         self.assertEqual(recommendation["effective_num_ctx"], 32768)
+
+    def test_auto_profile_supports_short_qwen38_aliases(self) -> None:
+        recommendation = recommend_automatic_settings(
+            {"ram_gb": 64, "vram_gb": 16, "cpu_threads": 16, "torch_cuda": True},
+            [
+                {"name": "qwen3.8:27b", "size": 19 * 1024**3},
+                {"name": "qwen3.8:27b-q8_0", "size": 29 * 1024**3},
+            ],
+        )
+
+        self.assertEqual(recommendation["ollama_model"], "qwen3.8:27b")
+        self.assertEqual(
+            recommendation["director_model"], "qwen3.8:27b-q8_0"
+        )
 
     def test_qwen38_q4_does_not_fall_back_to_legacy_qwen36_q8(self) -> None:
         recommendation = recommend_automatic_settings(
