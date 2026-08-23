@@ -229,4 +229,12 @@ dialog::backdrop { background: rgba(0, 8, 20, .55); backdrop-filter: blur(7px); 
   .backend-setup { grid-template-columns: 1fr; }
   .backend-setup ol { grid-template-columns: 1fr; }
   .worker-select { grid-template-columns: 1fr; }
+
+  /* No primary or explanatory control text should require pinch-zoom. */
+  .remote-copy small, .local-connection code, .worker-select > span,
+  .health-card small, .eyebrow, .field em, .picker-copy > span,
+  .button.small, .consent, .log-toolbar { font-size: 13px; }
+  .backend-setup ol, .field > span, .hardware-summary, .switch,
+  .run-status p, .empty, .dialog-card p { font-size: 14px; }
+  .button, input, select, textarea { font-size: 15px; }
 }
